@@ -1,0 +1,65 @@
+bucket_a_signals:
+  - product analytics
+  - experimentation
+  - pricing
+  - monetization
+  - marketplace
+  - unit economics
+  - decision science
+  - forecasting
+  - kpi governance
+
+bucket_b_signals:
+  - growth analytics
+  - revenue analytics
+  - product strategy
+  - strategic analytics
+  - stakeholder management
+
+bucket_c_signals:
+  - mlops
+  - platform
+  - ai engineer
+  - data engineering
+  - dashboarding
+  - reporting only
+
+company_priority:
+  - netflix
+  - airbnb
+  - stripe
+  - uber
+  - doordash
+  - booking.com
+
+source_weights:
+  dailyremote-bridge: 1.5
+  company-watchlist: 3.0
+
+title_weights:
+  head of analytics: 8
+  product analytics lead: 8
+  product data science manager: 7
+  senior product data science manager: 7
+  lead product analyst: 7
+  monetization: 6
+  pricing: 6
+  staff data scientist: 5
+  lead data scientist: 5
+  analytics manager: 4
+
+description_weights:
+  experimentation: 3
+  a/b testing: 3
+  unit economics: 4
+  marketplace: 4
+  pricing: 4
+  monetization: 4
+  forecasting: 3
+  decision systems: 3
+  product strategy: 2
+  revenue strategy: 2
+  kpi governance: 2
+
+threshold_a: 14
+threshold_b: 8

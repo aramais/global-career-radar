@@ -1,0 +1,174 @@
+positive_title_signals:
+  - product analytics
+  - head of analytics
+  - product data science manager
+  - senior product data science manager
+  - product analytics lead
+  - lead product analyst
+  - monetization
+  - pricing
+  - revenue analytics
+  - marketplace
+  - staff data scientist
+  - lead data scientist
+  - decision scientist
+  - growth analytics
+  - analytics manager
+
+positive_description_signals:
+  - experimentation
+  - a/b testing
+  - product strategy
+  - pricing
+  - monetization
+  - unit economics
+  - kpi governance
+  - forecasting
+  - decision systems
+  - marketplace economics
+  - growth strategy
+  - revenue strategy
+  - cross-functional product
+  - strategic analytics
+
+negative_title_signals:
+  - ml engineer
+  - machine learning engineer
+  - ai engineer
+  - llm engineer
+  - mlops
+  - platform engineer
+  - data engineer
+  - analytics engineer
+  - bi developer
+  - recruiting analytics
+  - people analytics
+  - security analytics
+
+negative_description_signals:
+  - production ml
+  - model deployment
+  - feature store
+  - mlops
+  - kubernetes
+  - airflow orchestration
+  - llm applications
+  - ai platform
+  - pipeline ownership
+  - dashboard factory
+  - people analytics
+  - recruiting analytics
+  - hr analytics
+  - security analytics
+  - fraud detection only
+  - compliance analytics
+
+blocker_phrases:
+  - must be based in the united states
+  - must reside in the united states
+  - us work authorization required
+  - requires us work authorization
+  - authorized to work in the u.s.
+  - must live in eu
+  - eu only
+  - emea only
+  - us only
+  - canada only
+  - remote in europe only
+  - office in london required
+  - hybrid in new york
+  - relocation required
+  - must relocate
+  - on-site required
+  - must work pacific hours
+  - must work eastern time only
+  - singapore time zone
+  - australia time zone
+  - visa sponsorship unavailable
+
+review_phrases:
+  - occasional travel
+  - preferred in
+  - bonus if located
+  - overlap with est
+  - overlap with pst
+  - some ml exposure
+
+allowlist_phrases:
+  - worldwide
+  - globally remote
+  - global remote
+  - remote anywhere
+  - work from anywhere
+  - contractor
+  - b2b
+  - employer of record
+  - eor
+  - distributed team
+  - async
+  - americas
+  - latam
+  - latin america
+  - south america
+  - chile
+
+company_blacklist:
+  - stealth ml infra lab
+
+company_whitelist:
+  - netflix
+  - airbnb
+  - stripe
+  - uber
+  - doordash
+
+target_geographies:
+  - worldwide
+  - global remote
+  - americas
+  - latam
+  - latin america
+  - south america
+  - chile
+  - argentina
+  - mexico
+  - colombia
+  - brazil
+  - canada
+
+geography_blockers:
+  - remote in eu only
+  - eu only
+  - emea only
+  - uk only
+  - us only
+  - canada only
+  - germany only
+  - netherlands only
+  - must be based in
+  - must reside in
+  - current residence in
+
+timezone_allowed:
+  - americas time zones
+  - americas timezone
+  - latam timezone
+  - overlap with eastern time
+  - overlap with central time
+  - async
+  - distributed team
+
+timezone_blockers:
+  - cet hours
+  - europe time zone
+  - apac hours
+  - singapore hours
+  - sydney hours
+  - work pst only
+  - work eastern time only
+  - eu timezone
+
+closed_phrases:
+  - no longer accepting applications
+  - position has been filled
+  - this job is closed

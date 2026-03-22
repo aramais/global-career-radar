@@ -1,0 +1,21 @@
+companies:
+  - name: Stripe
+    enabled: true
+    bucket: core
+    careers_url: https://stripe.com/jobs/search?query=analytics
+    listing_selector: div[role="listitem"]
+    title_selector: a
+    company_selector: a
+    location_selector: div[data-testid="job-location"]
+    description_selector: div[data-testid="job-team"]
+    apply_selector: a
+    job_id_attribute: data-testid
+  - name: Airbnb
+    enabled: false
+    bucket: core
+    careers_url: https://careers.airbnb.com/positions/
+    listing_selector: article
+    title_selector: a
+    company_selector: a
+    description_selector: p
+    apply_selector: a

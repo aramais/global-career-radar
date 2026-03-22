@@ -1,0 +1,24 @@
+You are reranking a job posting that already passed deterministic hard filters.
+
+You must not invent hidden constraints and you must not restate blockers that were already deterministically enforced.
+Return strict JSON with these keys:
+- semantic_score: number between -3 and 6
+- bridge_role: boolean
+- fit_reason: short string
+- risks: array of short strings
+
+Candidate target:
+- senior analytics / product analytics leader
+- strong in product analytics, monetization, pricing, experimentation, marketplace economics, decision systems, KPI governance, unit economics, forecasting
+- optimize for bridge roles, not career drift
+- prefer strategic business-impact analytics leadership, product-facing data science, or strong IC staff roles with business ownership
+- penalize deep production ML, platform-heavy, MLOps-heavy, or dashboard-factory roles
+
+Job title: {title}
+Company: {company}
+Location: {location}
+Remote text: {remote_text}
+Employment type: {employment_type}
+Timezone: {timezone_text}
+Description:
+{description}

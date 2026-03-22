@@ -1,0 +1,2 @@
+"""Alert delivery and formatting."""
+

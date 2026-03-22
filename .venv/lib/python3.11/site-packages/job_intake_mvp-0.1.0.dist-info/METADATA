@@ -1,0 +1,225 @@
+Metadata-Version: 2.4
+Name: job-intake-mvp
+Version: 0.1.0
+Summary: Deterministic-first personal job intake system for precision remote role discovery
+Author: Codex
+License: MIT
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: beautifulsoup4>=4.12.3
+Requires-Dist: PyYAML>=6.0.1
+Requires-Dist: python-dotenv>=1.0.1
+Requires-Dist: requests>=2.32.3
+Requires-Dist: SQLAlchemy>=2.0.36
+Requires-Dist: typer>=0.12.5
+Requires-Dist: openai>=1.52.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.3.3; extra == "dev"
+Requires-Dist: pytest-cov>=5.0.0; extra == "dev"
+Requires-Dist: ruff>=0.7.2; extra == "dev"
+
+# Job Intake MVP
+
+Precision-first personal job intake system for senior analytics leadership roles. The pipeline ingests public job sources, normalizes them, enforces deterministic hard filters, applies optional semantic reranking only after a pass, stores every decision with rationale, and sends compact Telegram alerts for high-priority matches.
+
+This MVP is intentionally strict:
+
+- deterministic rules gate first
+- LLM reranking can never override hard rejects
+- precision is favored over recall
+- no LinkedIn login, authenticated scraping, or auto-apply flow
+
+## Concise architecture summary
+
+- Ingestion layer
+  - `DailyRemoteAdapter` parses public DailyRemote listing pages
+  - `HtmlPageAdapter` parses public career pages with configurable selectors
+  - `CompanyWatchlistAdapter` wraps curated companies on top of the HTML adapter
+- Normalization layer
+  - all sources emit a common `JobRecord` schema
+- Deterministic hard-filter layer
+  - `RuleEngine` rejects geography, authorization, timezone, office-presence, closed, and role-family blockers
+  - every rejection persists explicit blocker signals and reasons
+- Ranking layer
+  - `DeterministicScorer` computes a config-driven pre-score
+  - `OpenAIReranker` is optional and only runs for passed jobs
+  - final output is bucketed into `Bucket A`, `Bucket B`, or `Bucket C` and tiered as `A`, `B`, or `C`
+- Persistence and review
+  - SQLite via SQLAlchemy, with a clean path to PostgreSQL
+  - deduplication, event log, feedback capture, CSV export, and HTML review page
+- Alerting
+  - instant Telegram alert for A-tier roles
+  - daily Telegram digest for A/B-tier roles
+
+## Implementation plan
+
+1. Ingest from DailyRemote, public company pages, and a watchlist-driven HTML adapter.
+2. Normalize everything into one schema before any filtering.
+3. Apply deterministic hard filters for geography, authorization, timezone, title taxonomy, and status.
+4. Score only passing jobs with deterministic weights, then optionally LLM-rerank.
+5. Persist all seen jobs, state changes, audit trails, and alert history.
+6. Alert only on A-tier roles instantly and provide a daily digest for A/B-tier.
+7. Expose operator workflows through CLI, CSV export, HTML review, and feedback capture.
+
+## Repository structure
+
+```text
+.
+├── README.md
+├── Dockerfile
+├── Makefile
+├── pyproject.toml
+├── requirements.txt
+├── config
+│   ├── company_watchlist.yaml
+│   ├── llm_prompt.txt
+│   ├── rules.yaml
+│   ├── search_profiles.yaml
+│   └── settings.yaml
+├── data
+├── docs
+│   ├── architecture.md
+│   └── telegram_digest.md
+├── scripts
+│   ├── export_shortlist.py
+│   └── run_pipeline.py
+├── src
+│   └── job_intake
+│       ├── adapters
+│       ├── alerts
+│       ├── config
+│       ├── models
+│       ├── review
+│       ├── scoring
+│       ├── storage
+│       ├── utils
+│       ├── cli.py
+│       ├── filtering.py
+│       └── pipeline.py
+└── tests
+    ├── test_dedup.py
+    └── test_rules_engine.py
+```
+
+## Key files
+
+- App entrypoint: `src/job_intake/cli.py`
+- Pipeline orchestration: `src/job_intake/pipeline.py`
+- Deterministic rules: `src/job_intake/filtering.py`
+- Deduplication: `src/job_intake/storage/dedup.py`
+- Persistence: `src/job_intake/storage/models.py`
+- DailyRemote adapter: `src/job_intake/adapters/dailyremote.py`
+- Generic HTML adapter: `src/job_intake/adapters/html_page.py`
+- Configurable rules: `config/rules.yaml`
+- Search buckets and weights: `config/search_profiles.yaml`
+
+## Setup instructions
+
+### Runtime requirement
+
+- Python `3.11+`
+
+### Local setup
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -e .[dev]
+cp .env.example .env
+```
+
+Edit `.env` as needed:
+
+```env
+OPENAI_API_KEY=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+JOB_INTAKE_DATABASE_URL=sqlite:///data/job_intake.db
+JOB_INTAKE_LOG_LEVEL=INFO
+```
+
+### Configure filters and sources
+
+- Tune hard blockers and positive signals in `config/rules.yaml`
+- Tune bucket weights in `config/search_profiles.yaml`
+- Add target companies in `config/company_watchlist.yaml`
+- Enable LLM reranking in `config/settings.yaml` only after deterministic filters are stable
+
+### Run the pipeline
+
+```bash
+job-intake run --config config/settings.yaml
+```
+
+### Generate digest and exports
+
+```bash
+job-intake digest --config config/settings.yaml
+job-intake export-csv --config config/settings.yaml --output data/shortlisted_jobs.csv
+job-intake render-html --config config/settings.yaml --output data/review.html
+```
+
+### Store operator feedback
+
+```bash
+job-intake feedback <job_uid> false_positive --note "US-only restriction slipped through"
+job-intake feedback <job_uid> false_negative --note "Strong bridge role, improve title allowlist"
+```
+
+## Config examples
+
+### Search buckets
+
+- `Bucket A`
+  - bridge roles with clear product/business analytics leadership signals
+  - likely alert-worthy
+- `Bucket B`
+  - adjacent or partially matching roles worth manual review
+- `Bucket C`
+  - hard rejects or low-fit roles logged only
+
+### Deterministic filter examples
+
+- reject
+  - `us work authorization required`
+  - `must reside in the united states`
+  - `eu only`
+  - `relocation required`
+  - `machine learning engineer`
+- keep
+  - `worldwide`
+  - `contractor`
+  - `EOR`
+  - `LATAM`
+  - `distributed team`
+
+## Telegram digest format
+
+See `docs/telegram_digest.md` for concrete examples.
+
+## Tests
+
+The test suite covers:
+
+- rules-engine hard rejection and review logic
+- dedup identity behavior across source IDs, canonical URLs, and content fingerprints
+
+Run with:
+
+```bash
+pytest
+```
+
+## Production hardening next steps
+
+1. Add per-source integration tests with recorded HTML fixtures so selector drift is caught early.
+2. Add provider-specific ATS adapters for Greenhouse, Lever, Ashby, and Workday public endpoints.
+3. Move from polling-only HTML parsing to RSS/API feeds where available.
+4. Add a lightweight admin UI with filter tuning, feedback review, and event history.
+5. Add outbound email and Slack delivery as secondary alert channels.
+6. Add idempotent scheduler wrappers for cron or systemd timers on your server.
+7. Add migration tooling such as Alembic before moving to PostgreSQL in production.
+8. Add selector health checks and a dead-source alert so broken ingestion is surfaced quickly.
+9. Add embedding-free semantic heuristics for bridge-role classification before expanding LLM usage.
+10. Add backup, retention, and alert dedupe policies for long-running production use.

@@ -1,0 +1,49 @@
+database_url: ${JOB_INTAKE_DATABASE_URL:-sqlite:///data/job_intake.db}
+log_level: ${JOB_INTAKE_LOG_LEVEL:-INFO}
+rules_path: rules.yaml
+search_profiles_path: search_profiles.yaml
+company_watchlist_path: company_watchlist.yaml
+export_dir: data
+
+telegram:
+  enabled: false
+  bot_token_env: TELEGRAM_BOT_TOKEN
+  chat_id_env: TELEGRAM_CHAT_ID
+  instant_a_tier: true
+  daily_digest_enabled: true
+
+llm:
+  enabled: false
+  provider: openai
+  model: gpt-5-mini
+  api_key_env: OPENAI_API_KEY
+  prompt_path: config/llm_prompt.txt
+  max_description_chars: 6000
+
+sources:
+  - name: dailyremote-bridge
+    type: dailyremote
+    enabled: true
+    params:
+      search_urls:
+        - https://dailyremote.com/?search=Product%20Analytics%20Lead&employmentType=full-time&work_arrangement=remote&experience=5-10
+  - name: company-watchlist
+    type: watchlist
+    enabled: true
+    params:
+      watchlist_path: config/company_watchlist.yaml
+  - name: generic-careers
+    type: html
+    enabled: false
+    params:
+      url: https://example.com/careers
+      listing_selector: article.job-card
+      title_selector: a.job-title
+      company_selector: span.company-name
+      apply_selector: a.job-title
+      description_selector: p.job-summary
+      location_selector: span.location
+      employment_type_selector: span.employment-type
+      salary_selector: span.salary
+      timezone_selector: span.timezone
+      job_id_attribute: data-job-id
