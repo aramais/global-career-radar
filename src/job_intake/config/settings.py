@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import os
-from pathlib import Path
 import re
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -35,6 +35,11 @@ class LLMConfig:
     api_key_env: str = "OPENAI_API_KEY"
     prompt_path: str = "config/llm_prompt.txt"
     max_description_chars: int = 6000
+    reasoning_effort: str = "minimal"
+    max_output_tokens: int = 400
+    request_timeout: float = 30.0
+    semantic_score_min: float = -3.0
+    semantic_score_max: float = 6.0
 
 
 @dataclass(slots=True)

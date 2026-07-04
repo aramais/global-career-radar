@@ -40,6 +40,7 @@ class JobORM(Base):
     matched_signals: Mapped[list[str]] = mapped_column(JSON, default=list)
     filter_decision: Mapped[str] = mapped_column(String(32), index=True)
     fit_score: Mapped[float] = mapped_column(Float, default=0.0)
+    semantic_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     fit_reason: Mapped[str] = mapped_column(Text, default="")
     tier: Mapped[str] = mapped_column(String(4), default="C", index=True)
     bucket: Mapped[str] = mapped_column(String(32), default="Bucket C")

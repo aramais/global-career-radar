@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import csv
 
 from sqlalchemy import select
 
-from job_intake.models.job import EvaluatedJob, JobTier
+from job_intake.models.job import EvaluatedJob, JobRecord, JobTier
 from job_intake.storage.dedup import JobDeduplicator
 from job_intake.storage.models import FeedbackORM, JobEventORM, JobORM
 
@@ -55,6 +55,7 @@ class JobRepository:
                 matched_signals=item.evaluation.matched_signals,
                 filter_decision=item.evaluation.decision.value,
                 fit_score=item.evaluation.fit_score,
+                semantic_score=item.evaluation.semantic_score,
                 fit_reason=item.evaluation.fit_reason,
                 tier=item.evaluation.tier.value,
                 bucket=item.evaluation.bucket,
@@ -103,6 +104,7 @@ class JobRepository:
         existing.matched_signals = item.evaluation.matched_signals
         existing.filter_decision = item.evaluation.decision.value
         existing.fit_score = item.evaluation.fit_score
+        existing.semantic_score = item.evaluation.semantic_score
         existing.fit_reason = item.evaluation.fit_reason
         existing.bucket = item.evaluation.bucket
         existing.tier = item.evaluation.tier.value
@@ -136,6 +138,10 @@ class JobRepository:
             tier_changed=tier_changed,
             should_alert=should_alert,
         )
+
+    def find_by_record(self, record: JobRecord) -> JobORM | None:
+        identity = self.deduplicator.build_identity(record)
+        return self.session.scalar(select(JobORM).where(JobORM.job_uid == identity.job_uid))
 
     def mark_alert_sent(self, job_uid: str, tier: JobTier, channel: str, message: str) -> None:
         job = self.session.scalar(select(JobORM).where(JobORM.job_uid == job_uid))

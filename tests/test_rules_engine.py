@@ -7,7 +7,7 @@ def build_rules() -> FilterRules:
         {
             "positive_title_signals": ["product analytics lead", "staff data scientist"],
             "positive_description_signals": ["experimentation", "pricing", "marketplace"],
-            "negative_title_signals": ["ml engineer", "data engineer"],
+            "negative_title_signals": ["ml engineer", "data engineer", "machine learning engineer"],
             "negative_description_signals": ["mlops", "feature store"],
             "blocker_phrases": ["us work authorization required", "relocation required"],
             "review_phrases": ["preferred in"],

@@ -4,7 +4,6 @@ import hashlib
 import re
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
-
 WHITESPACE_RE = re.compile(r"\s+")
 PUNCT_STRIP_RE = re.compile(r"[^a-z0-9\s:/+-]")
 
@@ -44,6 +43,21 @@ def stable_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def matches_phrase(normalized_text: str, phrase: str) -> bool:
+    """Whole-token match of ``phrase`` inside already-normalized text.
+
+    Uses non-alphanumeric boundaries instead of a bare substring test, so ``ml`` no
+    longer matches inside ``html`` and ``pricing`` no longer matches ``repricing``.
+    Punctuation inside multi-token phrases (``a/b testing``, ``booking.com``) is
+    handled because ``normalize_text`` is applied to the phrase too.
+    """
+    norm_phrase = normalize_text(phrase)
+    if not norm_phrase:
+        return False
+    pattern = r"(?<![a-z0-9])" + re.escape(norm_phrase) + r"(?![a-z0-9])"
+    return re.search(pattern, normalized_text) is not None
+
+
 def contains_any(text: str, phrases: list[str]) -> list[str]:
     normalized = normalize_text(text)
-    return [phrase for phrase in phrases if normalize_text(phrase) in normalized]
+    return [phrase for phrase in phrases if matches_phrase(normalized, phrase)]

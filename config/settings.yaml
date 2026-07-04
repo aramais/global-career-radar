@@ -19,6 +19,11 @@ llm:
   api_key_env: OPENAI_API_KEY
   prompt_path: config/llm_prompt.txt
   max_description_chars: 6000
+  reasoning_effort: minimal
+  max_output_tokens: 400
+  request_timeout: 30.0
+  semantic_score_min: -3.0
+  semantic_score_max: 6.0
 
 sources:
   - name: dailyremote-bridge

@@ -14,10 +14,10 @@ from job_intake.scoring.llm import build_reranker
 from job_intake.scoring.pre_score import DeterministicScorer, SearchProfiles
 from job_intake.scoring.tiering import finalize_tier
 from job_intake.storage.database import Database
+from job_intake.storage.dedup import JobDeduplicator
 from job_intake.storage.models import JobORM
 from job_intake.storage.repository import JobRepository
 from job_intake.utils.logging import configure_logging
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,11 +33,14 @@ class JobIntakePipeline:
         self.scorer = DeterministicScorer(self.search_profiles)
         self.reranker = build_reranker(config.llm)
         self.telegram = TelegramNotifier(config.telegram)
+        self.deduplicator = JobDeduplicator()
 
     def run(self) -> dict[str, int]:
         ingested = 0
         persisted = 0
         alerts = 0
+        llm_calls = 0
+        llm_cache_hits = 0
 
         with self.database.session() as session:
             repository = JobRepository(session)
@@ -57,8 +60,18 @@ class JobIntakePipeline:
                         record.description_clean or record.description_raw,
                         evaluated.evaluation,
                     )
-                    evaluated = self.reranker.rerank(evaluated)
-                    evaluated = finalize_tier(evaluated)
+                    if self._apply_cached_rerank(record, evaluated, repository):
+                        llm_cache_hits += 1
+                    else:
+                        before = evaluated.evaluation.semantic_score
+                        evaluated = self.reranker.rerank(evaluated)
+                        if evaluated.evaluation.semantic_score != before:
+                            llm_calls += 1
+                    evaluated = finalize_tier(
+                        evaluated,
+                        self.search_profiles.threshold_a,
+                        self.search_profiles.threshold_b,
+                    )
                     result = repository.upsert_evaluated_job(evaluated)
                     persisted += 1
                     if result.should_alert and self.config.telegram.instant_a_tier:
@@ -70,7 +83,51 @@ class JobIntakePipeline:
                             repository.mark_alert_sent(result.job_uid, evaluated.evaluation.tier, "telegram", message)
                             alerts += 1
             session.commit()
-        return {"ingested": ingested, "persisted": persisted, "alerts": alerts}
+        LOGGER.info(
+            "run_complete ingested=%s persisted=%s alerts=%s llm_calls=%s llm_cache_hits=%s",
+            ingested,
+            persisted,
+            alerts,
+            llm_calls,
+            llm_cache_hits,
+        )
+        return {
+            "ingested": ingested,
+            "persisted": persisted,
+            "alerts": alerts,
+            "llm_calls": llm_calls,
+            "llm_cache_hits": llm_cache_hits,
+        }
+
+    def _apply_cached_rerank(self, record, evaluated, repository) -> bool:
+        """Reuse a previous LLM semantic score when the job is unchanged.
+
+        Deterministic scoring is cheap and always re-run; only the paid LLM call is
+        cached. A cache hit requires: LLM enabled, an existing row with an identical
+        ``content_hash``, and a previously persisted ``semantic_score``. On hit the
+        stored semantic contribution is re-applied without calling the API.
+        """
+        if not self.config.llm.enabled:
+            return False
+        existing = repository.find_by_record(record)
+        if existing is None or existing.semantic_score is None:
+            return False
+        identity = self.deduplicator.build_identity(record)
+        if existing.content_hash != identity.content_hash:
+            return False
+
+        evaluation = evaluated.evaluation
+        evaluation.semantic_score = existing.semantic_score
+        evaluation.fit_score += existing.semantic_score
+        evaluation.bridge_role = evaluation.bridge_role or existing.bridge_role
+        if existing.fit_reason:
+            evaluation.fit_reason = existing.fit_reason
+        if existing.risks:
+            evaluation.risks = sorted(set(evaluation.risks + list(existing.risks)))
+        evaluation.audit_log.append(
+            f"Semantic rerank reused from cache ({existing.semantic_score:.2f} points)."
+        )
+        return True
 
     def send_daily_digest(self, hours: int = 24) -> str:
         with self.database.session() as session:

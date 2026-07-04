@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from job_intake.models.job import FilterDecision, JobEvaluation, JobTier
-from job_intake.utils.text import contains_any, normalize_text
+from job_intake.utils.text import contains_any, matches_phrase, normalize_text
 
 
 @dataclass(slots=True)
@@ -58,12 +58,12 @@ class DeterministicScorer:
         description_text = normalize_text(description)
 
         for phrase, weight in self.profiles.title_weights.items():
-            if normalize_text(phrase) in title_text:
+            if matches_phrase(title_text, phrase):
                 score += float(weight)
                 evaluation.matched_signals.append(f"title_weight:{phrase}")
 
         for phrase, weight in self.profiles.description_weights.items():
-            if normalize_text(phrase) in description_text:
+            if matches_phrase(description_text, phrase):
                 score += float(weight)
                 evaluation.matched_signals.append(f"description_weight:{phrase}")
 
@@ -86,16 +86,8 @@ class DeterministicScorer:
         evaluation.deterministic_score = score
         evaluation.fit_score = score
 
-        if score >= self.profiles.threshold_a and evaluation.decision == FilterDecision.PASS:
-            evaluation.tier = JobTier.A
-            evaluation.bucket = "Bucket A"
-        elif score >= self.profiles.threshold_b:
-            evaluation.tier = JobTier.B
-            evaluation.bucket = "Bucket B"
-        else:
-            evaluation.tier = JobTier.C if evaluation.decision == FilterDecision.REJECT else JobTier.B
-            evaluation.bucket = "Bucket C" if evaluation.tier == JobTier.C else "Bucket B"
-
+        # Final tier/bucket are decided by finalize_tier() after optional LLM
+        # reranking, using the config thresholds — do not assign them here.
         evaluation.audit_log.append(f"Deterministic score computed as {score:.2f}.")
         return evaluation
 
