@@ -49,6 +49,19 @@ def render_html(
     typer.echo(f"Rendered review report to {path}")
 
 
+@app.command("prune")
+def prune(
+    config: str = typer.Option("config/settings.yaml", help="Path to app config YAML"),
+    days: int = typer.Option(90, help="Delete matching jobs not seen for this many days"),
+    tiers: str = typer.Option("C", help="Comma-separated tier(s) to prune; default C"),
+    vacuum: bool = typer.Option(False, "--vacuum/--no-vacuum", help="Run VACUUM after pruning"),
+) -> None:
+    pipeline = build_pipeline(config)
+    tier_tuple = tuple(t.strip() for t in tiers.split(",") if t.strip()) or ("C",)
+    removed = pipeline.prune(older_than_days=days, tiers=tier_tuple, do_vacuum=vacuum)
+    typer.echo(f"Pruned {removed} job(s) older than {days}d, tiers={list(tier_tuple)}")
+
+
 @app.command("feedback")
 def feedback(
     job_uid: str = typer.Argument(..., help="Job UID"),

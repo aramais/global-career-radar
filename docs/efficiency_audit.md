@@ -76,19 +76,31 @@ persistence (`JobRepository`) → Telegram instant/digest alerts. LLM reranking 
 - Also fixed a pre-existing broken test fixture (`test_rejects_non_target_ml_role_family` asserted a
   `title_blocker` its rules never produced).
 
-### P3 — optimizations (not started)
-- **P3-1** Batch reranking via the OpenAI Batch API for the nightly digest (−50% cost). _(finding 3/4)_
-- **P3-2** Token-aware (not char-count) description trimming; strip boilerplate before send. _(4)_
-- **P3-3** Memory retention: drop `description_raw` after cleaning or prune old C-tier rows;
-  periodic `VACUUM`. _(finding 9)_
-- **P3-4** Embedding-free bridge-role heuristic to gate more jobs away from the LLM. _(3)_
-- **P3-5** Alert de-duplication window. _(finding 10)_
+### P3 — optimizations (DONE in this commit; all default-off / behaviour-preserving)
+- **P3-1 — Batch API reranking.** Opt-in `BatchReranker.rerank_many` (files→batch→poll→parse) shares
+  `_apply_semantic_payload`/`render_prompt` with the sync path; `run()` defers cache-miss PASS jobs to
+  one batch when `llm.batch_enabled`. Blocks up to `batch_max_wait` — for the nightly digest, not
+  instant alerts. `scoring/llm.py`, `pipeline.py`, `config/settings.py`. _(findings 3/4)_
+- **P3-2 — Boilerplate strip + token estimate.** `strip_boilerplate` removes EOE/benefits/about-us/
+  apply-now lines before the LLM (gated by `llm.strip_boilerplate`); est-token debug log.
+  `utils/text.py`, `scoring/llm.py`. _(finding 4)_
+- **P3-3 — Retention.** `prune_low_tier` + `Database.vacuum()` + `job-intake prune --days --tiers
+  --vacuum`. `storage/repository.py`, `storage/database.py`, `pipeline.py`, `cli.py`. _(finding 9)_
+- **P3-4 — Heuristic LLM gating.** `should_skip_llm` skips the API when the deterministic outcome is
+  already unambiguous (clear A / clear low), gated by `llm.skip_high_confidence`. `scoring/llm.py`,
+  `pipeline.py`. _(finding 3)_
+- **P3-5 — Alert de-dup window.** `last_alerted_at` column (idempotent migration) + `alert_dedup_hours`
+  suppress repeat A-tier alerts inside the window. `storage/models.py`, `storage/database.py`,
+  `storage/repository.py`, `config/settings.py`, `pipeline.py`. _(finding 10)_
+
+_New tests: `tests/test_repository.py` (prune, alert dedup) and additions to `tests/test_llm.py`
+(boilerplate, heuristic, batch, output extraction). Suite: 27 passing._
 
 ## Verification
 
 ```bash
 .venv/bin/pip install -e .[dev] -q
-.venv/bin/pytest -q          # 17 passing (rules + dedup + tiering + llm)
+.venv/bin/pytest -q          # 27 passing (rules + dedup + tiering + llm + repository)
 .venv/bin/ruff check src/ tests/
 .venv/bin/python -c "from job_intake.pipeline import build_pipeline; build_pipeline('config/settings.yaml'); print('schema+init OK')"
 ```

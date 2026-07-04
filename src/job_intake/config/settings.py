@@ -25,6 +25,7 @@ class TelegramConfig:
     chat_id_env: str = "TELEGRAM_CHAT_ID"
     instant_a_tier: bool = True
     daily_digest_enabled: bool = True
+    alert_dedup_hours: float = 24.0
 
 
 @dataclass(slots=True)
@@ -40,6 +41,13 @@ class LLMConfig:
     request_timeout: float = 30.0
     semantic_score_min: float = -3.0
     semantic_score_max: float = 6.0
+    strip_boilerplate: bool = True
+    skip_high_confidence: bool = False
+    high_confidence_margin: float = 4.0
+    batch_enabled: bool = False
+    batch_completion_window: str = "24h"
+    batch_poll_interval: float = 30.0
+    batch_max_wait: float = 86400.0
 
 
 @dataclass(slots=True)

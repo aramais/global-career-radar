@@ -15,20 +15,31 @@ class Database:
         Base.metadata.create_all(self.engine)
         self._apply_lightweight_migrations()
 
+    # Additive columns that ``create_all`` cannot add to a pre-existing ``jobs`` table.
+    _JOBS_ADDITIVE_COLUMNS = {
+        "semantic_score": "FLOAT",
+        "last_alerted_at": "DATETIME",
+    }
+
     def _apply_lightweight_migrations(self) -> None:
         """Add columns that ``create_all`` cannot add to a pre-existing table.
 
         ``create_all`` only creates missing tables, never alters existing ones, so a
-        DB created before the ``semantic_score`` column existed would lack it. This is
-        a minimal, idempotent additive migration until Alembic is introduced.
+        DB created before a column existed would lack it. This is a minimal, idempotent
+        additive migration until Alembic is introduced.
         """
         inspector = inspect(self.engine)
         if "jobs" not in inspector.get_table_names():
             return
         columns = {col["name"] for col in inspector.get_columns("jobs")}
-        if "semantic_score" not in columns:
-            with self.engine.begin() as connection:
-                connection.execute(text("ALTER TABLE jobs ADD COLUMN semantic_score FLOAT"))
+        for name, ddl_type in self._JOBS_ADDITIVE_COLUMNS.items():
+            if name not in columns:
+                with self.engine.begin() as connection:
+                    connection.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {ddl_type}"))
+
+    def vacuum(self) -> None:
+        with self.engine.begin() as connection:
+            connection.execute(text("VACUUM"))
 
     def session(self) -> Session:
         return self.session_factory()

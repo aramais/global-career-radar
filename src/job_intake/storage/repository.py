@@ -22,9 +22,15 @@ class UpsertResult:
 
 
 class JobRepository:
-    def __init__(self, session, deduplicator: JobDeduplicator | None = None) -> None:
+    def __init__(
+        self,
+        session,
+        deduplicator: JobDeduplicator | None = None,
+        alert_dedup_hours: float = 0.0,
+    ) -> None:
         self.session = session
         self.deduplicator = deduplicator or JobDeduplicator()
+        self.alert_dedup_hours = alert_dedup_hours
 
     def upsert_evaluated_job(self, item: EvaluatedJob) -> UpsertResult:
         identity = self.deduplicator.build_identity(item.record)
@@ -131,6 +137,8 @@ class JobRepository:
         should_alert = item.evaluation.tier == JobTier.A and (
             existing.last_alerted_tier != JobTier.A.value or tier_changed
         )
+        if should_alert and not self._dedup_window_elapsed(existing.last_alerted_at, now):
+            should_alert = False
         return UpsertResult(
             job_uid=identity.job_uid,
             is_new=False,
@@ -138,6 +146,15 @@ class JobRepository:
             tier_changed=tier_changed,
             should_alert=should_alert,
         )
+
+    def _dedup_window_elapsed(self, last_alerted_at: datetime | None, now: datetime) -> bool:
+        """True when enough time has passed since the last alert to alert again."""
+        if self.alert_dedup_hours <= 0 or last_alerted_at is None:
+            return True
+        # SQLite returns naive datetimes even for timezone=True columns; assume UTC.
+        if last_alerted_at.tzinfo is None:
+            last_alerted_at = last_alerted_at.replace(tzinfo=timezone.utc)
+        return now - last_alerted_at >= timedelta(hours=self.alert_dedup_hours)
 
     def find_by_record(self, record: JobRecord) -> JobORM | None:
         identity = self.deduplicator.build_identity(record)
@@ -148,6 +165,7 @@ class JobRepository:
         if job is None:
             return
         job.last_alerted_tier = tier.value
+        job.last_alerted_at = datetime.now(timezone.utc)
         self.session.add(
             JobEventORM(
                 job_uid=job_uid,
@@ -173,6 +191,22 @@ class JobRepository:
 
     def add_feedback(self, job_uid: str, label: str, note: str = "") -> None:
         self.session.add(FeedbackORM(job_uid=job_uid, label=label, note=note))
+
+    def prune_low_tier(self, older_than_days: int, tiers: tuple[str, ...] = ("C",)) -> int:
+        """Delete low-tier jobs not seen for ``older_than_days`` days.
+
+        Uses ORM ``session.delete`` so the events/feedback cascade fires. Returns the
+        number of job rows removed.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+        stmt = select(JobORM).where(
+            JobORM.last_seen_at < cutoff,
+            JobORM.tier.in_(list(tiers)),
+        )
+        rows = list(self.session.scalars(stmt))
+        for row in rows:
+            self.session.delete(row)
+        return len(rows)
 
     def export_shortlisted_csv(self, output_path: Path, limit: int = 500) -> Path:
         rows = self.list_jobs(limit=limit)

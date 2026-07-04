@@ -10,7 +10,7 @@ from job_intake.alerts.digest import build_daily_digest, build_instant_alert
 from job_intake.alerts.telegram import TelegramNotifier
 from job_intake.config.settings import AppConfig, load_app_config, load_yaml_mapping
 from job_intake.filtering import FilterRules, RuleEngine
-from job_intake.scoring.llm import build_reranker
+from job_intake.scoring.llm import BatchReranker, build_reranker, should_skip_llm
 from job_intake.scoring.pre_score import DeterministicScorer, SearchProfiles
 from job_intake.scoring.tiering import finalize_tier
 from job_intake.storage.database import Database
@@ -32,25 +32,35 @@ class JobIntakePipeline:
         self.rule_engine = RuleEngine(self.rules)
         self.scorer = DeterministicScorer(self.search_profiles)
         self.reranker = build_reranker(config.llm)
+        self.batch_reranker = (
+            BatchReranker(config.llm) if config.llm.enabled and config.llm.batch_enabled else None
+        )
         self.telegram = TelegramNotifier(config.telegram)
         self.deduplicator = JobDeduplicator()
 
     def run(self) -> dict[str, int]:
-        ingested = 0
-        persisted = 0
-        alerts = 0
-        llm_calls = 0
-        llm_cache_hits = 0
+        stats = {
+            "ingested": 0,
+            "persisted": 0,
+            "alerts": 0,
+            "llm_calls": 0,
+            "llm_cache_hits": 0,
+            "llm_skipped": 0,
+            "llm_batched": 0,
+        }
 
         with self.database.session() as session:
-            repository = JobRepository(session)
+            repository = JobRepository(
+                session, alert_dedup_hours=self.config.telegram.alert_dedup_hours
+            )
+            pending_batch: list = []
             for source in self.config.sources:
                 if not source.enabled:
                     continue
                 adapter = build_adapter(source)
                 records = adapter.fetch_jobs()
                 LOGGER.info("source_fetched %s jobs from %s", len(records), source.name)
-                ingested += len(records)
+                stats["ingested"] += len(records)
                 for record in records:
                     evaluated = self.rule_engine.apply(record)
                     evaluated.evaluation = self.scorer.score(
@@ -61,43 +71,86 @@ class JobIntakePipeline:
                         evaluated.evaluation,
                     )
                     if self._apply_cached_rerank(record, evaluated, repository):
-                        llm_cache_hits += 1
+                        stats["llm_cache_hits"] += 1
+                    elif self._should_skip_llm(evaluated):
+                        stats["llm_skipped"] += 1
+                    elif self.batch_reranker is not None:
+                        pending_batch.append(evaluated)
+                        continue  # finalized after the batch completes
                     else:
                         before = evaluated.evaluation.semantic_score
                         evaluated = self.reranker.rerank(evaluated)
                         if evaluated.evaluation.semantic_score != before:
-                            llm_calls += 1
-                    evaluated = finalize_tier(
-                        evaluated,
-                        self.search_profiles.threshold_a,
-                        self.search_profiles.threshold_b,
-                    )
-                    result = repository.upsert_evaluated_job(evaluated)
-                    persisted += 1
-                    if result.should_alert and self.config.telegram.instant_a_tier:
-                        job = session.scalar(select(JobORM).where(JobORM.job_uid == result.job_uid))
-                        if job is None:
-                            continue
-                        message = build_instant_alert(job)
-                        if self.telegram.send(message):
-                            repository.mark_alert_sent(result.job_uid, evaluated.evaluation.tier, "telegram", message)
-                            alerts += 1
+                            stats["llm_calls"] += 1
+                    stats["alerts"] += self._finalize_persist_alert(evaluated, repository, session)
+                    stats["persisted"] += 1
+
+            if pending_batch:
+                for evaluated in self.batch_reranker.rerank_many(pending_batch):
+                    stats["llm_batched"] += 1
+                    stats["alerts"] += self._finalize_persist_alert(evaluated, repository, session)
+                    stats["persisted"] += 1
+
             session.commit()
         LOGGER.info(
-            "run_complete ingested=%s persisted=%s alerts=%s llm_calls=%s llm_cache_hits=%s",
-            ingested,
-            persisted,
-            alerts,
-            llm_calls,
-            llm_cache_hits,
+            "run_complete ingested=%s persisted=%s alerts=%s llm_calls=%s "
+            "llm_cache_hits=%s llm_skipped=%s llm_batched=%s",
+            stats["ingested"],
+            stats["persisted"],
+            stats["alerts"],
+            stats["llm_calls"],
+            stats["llm_cache_hits"],
+            stats["llm_skipped"],
+            stats["llm_batched"],
         )
-        return {
-            "ingested": ingested,
-            "persisted": persisted,
-            "alerts": alerts,
-            "llm_calls": llm_calls,
-            "llm_cache_hits": llm_cache_hits,
-        }
+        return stats
+
+    def _should_skip_llm(self, evaluated) -> bool:
+        if not (self.config.llm.enabled and self.config.llm.skip_high_confidence):
+            return False
+        if should_skip_llm(
+            evaluated.evaluation,
+            self.search_profiles.threshold_a,
+            self.search_profiles.threshold_b,
+            self.config.llm.high_confidence_margin,
+        ):
+            evaluated.evaluation.audit_log.append(
+                "LLM skipped (high deterministic confidence)."
+            )
+            return True
+        return False
+
+    def _finalize_persist_alert(self, evaluated, repository, session) -> int:
+        """Finalize tier, persist, and send an instant alert if warranted. Returns alerts sent."""
+        evaluated = finalize_tier(
+            evaluated,
+            self.search_profiles.threshold_a,
+            self.search_profiles.threshold_b,
+        )
+        result = repository.upsert_evaluated_job(evaluated)
+        if result.should_alert and self.config.telegram.instant_a_tier:
+            job = session.scalar(select(JobORM).where(JobORM.job_uid == result.job_uid))
+            if job is None:
+                return 0
+            message = build_instant_alert(job)
+            if self.telegram.send(message):
+                repository.mark_alert_sent(
+                    result.job_uid, evaluated.evaluation.tier, "telegram", message
+                )
+                return 1
+        return 0
+
+    def prune(
+        self, older_than_days: int, tiers: tuple[str, ...] = ("C",), do_vacuum: bool = False
+    ) -> int:
+        with self.database.session() as session:
+            repository = JobRepository(session)
+            removed = repository.prune_low_tier(older_than_days, tiers)
+            session.commit()
+        if do_vacuum:
+            self.database.vacuum()
+        LOGGER.info("prune_complete removed=%s vacuum=%s", removed, do_vacuum)
+        return removed
 
     def _apply_cached_rerank(self, record, evaluated, repository) -> bool:
         """Reuse a previous LLM semantic score when the job is unchanged.

@@ -11,6 +11,7 @@ telegram:
   chat_id_env: TELEGRAM_CHAT_ID
   instant_a_tier: true
   daily_digest_enabled: true
+  alert_dedup_hours: 24.0
 
 llm:
   enabled: false
@@ -24,6 +25,13 @@ llm:
   request_timeout: 30.0
   semantic_score_min: -3.0
   semantic_score_max: 6.0
+  strip_boilerplate: true
+  skip_high_confidence: false
+  high_confidence_margin: 4.0
+  batch_enabled: false
+  batch_completion_window: 24h
+  batch_poll_interval: 30.0
+  batch_max_wait: 86400.0
 
 sources:
   - name: dailyremote-bridge

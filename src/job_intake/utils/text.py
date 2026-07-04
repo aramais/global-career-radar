@@ -7,6 +7,33 @@ from urllib.parse import parse_qsl, urlparse, urlunparse
 WHITESPACE_RE = re.compile(r"\s+")
 PUNCT_STRIP_RE = re.compile(r"[^a-z0-9\s:/+-]")
 
+# Conservative markers of non-signal boilerplate commonly found in job posts. A line is
+# dropped only when it clearly reads as boilerplate, so real role content is preserved.
+BOILERPLATE_MARKERS = (
+    "equal opportunity",
+    "equal employment",
+    "we are an equal",
+    "does not discriminate",
+    "reasonable accommodation",
+    "background check",
+    "e-verify",
+    "about us",
+    "about the company",
+    "who we are",
+    "our mission",
+    "our values",
+    "why join us",
+    "perks and benefits",
+    "benefits include",
+    "what we offer",
+    "how to apply",
+    "apply now",
+    "apply today",
+    "click apply",
+    "join our team",
+    "follow us on",
+)
+
 
 def normalize_text(value: str | None) -> str:
     if not value:
@@ -61,3 +88,29 @@ def matches_phrase(normalized_text: str, phrase: str) -> bool:
 def contains_any(text: str, phrases: list[str]) -> list[str]:
     normalized = normalize_text(text)
     return [phrase for phrase in phrases if matches_phrase(normalized, phrase)]
+
+
+def strip_boilerplate(text: str, markers: tuple[str, ...] | None = None) -> str:
+    """Drop boilerplate lines before sending a description to the LLM.
+
+    Splits on newlines and sentence-ish boundaries, removing lines that contain a known
+    boilerplate marker (EOE/benefits/about-us/apply-now) or that are too short to carry
+    role signal. Conservative by design: when in doubt the line is kept. Reduces tokens
+    without changing the deterministic pipeline (only the LLM prompt input).
+    """
+    if not text:
+        return ""
+    markers = markers if markers is not None else BOILERPLATE_MARKERS
+    kept: list[str] = []
+    for raw_line in re.split(r"[\n\r]+", text):
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.casefold()
+        if any(marker in lowered for marker in markers):
+            continue
+        # Drop very short non-sentence fragments (nav/labels), keep real content lines.
+        if len(line) < 3:
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip() or text.strip()

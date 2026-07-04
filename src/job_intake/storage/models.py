@@ -48,6 +48,9 @@ class JobORM(Base):
     audit_log: Mapped[list[str]] = mapped_column(JSON, default=list)
     bridge_role: Mapped[bool] = mapped_column(default=False)
     last_alerted_tier: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    last_alerted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     source_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
