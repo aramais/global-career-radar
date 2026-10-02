@@ -20,7 +20,7 @@ class SearchProfiles:
     threshold_b: float
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "SearchProfiles":
+    def from_mapping(cls, data: dict[str, Any]) -> SearchProfiles:
         return cls(
             bucket_a_signals=data.get("bucket_a_signals", []),
             bucket_b_signals=data.get("bucket_b_signals", []),
@@ -69,7 +69,9 @@ class DeterministicScorer:
 
         score += self._source_weight(source)
 
-        if normalize_text(company) in [normalize_text(name) for name in self.profiles.company_priority]:
+        if normalize_text(company) in [
+            normalize_text(name) for name in self.profiles.company_priority
+        ]:
             score += 2.0
             evaluation.matched_signals.append(f"company_priority:{company}")
 

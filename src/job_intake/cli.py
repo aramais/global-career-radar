@@ -4,10 +4,11 @@ from pathlib import Path
 
 import typer
 
+from job_intake.config.settings import load_app_config, load_yaml_mapping
 from job_intake.pipeline import build_pipeline
+from job_intake.profiles import load_streams
 
-
-app = typer.Typer(add_completion=False, help="Deterministic-first job intake pipeline")
+app = typer.Typer(add_completion=False, help="Personal multi-profile job search")
 
 
 @app.command()
@@ -15,8 +16,39 @@ def run(config: str = typer.Option("config/settings.yaml", help="Path to app con
     pipeline = build_pipeline(config)
     result = pipeline.run()
     typer.echo(
-        f"Run completed: ingested={result['ingested']} persisted={result['persisted']} alerts={result['alerts']}"
+        f"Run completed: ingested={result['ingested']} persisted={result['persisted']} "
+        f"evaluations={result['evaluations']} alerts={result['alerts']} "
+        f"source_errors={result['source_errors']} record_errors={result['record_errors']}"
     )
+    for error in result["errors"]:
+        typer.echo(error, err=True)
+    if result["source_errors"] or result["record_errors"] or result["alert_errors"]:
+        raise typer.Exit(code=1)
+
+
+@app.command("profiles")
+def profiles(config: str = typer.Option("config/settings.yaml", help="App config YAML")) -> None:
+    """List enabled search profiles and the queries they generate."""
+    settings = load_app_config(config)
+    streams = load_streams(
+        load_yaml_mapping(settings.rules_path), load_yaml_mapping(settings.search_profiles_path)
+    )
+    for stream in streams:
+        typer.echo(f"{stream.id}: {stream.name} (version {stream.version[:8]})")
+        typer.echo(f"  Keywords: {', '.join(stream.keywords)}")
+
+
+@app.command("reevaluate")
+def reevaluate(config: str = typer.Option("config/settings.yaml", help="App config YAML")) -> None:
+    """Re-score saved vacancies offline without fetching, AI calls or notifications."""
+    result = build_pipeline(config).reevaluate_saved()
+    typer.echo(
+        f"Reevaluated {result['persisted']} jobs, {result['evaluations']} profile evaluations"
+    )
+    for error in result["errors"]:
+        typer.echo(error, err=True)
+    if result["record_errors"]:
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -32,10 +64,20 @@ def digest(
 def export_csv(
     config: str = typer.Option("config/settings.yaml", help="Path to app config YAML"),
     output: str = typer.Option("data/shortlisted_jobs.csv", help="Export target CSV path"),
+    profile: str | None = typer.Option(None, help="Enabled profile ID"),
+    include_rejected: bool = typer.Option(False, help="Include hard rejected vacancies"),
+    shortlist: bool = typer.Option(
+        False, help="Export A/B tiers only; default includes low scores"
+    ),
 ) -> None:
     pipeline = build_pipeline(config)
-    path = pipeline.export_csv(Path(output).resolve())
-    typer.echo(f"Exported shortlist to {path}")
+    path = pipeline.export_csv(
+        Path(output).resolve(),
+        profile_id=profile,
+        include_rejected=include_rejected,
+        shortlist=shortlist,
+    )
+    typer.echo(f"Exported vacancies to {path}")
 
 
 @app.command("render-html")
@@ -43,9 +85,10 @@ def render_html(
     config: str = typer.Option("config/settings.yaml", help="Path to app config YAML"),
     output: str = typer.Option("data/review.html", help="HTML report target"),
     limit: int = typer.Option(100, help="Maximum number of recent rows to render"),
+    profile: str | None = typer.Option(None, help="Initial profile filter"),
 ) -> None:
     pipeline = build_pipeline(config)
-    path = pipeline.render_html(Path(output).resolve(), limit=limit)
+    path = pipeline.render_html(Path(output).resolve(), limit=limit, profile_id=profile)
     typer.echo(f"Rendered review report to {path}")
 
 

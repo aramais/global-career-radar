@@ -14,6 +14,7 @@ from job_intake.scoring.llm import (
     BatchReranker,
     OpenAIReranker,
     _extract_output_text,
+    render_prompt,
     should_skip_llm,
 )
 
@@ -250,3 +251,116 @@ def test_batch_reranker_missing_key_falls_back(monkeypatch: pytest.MonkeyPatch) 
 
     assert result[0].evaluation.semantic_score is None
     assert any("skipped" in entry.lower() for entry in result[0].evaluation.audit_log)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"semantic_score": "3"},
+        {"semantic_score": True},
+        {"semantic_score": float("nan")},
+        {"semantic_score": float("inf")},
+        {"semantic_score": 2, "bridge_role": "false"},
+        {"semantic_score": 2, "fit_reason": ["not a string"]},
+        {"semantic_score": 2, "risks": "not a list"},
+        {"semantic_score": 2, "risks": [None]},
+        ["not an object"],
+    ],
+)
+def test_invalid_semantic_payload_keeps_deterministic_evaluation(
+    monkeypatch: pytest.MonkeyPatch, payload,
+) -> None:
+    _install_fake_openai(monkeypatch, json.dumps(payload))
+    job = _passing_job("Role with uncertain fit.")
+    job.evaluation.fit_reason = "Deterministic explanation"
+    job.evaluation.risks = ["Existing risk"]
+
+    result = _reranker().rerank(job)
+
+    assert result.evaluation.semantic_score is None
+    assert result.evaluation.fit_score == 10.0
+    assert result.evaluation.fit_reason == "Deterministic explanation"
+    assert result.evaluation.risks == ["Existing risk"]
+    assert result.evaluation.bridge_role is False
+    assert any("failed" in entry.lower() for entry in result.evaluation.audit_log)
+
+
+def test_batch_bad_payload_does_not_lose_other_scores(monkeypatch: pytest.MonkeyPatch) -> None:
+    jobs = [_passing_job("Role one."), _passing_job("Role two.")]
+    output_lines = [
+        {
+            "custom_id": "0",
+            "response": {"body": {"output_text": json.dumps({"semantic_score": 3.0})}},
+        },
+        {
+            "custom_id": "1",
+            "response": {
+                "body": {"output_text": json.dumps({"semantic_score": 2, "bridge_role": "false"})}
+            },
+        },
+    ]
+    _install_fake_batch_openai(monkeypatch, output_lines)
+    reranker = BatchReranker(LLMConfig(enabled=True, batch_enabled=True, prompt_path=PROMPT_PATH))
+
+    result = reranker.rerank_many(jobs)
+
+    assert result[0].evaluation.semantic_score == 3.0
+    assert result[1].evaluation.semantic_score is None
+    assert result[1].evaluation.fit_score == 10.0
+    assert any("failed" in entry.lower() for entry in result[1].evaluation.audit_log)
+
+
+def test_prompt_contains_active_profile_context() -> None:
+    job = _passing_job("Own {roadmap} for the product.")
+    job.profile_id = "product_management"
+    job.profile_name = "Product Management"
+    job.profile_context = "Product strategy, discovery and roadmap ownership."
+    prompt = render_prompt(
+        "Profile: {profile_name} ({profile_id}). Candidate: {profile_context}. Job: {description}",
+        LLMConfig(), job,
+    )
+    assert "Product Management (product_management)" in prompt
+    assert "Product strategy, discovery and roadmap ownership." in prompt
+    assert "Own {roadmap}" in prompt
+
+
+def test_review_rerank_keeps_manual_review_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_openai(
+        monkeypatch, json.dumps({"semantic_score": 5.0, "bridge_role": True, "risks": []})
+    )
+    job = _passing_job("A product role with hiring country unconfirmed.")
+    job.evaluation.decision = FilterDecision.REVIEW
+    job.evaluation.risks = ["geography:eligibility_unconfirmed"]
+
+    result = _reranker().rerank(job)
+
+    assert result.evaluation.decision == FilterDecision.REVIEW
+    assert result.evaluation.fit_score == 15.0
+    assert result.evaluation.risks == ["geography:eligibility_unconfirmed"]
+
+
+def test_hard_rejected_job_cannot_be_reranked(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _install_fake_openai(monkeypatch, json.dumps({"semantic_score": 6.0}))
+    job = _passing_job("Must reside in Germany.")
+    job.evaluation.decision = FilterDecision.REJECT
+
+    result = _reranker().rerank(job)
+
+    assert result.evaluation.decision == FilterDecision.REJECT
+    assert result.evaluation.semantic_score is None
+    assert client.responses.last_prompt is None
+
+
+def test_batch_review_rerank_does_not_change_filter_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _passing_job("Role with uncertain language.")
+    job.evaluation.decision = FilterDecision.REVIEW
+    _install_fake_batch_openai(monkeypatch, [{
+        "custom_id": "0",
+        "response": {"body": {"output_text": json.dumps({"semantic_score": 4.0})}},
+    }])
+    reranker = BatchReranker(LLMConfig(enabled=True, batch_enabled=True, prompt_path=PROMPT_PATH))
+    result = reranker.rerank_many([job])
+    assert result[0].evaluation.decision == FilterDecision.REVIEW
+    assert result[0].evaluation.fit_score == 14.0

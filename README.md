@@ -1,205 +1,245 @@
-# Job Intake MVP
+# Job Intake — личный поиск работы
 
-Precision-first personal job intake system for senior analytics leadership roles. The pipeline ingests public job sources, normalizes them, enforces deterministic hard filters, applies optional semantic reranking only after a pass, stores every decision with rationale, and sends compact Telegram alerts for high-priority matches.
+Проект собирает вакансии, оценивает их по нескольким настраиваемым потокам поиска и
+помогает быстро выбирать варианты для отклика. Первая версия ориентирована на широкий
+охват: удалённая работа с возможностью найма из Бразилии либо работа в São Paulo,
+рабочий язык — английский. Неясные условия остаются доступны для ручной проверки.
 
-This MVP is intentionally strict:
+Главная продуктовая цель — доходить до интервью с командой. Этот этап создаёт основу
+поиска и отбора; CRM откликов, рефералы, версии CV и материалы для отклика относятся
+к следующему этапу. Исходный файл `JobCRM.xlsx` не изменяется и пока не импортируется
+в рабочую базу.
 
-- deterministic rules gate first
-- LLM reranking can never override hard rejects
-- precision is favored over recall
-- no LinkedIn login, authenticated scraping, or auto-apply flow
+## Что уже работает
 
-## Concise architecture summary
+- Четыре независимых профиля: Product Management, Analytics Leadership, Business
+  Analytics и Data Science Management. Одна вакансия получает отдельную оценку
+  по каждому включённому профилю.
+- DailyRemote, публичные API Greenhouse, Ashby и Lever, HTML-страницы компаний и
+  смешанная watchlist. ATS передают полные описания; DailyRemote может догружать
+  описание из страницы вакансии.
+- Явные ограничения, причины оценки, вопросы для проверки и категории A/B/C.
+  Низкое соответствие сохраняет вакансию для просмотра.
+- SQLite с историей событий и feedback, широкий CSV и локальный HTML-отчёт
+  с фильтрами по профилю, результату, тексту и порядку сортировки.
+- Переоценка сохранённых вакансий после изменения критериев без обращения
+  к источникам, AI или Telegram.
+- Независимое сохранение вакансий: сбой другой страницы, компании или источника
+  не откатывает уже записанные результаты.
 
-- Ingestion layer
-  - `DailyRemoteAdapter` parses public DailyRemote listing pages
-  - `HtmlPageAdapter` parses public career pages with configurable selectors
-  - `CompanyWatchlistAdapter` wraps curated companies on top of the HTML adapter
-- Normalization layer
-  - all sources emit a common `JobRecord` schema
-- Deterministic hard-filter layer
-  - `RuleEngine` rejects geography, authorization, timezone, office-presence, closed, and role-family blockers
-  - every rejection persists explicit blocker signals and reasons
-- Ranking layer
-  - `DeterministicScorer` computes a config-driven pre-score
-  - `OpenAIReranker` is optional and only runs for passed jobs
-  - final output is bucketed into `Bucket A`, `Bucket B`, or `Bucket C` and tiered as `A`, `B`, or `C`
-- Persistence and review
-  - SQLite via SQLAlchemy, with a clean path to PostgreSQL
-  - deduplication, event log, feedback capture, CSV export, and HTML review page
-- Alerting
-  - instant Telegram alert for A-tier roles
-  - daily Telegram digest for A/B-tier roles
+AI и Telegram выключены по умолчанию. Сбор запускается вручную командой `run`;
+встроенного расписания и автоматически развёрнутого сервиса нет.
 
-## Implementation plan
+## Запуск из папки проекта
 
-1. Ingest from DailyRemote, public company pages, and a watchlist-driven HTML adapter.
-2. Normalize everything into one schema before any filtering.
-3. Apply deterministic hard filters for geography, authorization, timezone, title taxonomy, and status.
-4. Score only passing jobs with deterministic weights, then optionally LLM-rerank.
-5. Persist all seen jobs, state changes, audit trails, and alert history.
-6. Alert only on A-tier roles instantly and provide a daily digest for A/B-tier.
-7. Expose operator workflows through CLI, CSV export, HTML review, and feedback capture.
-
-## Repository structure
-
-```text
-.
-├── README.md
-├── Dockerfile
-├── Makefile
-├── pyproject.toml
-├── requirements.txt
-├── config
-│   ├── company_watchlist.yaml
-│   ├── llm_prompt.txt
-│   ├── rules.yaml
-│   ├── search_profiles.yaml
-│   └── settings.yaml
-├── data
-├── docs
-│   ├── architecture.md
-│   └── telegram_digest.md
-├── scripts
-│   ├── export_shortlist.py
-│   └── run_pipeline.py
-├── src
-│   └── job_intake
-│       ├── adapters
-│       ├── alerts
-│       ├── config
-│       ├── models
-│       ├── review
-│       ├── scoring
-│       ├── storage
-│       ├── utils
-│       ├── cli.py
-│       ├── filtering.py
-│       └── pipeline.py
-└── tests
-    ├── test_dedup.py
-    └── test_rules_engine.py
-```
-
-## Key files
-
-- App entrypoint: `src/job_intake/cli.py`
-- Pipeline orchestration: `src/job_intake/pipeline.py`
-- Deterministic rules: `src/job_intake/filtering.py`
-- Deduplication: `src/job_intake/storage/dedup.py`
-- Persistence: `src/job_intake/storage/models.py`
-- DailyRemote adapter: `src/job_intake/adapters/dailyremote.py`
-- Generic HTML adapter: `src/job_intake/adapters/html_page.py`
-- Configurable rules: `config/rules.yaml`
-- Search buckets and weights: `config/search_profiles.yaml`
-
-## Setup instructions
-
-### Runtime requirement
-
-- Python `3.11+`
-
-### Local setup
+Нужен Python 3.11 или новее. Для нового окружения:
 
 ```bash
 python3.11 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -e .[dev]
-cp .env.example .env
+.venv/bin/python -m pip install -e '.[dev]'
 ```
 
-Edit `.env` as needed:
-
-```env
-OPENAI_API_KEY=
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-JOB_INTAKE_DATABASE_URL=sqlite:///data/job_intake.db
-JOB_INTAKE_LOG_LEVEL=INFO
-```
-
-### Configure filters and sources
-
-- Tune hard blockers and positive signals in `config/rules.yaml`
-- Tune bucket weights in `config/search_profiles.yaml`
-- Add target companies in `config/company_watchlist.yaml`
-- Enable LLM reranking in `config/settings.yaml` only after deterministic filters are stable
-
-### Run the pipeline
+Следующие команды выполняются из корня репозитория. Относительный путь к SQLite
+рассчитывается относительно текущей рабочей папки.
 
 ```bash
-job-intake run --config config/settings.yaml
+# Посмотреть активные профили и поисковые слова
+.venv/bin/job-intake profiles --config config/settings.yaml
+
+# Собрать вакансии из включённых публичных источников и сохранить оценки
+.venv/bin/job-intake run --config config/settings.yaml
+
+# Создать широкий список и HTML для ручного отбора
+.venv/bin/job-intake export-csv --config config/settings.yaml --output data/jobs.csv
+.venv/bin/job-intake render-html --config config/settings.yaml --output data/review.html --limit 500
 ```
 
-### Generate digest and exports
+`run` обращается к сайтам. При частичных ошибках он выводит причины и завершает CLI
+с ненулевым кодом; успешные записи сохраняются. Откройте `data/review.html` в браузере:
+это локальный отчёт, для его фильтров нужен JavaScript. Изменения в базе появятся
+после следующего `render-html`.
+
+## Настройка потоков
+
+Профили находятся в `config/search_profiles.yaml`:
+
+| ID | Направление | Начальные запросы |
+| --- | --- | --- |
+| `product-management` | Product Management | Product Manager, Product Lead, Head of Product, Product Owner |
+| `analytics-leadership` | Analytics Leadership | Head of Analytics, Analytics Manager, Head of Data, Product Analytics Lead |
+| `business-analytics` | Business Analytics | Business Analytics Manager, Business Analyst Manager, Head of Business Analytics |
+| `data-science-management` | Data Science Management | Data Science Manager, Product Data Science Manager, Head of Data Science, Data Science Lead |
+
+У каждого потока можно изменить:
+
+- `enabled` — участвует ли он в поиске и текущем отчёте;
+- `keywords` — запросы к DailyRemote; одинаковые запросы включённых потоков
+  объединяются;
+- `context` — описание искомой роли для дополнительной AI-оценки;
+- `rules` — переопределения общих правил из `config/rules.yaml`;
+- `scoring` — веса названий и содержания, приоритет компаний, сигналы и пороги
+  A/B. Общие значения находятся в `defaults`.
+
+Стабильный `id` связывает профиль с сохранённой историей. Изменение правил, весов,
+названия или контекста создаёт новую версию критериев; сохранённые оценки становятся
+устаревшими до следующей переоценки. Для пары вакансия–профиль хранится последняя
+оценка, а не архив всех её версий. Изменение только `keywords` меняет
+запросы для следующего сбора.
+
+После изменения критериев:
 
 ```bash
-job-intake digest --config config/settings.yaml
-job-intake export-csv --config config/settings.yaml --output data/shortlisted_jobs.csv
-job-intake render-html --config config/settings.yaml --output data/review.html
+.venv/bin/job-intake reevaluate --config config/settings.yaml
+.venv/bin/job-intake export-csv --config config/settings.yaml --output data/jobs.csv
+.venv/bin/job-intake render-html --config config/settings.yaml --output data/review.html --limit 500
 ```
 
-### Store operator feedback
+`reevaluate` использует уже сохранённые данные и только детерминированные правила.
+Он сохраняет даты публикации, первого обнаружения, последнего наблюдения и создания
+записи; оценки и дата обновления меняются. Команда не догружает неполные описания.
+
+## Отбор с приоритетом полноты
+
+В `config/rules.yaml` включён `recall_first: true`. Разделяются решение и баллы:
+
+| Решение | Что означает |
+| --- | --- |
+| `PASS` | Правила не нашли обязательных препятствий или вопросов, есть целевые сигналы |
+| `REVIEW` | География найма, рабочий язык или другие условия требуют проверки; роль может быть смежной |
+| `REJECT` | Найдено явное обязательное ограничение, несовместимое с настройками профиля, либо вакансия закрыта |
+
+Например, «remote» без подтверждения найма из Бразилии остаётся `REVIEW`. Английский
+текст объявления сам по себе не подтверждает английский рабочий язык. Несоответствие
+семейству ролей в широком режиме становится риском для проверки. Обязательное
+проживание в Германии не отменяется словами «contractor», «async» или «worldwide».
+
+A/B/C выражают соответствие профилю. A требует `PASS`, целевого сигнала и достаточного
+балла; `REVIEW` не превращается в A только из-за высокой оценки. C включает как
+низкое соответствие, так и явные ограничения; эти случаи показываются отдельно.
+
+## CSV и HTML
+
+CSV по умолчанию включает A/B и низкие оценки C, исключая явные `REJECT`. По умолчанию
+выгружается до 500 вакансий. В нём есть условия, описание, риски и оценки профилей.
 
 ```bash
-job-intake feedback <job_uid> false_positive --note "US-only restriction slipped through"
-job-intake feedback <job_uid> false_negative --note "Strong bridge role, improve title allowlist"
+# Ранжировать и отбирать по одному включённому профилю
+.venv/bin/job-intake export-csv --profile analytics-leadership --output data/analytics.csv
+
+# Только A/B
+.venv/bin/job-intake export-csv --shortlist --output data/shortlist.csv
+
+# Сохранить также явные ограничения для аудита правил
+.venv/bin/job-intake export-csv --include-rejected --output data/all_jobs.csv
+
+# Открыть HTML с выбранным начальным профилем
+.venv/bin/job-intake render-html --profile product-management --output data/review.html --limit 500
 ```
 
-## Config examples
+HTML показывает все выгруженные записи: подходящие варианты, низкое соответствие,
+явные ограничения и вакансии без актуальной оценки. Переключение профиля меняет
+оценку и причины для той же вакансии. Доступны поиск по компании, роли и описанию,
+фильтр результата, сортировка по баллам или дате первого обнаружения и ссылки
+на источник и отклик.
 
-### Search buckets
-
-- `Bucket A`
-  - bridge roles with clear product/business analytics leadership signals
-  - likely alert-worthy
-- `Bucket B`
-  - adjacent or partially matching roles worth manual review
-- `Bucket C`
-  - hard rejects or low-fit roles logged only
-
-### Deterministic filter examples
-
-- reject
-  - `us work authorization required`
-  - `must reside in the united states`
-  - `eu only`
-  - `relocation required`
-  - `machine learning engineer`
-- keep
-  - `worldwide`
-  - `contractor`
-  - `EOR`
-  - `LATAM`
-  - `distributed team`
-
-## Telegram digest format
-
-See `docs/telegram_digest.md` for concrete examples.
-
-## Tests
-
-The test suite covers:
-
-- rules-engine hard rejection and review logic
-- dedup identity behavior across source IDs, canonical URLs, and content fingerprints
-
-Run with:
+Feedback сохраняется как заметка для последующей работы, без автоматического
+обучения правил. Подставьте UID вакансии из CSV:
 
 ```bash
-pytest
+.venv/bin/job-intake feedback '<job_uid>' false_positive --note 'Проверить географию найма'
 ```
 
-## Production hardening next steps
+## Источники и полные описания
 
-1. Add per-source integration tests with recorded HTML fixtures so selector drift is caught early.
-2. Add provider-specific ATS adapters for Greenhouse, Lever, Ashby, and Workday public endpoints.
-3. Move from polling-only HTML parsing to RSS/API feeds where available.
-4. Add a lightweight admin UI with filter tuning, feedback review, and event history.
-5. Add outbound email and Slack delivery as secondary alert channels.
-6. Add idempotent scheduler wrappers for cron or systemd timers on your server.
-7. Add migration tooling such as Alembic before moving to PostgreSQL in production.
-8. Add selector health checks and a dead-source alert so broken ingestion is surfaced quickly.
-9. Add embedding-free semantic heuristics for bridge-role classification before expanding LLM usage.
-10. Add backup, retention, and alert dedupe policies for long-running production use.
+Источники включаются в `config/settings.yaml`, компании — в
+`config/company_watchlist.yaml`. Текущая ATS-watchlist содержит Supabase и Wikimedia
+Foundation. Старые HTML-конфигурации Stripe и Airbnb выключены до проверки селекторов.
+Живая проверка 1 октября 2026 получила 48 вакансий Supabase и 11 Wikimedia с полными
+описаниями, а также 12 карточек DailyRemote. На проверенных страницах DailyRemote
+полное описание закрыто доступом; карточки сохраняются для ручной проверки.
+
+DailyRemote создаёт запросы по `keywords` всех включённых потоков. В текущих настройках
+`max_pages: 1` ограничивает каждый запрос одной страницей, а `max_detail_fetches: 40`
+задаёт общий лимит догрузок описания для этого источника за один запуск. Можно задать
+`search_urls` вручную, выключив `use_profile_queries`. Пагинация следует `a[rel="next"]`
+или заданному `next_selector`, если такой переход есть на странице. Пределы адаптера:
+до 20 страниц на запрос и до 1000 догрузок.
+
+Детали читаются из JSON-LD `JobPosting` или семантического селектора описания;
+`detail_description_selector` позволяет указать свой CSS-селектор. Переходы и
+перенаправления к деталям остаются на исходном HTTP(S)-origin. При ошибке, отсутствии
+описания или исчерпании лимита сохраняется вся карточка с
+`description_complete: false` и причиной в метаданных. Время сбора не подставляется
+в дату публикации. В широком режиме явно неполное описание добавляет вопрос для
+проверки и решение `REVIEW`.
+
+Публичные ATS не требуют ключа для чтения этих endpoints:
+
+| Тип | `params` | Данные |
+| --- | --- | --- |
+| `greenhouse` | `board_token`, `company` | `content=true`: полное описание, локация; дата редактирования отдельно от публикации |
+| `ashby` | `board_name`, `company` | Полное описание, локации, `publishedAt`, опубликованная зарплата |
+| `lever` | `site`, `company`; опционально `region: global` или `eu`, `page_size`, `max_pages` | Описание вместе со списками требований и заключением, локации, зарплата; ограниченная пагинация |
+
+Для Lever по умолчанию запрашивается до 100 записей на странице и до 10 страниц.
+
+Пример компании в watchlist:
+
+```yaml
+companies:
+  - name: Supabase
+    type: ashby
+    enabled: true
+    bucket: core
+    params:
+      board_name: supabase
+      company: Supabase
+```
+
+Тот же `type` и `params` можно использовать как отдельный источник в `settings.yaml`.
+Watchlist также поддерживает `type: html` и прежний формат с `careers_url` и селекторами.
+Для HTML можно задать фиксированную `company`, `posted_at_selector` и
+`detail_description_selector`; последний включает догрузку, если `fetch_details`
+явно не выключен.
+
+Описание API: [Greenhouse Job Board API](https://docs.greenhouse.io/job-board.html),
+[Ashby Public Job Posting API](https://developers.ashbyhq.com/docs/public-job-posting-api),
+[Lever Postings API](https://github.com/lever/postings-api/blob/master/README.md).
+
+## AI, уведомления и данные
+
+`llm.enabled` и `telegram.enabled` в `config/settings.yaml` по умолчанию равны `false`.
+Если включить их, ключи задаются через переменные окружения, перечисленные в
+`.env.example`. AI может оценивать `PASS` и `REVIEW`, сохраняя явные отказы. Кеш
+раздельный для профилей; он учитывает полное сохранённое содержание и метаданные,
+версию критериев, модель, конфигурацию AI и фактический текст промпта. Размер текста,
+передаваемого AI, отдельно ограничивает `max_description_chars`.
+
+Для мгновенных Telegram-уведомлений вакансия, её оценки и запись outbox фиксируются
+в SQLite до отправки. Неудачная доставка остаётся ожидающей и повторяется при
+следующем `run`. Это доставка с возможным повтором: если процесс завершится после
+успешной отправки, но до сохранения подтверждения, сообщение может прийти ещё раз.
+`digest` формирует A/B-дайджест и при включённых настройках отправляет его; расписание
+для запуска команды не настроено.
+
+База по умолчанию — `data/job_intake.db`. При открытии старой SQLite-базы добавляются
+недостающие колонки и таблицы оценок профилей/outbox; существующие вакансии и события
+сохраняются. Дедупликация опирается прежде всего на ID источника, затем на URL или
+fingerprint. Одна вакансия из разных источников пока может остаться несколькими
+записями: объединение таких идентификаторов ещё неполное.
+
+## Проверка и следующие этапы
+
+```bash
+.venv/bin/pytest
+```
+
+Проверки используют локальные фикстуры и временные SQLite-базы: ограничения,
+независимые оценки, полные описания, сбои источников, кеш, outbox, экспорт,
+HTML-отчёт и повторяемая миграция. Отдельная живая проверка выполнена для Supabase,
+Wikimedia и одного запроса DailyRemote; весь набор запросов и Lever пока проверены
+локальными фикстурами. Результаты пробного сбора — в `.audit/phase1-preview/`.
+
+Дальше: импорт истории из копии JobCRM, контакты и реферальные маршруты, этапы отклика
+с датами и следующими действиями, версии CV и подготовка материалов. Подробности
+текущей реализации — в [архитектуре](docs/architecture.md).

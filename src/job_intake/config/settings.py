@@ -76,6 +76,7 @@ ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::-([^}]+))?\}")
 
 def _expand_env(value: Any) -> Any:
     if isinstance(value, str):
+
         def replace(match: re.Match[str]) -> str:
             name = match.group(1)
             default = match.group(2) or ""
@@ -103,12 +104,21 @@ def load_app_config(path: str | Path) -> AppConfig:
         )
         for item in raw.get("sources", [])
     ]
+    for source in sources:
+        if source.type == "watchlist" and "watchlist_path" in source.params:
+            source.params["watchlist_path"] = str(
+                (config_path.parent.parent / source.params["watchlist_path"]).resolve()
+            )
     telegram = TelegramConfig(**raw.get("telegram", {}))
     llm_raw = raw.get("llm", {})
     llm = LLMConfig(
         **{
             **llm_raw,
-            "prompt_path": str((config_path.parent.parent / llm_raw.get("prompt_path", "config/llm_prompt.txt")).resolve()),
+            "prompt_path": str(
+                (
+                    config_path.parent.parent / llm_raw.get("prompt_path", "config/llm_prompt.txt")
+                ).resolve()
+            ),
         }
     )
     return AppConfig(

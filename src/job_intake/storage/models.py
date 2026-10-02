@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Base(DeclarativeBase):
@@ -48,9 +48,7 @@ class JobORM(Base):
     audit_log: Mapped[list[str]] = mapped_column(JSON, default=list)
     bridge_role: Mapped[bool] = mapped_column(default=False)
     last_alerted_tier: Mapped[str | None] = mapped_column(String(4), nullable=True)
-    last_alerted_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    last_alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     source_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -58,11 +56,66 @@ class JobORM(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
-
-    events: Mapped[list["JobEventORM"]] = relationship(back_populates="job", cascade="all, delete")
-    feedback: Mapped[list["FeedbackORM"]] = relationship(
-        back_populates="job", cascade="all, delete"
+    best_profile_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    best_profile_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    alert_pending: Mapped[bool] = mapped_column(default=False)
+    profile_evaluations: Mapped[list[JobProfileEvaluationORM]] = relationship(
+        back_populates="job", cascade="all, delete-orphan"
     )
+    alert_outbox: Mapped[list[AlertOutboxORM]] = relationship(
+        back_populates="job", cascade="all, delete-orphan"
+    )
+
+    events: Mapped[list[JobEventORM]] = relationship(back_populates="job", cascade="all, delete")
+    feedback: Mapped[list[FeedbackORM]] = relationship(back_populates="job", cascade="all, delete")
+
+
+class JobProfileEvaluationORM(Base):
+    __tablename__ = "job_profile_evaluations"
+    __table_args__ = (UniqueConstraint("job_uid", "profile_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_uid: Mapped[str] = mapped_column(ForeignKey("jobs.job_uid"), index=True)
+    profile_id: Mapped[str] = mapped_column(String(100), index=True)
+    profile_name: Mapped[str] = mapped_column(String(255))
+    profile_version: Mapped[str] = mapped_column(String(64))
+    content_hash: Mapped[str] = mapped_column(String(64))
+    llm_cache_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    decision: Mapped[str] = mapped_column(String(32))
+    deterministic_score: Mapped[float] = mapped_column(Float)
+    semantic_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fit_score: Mapped[float] = mapped_column(Float)
+    tier: Mapped[str] = mapped_column(String(4))
+    bucket: Mapped[str] = mapped_column(String(32))
+    matched_signals: Mapped[list[str]] = mapped_column(JSON, default=list)
+    blocker_signals: Mapped[list[str]] = mapped_column(JSON, default=list)
+    reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+    fit_reason: Mapped[str] = mapped_column(Text)
+    bridge_role: Mapped[bool] = mapped_column(default=False)
+    risks: Mapped[list[str]] = mapped_column(JSON, default=list)
+    audit_log: Mapped[list[str]] = mapped_column(JSON, default=list)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    job: Mapped[JobORM] = relationship(back_populates="profile_evaluations")
+
+
+class AlertOutboxORM(Base):
+    __tablename__ = "alert_outbox"
+    __table_args__ = (UniqueConstraint("job_uid", "channel"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_uid: Mapped[str] = mapped_column(ForeignKey("jobs.job_uid"), index=True)
+    channel: Mapped[str] = mapped_column(String(32), default="telegram")
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    message: Mapped[str] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    job: Mapped[JobORM] = relationship(back_populates="alert_outbox")
 
 
 class JobEventORM(Base):

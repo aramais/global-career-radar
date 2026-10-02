@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "job-intake-mvp"
 version = "0.1.0"
-description = "Deterministic-first personal job intake system for precision remote role discovery"
+description = "Personal multi-profile job search with broad intake and explicit eligibility checks"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}

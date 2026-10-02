@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -52,14 +53,29 @@ def _apply_semantic_payload(
     Clamps ``semantic_score`` to the advertised range so a misbehaving model cannot
     skew tiers, then folds it into the fit score and merges bridge/reason/risks.
     """
-    semantic_score = float(payload.get("semantic_score", 0.0))
+    if not isinstance(payload, dict):
+        raise ValueError("Semantic payload must be a JSON object.")
+    raw_score = payload.get("semantic_score", 0.0)
+    if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+        raise ValueError("semantic_score must be a finite number.")
+    semantic_score = float(raw_score)
+    if not math.isfinite(semantic_score):
+        raise ValueError("semantic_score must be a finite number.")
+    bridge_role = payload.get("bridge_role", False)
+    if not isinstance(bridge_role, bool):
+        raise ValueError("bridge_role must be a JSON boolean.")
+    explanation = payload.get("fit_reason", "")
+    if not isinstance(explanation, str):
+        raise ValueError("fit_reason must be a string.")
+    risks = payload.get("risks", [])
+    if not isinstance(risks, list) or any(not isinstance(item, str) for item in risks):
+        raise ValueError("risks must be an array of strings.")
+    # Validate the entire payload before changing any deterministic field.
     semantic_score = max(
         min(semantic_score, config.semantic_score_max),
         config.semantic_score_min,
     )
-    bridge_role = bool(payload.get("bridge_role", False))
-    explanation = str(payload.get("fit_reason", "")).strip()
-    risks = [str(item) for item in payload.get("risks", [])]
+    explanation = explanation.strip()
 
     evaluation.semantic_score = semantic_score
     evaluation.fit_score += semantic_score
@@ -108,6 +124,12 @@ def render_prompt(template: str, config: LLMConfig, job: EvaluatedJob) -> str:
         "{employment_type}": job.record.employment_type or "",
         "{timezone_text}": job.record.timezone_text or "",
         "{description}": description,
+        "{profile_id}": getattr(job, "profile_id", "default"),
+        "{profile_name}": getattr(job, "profile_name", "") or "Default profile",
+        "{profile_version}": getattr(job, "profile_version", ""),
+        "{profile_context}": getattr(job, "profile_context", "") or (
+            "Assess fit to the configured role-family signals. Do not infer a candidate profile."
+        ),
     }
     prompt = template
     for placeholder, value in replacements.items():
@@ -135,8 +157,8 @@ class OpenAIReranker(SemanticReranker):
         return render_prompt(self.prompt_template, self.config, job)
 
     def rerank(self, job: EvaluatedJob) -> EvaluatedJob:
-        if job.evaluation.decision != FilterDecision.PASS:
-            job.evaluation.audit_log.append("Semantic rerank not allowed for non-passing job.")
+        if job.evaluation.decision == FilterDecision.REJECT:
+            job.evaluation.audit_log.append("Semantic rerank not allowed for hard-rejected job.")
             return job
 
         api_key = os.getenv(self.config.api_key_env)
@@ -164,6 +186,7 @@ class OpenAIReranker(SemanticReranker):
                     getattr(usage, "output_tokens", None),
                 )
             payload = json.loads(_strip_json_fence(response.output_text))
+            _apply_semantic_payload(job.evaluation, payload, self.config)
         except Exception as exc:  # noqa: BLE001 - any failure must fall back deterministically
             LOGGER.warning("llm_rerank_failed error=%s", exc)
             job.evaluation.audit_log.append(
@@ -171,12 +194,11 @@ class OpenAIReranker(SemanticReranker):
             )
             return job
 
-        _apply_semantic_payload(job.evaluation, payload, self.config)
         return job
 
 
 class BatchReranker:
-    """Rerank a batch of passing jobs in one OpenAI Batch API job (≈50% cheaper).
+    """Rerank a batch of non-rejected jobs in one OpenAI Batch API job (≈50% cheaper).
 
     Opt-in and asynchronous by nature: it submits all requests together, polls until
     the batch completes, then applies the parsed scores. Suited to the nightly digest
@@ -204,7 +226,7 @@ class BatchReranker:
         }
 
     def rerank_many(self, jobs: list[EvaluatedJob]) -> list[EvaluatedJob]:
-        passing = [job for job in jobs if job.evaluation.decision == FilterDecision.PASS]
+        passing = [job for job in jobs if job.evaluation.decision != FilterDecision.REJECT]
         if not passing:
             return jobs
 
@@ -244,11 +266,21 @@ class BatchReranker:
                 )
             return jobs
 
+        applied = 0
         for custom_id, payload in results.items():
             job = index.get(custom_id)
             if job is not None and payload is not None:
-                _apply_semantic_payload(job.evaluation, payload, self.config)
-        LOGGER.info("batch_rerank_applied count=%s", len(results))
+                try:
+                    _apply_semantic_payload(job.evaluation, payload, self.config)
+                    applied += 1
+                except (TypeError, ValueError) as exc:
+                    LOGGER.warning(
+                        "batch_rerank_payload_invalid custom_id=%s error=%s", custom_id, exc
+                    )
+                    job.evaluation.audit_log.append(
+                        f"Batch rerank failed, kept deterministic result: {exc}"
+                    )
+        LOGGER.info("batch_rerank_applied count=%s", applied)
         return jobs
 
     def _poll(self, client, batch_id: str):
@@ -269,14 +301,18 @@ class BatchReranker:
             line = line.strip()
             if not line:
                 continue
-            record = json.loads(line)
-            custom_id = record.get("custom_id")
-            body = (record.get("response") or {}).get("body", {})
-            output_text = _extract_output_text(body)
             try:
+                record = json.loads(line)
+                custom_id = record.get("custom_id")
+                body = (record.get("response") or {}).get("body", {})
+                output_text = _extract_output_text(body)
                 parsed = json.loads(_strip_json_fence(output_text)) if output_text else None
-            except json.JSONDecodeError:
-                parsed = None
+            except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+                LOGGER.warning("batch_rerank_output_invalid error=%s", exc)
+                # Keep partial successes when a single output line is malformed.
+                continue
+            if not isinstance(custom_id, str):
+                continue
             results[custom_id] = parsed
         return results
 

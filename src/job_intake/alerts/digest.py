@@ -1,19 +1,33 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 
 from job_intake.storage.models import JobORM
 
 
-def format_job_line(job: JobORM) -> str:
+@dataclass(slots=True)
+class DigestJob:
+    company: str
+    title: str
+    tier: str
+    fit_score: float
+    risks: list[str]
+    matched_signals: list[str]
+    fit_reason: str
+    apply_url: str | None
+    original_url: str
+
+
+def format_job_line(job: JobORM | DigestJob) -> str:
     risks = f" | Risks: {', '.join(job.risks[:2])}" if job.risks else ""
     why = ", ".join(job.matched_signals[:3]) or job.fit_reason
     url = job.apply_url or job.original_url
     return f"- [{job.tier}] {job.title} @ {job.company} | Why: {why}{risks} | Link: {url}"
 
 
-def build_daily_digest(jobs: list[JobORM]) -> str:
-    grouped: dict[str, list[JobORM]] = defaultdict(list)
+def build_daily_digest(jobs: list[JobORM | DigestJob]) -> str:
+    grouped: dict[str, list[JobORM | DigestJob]] = defaultdict(list)
     for job in jobs:
         grouped[job.tier].append(job)
 

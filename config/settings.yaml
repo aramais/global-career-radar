@@ -34,12 +34,16 @@ llm:
   batch_max_wait: 86400.0
 
 sources:
+  # Keep the existing source ID so re-fetching March history updates the same records.
   - name: dailyremote-bridge
     type: dailyremote
     enabled: true
     params:
-      search_urls:
-        - https://dailyremote.com/?search=Product%20Analytics%20Lead&employmentType=full-time&work_arrangement=remote&experience=5-10
+      use_profile_queries: true
+      search_url_template: https://dailyremote.com/?search={query}
+      fetch_details: true
+      max_detail_fetches: 40
+      max_pages: 1
   - name: company-watchlist
     type: watchlist
     enabled: true

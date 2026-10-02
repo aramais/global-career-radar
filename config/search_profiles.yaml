@@ -1,65 +1,80 @@
-bucket_a_signals:
-  - product analytics
-  - experimentation
-  - pricing
-  - monetization
-  - marketplace
-  - unit economics
-  - decision science
-  - forecasting
-  - kpi governance
+# Edit each stream independently; changing criteria makes saved evaluations stale.
+defaults:
+  company_priority: []
+  source_weights:
+    dailyremote-bridge: 1.0
+    company-watchlist: 1.0
+  bucket_c_signals: []
+  threshold_a: 14
+  threshold_b: 6
 
-bucket_b_signals:
-  - growth analytics
-  - revenue analytics
-  - product strategy
-  - strategic analytics
-  - stakeholder management
+streams:
+  - id: product-management
+    name: Product Management
+    enabled: true
+    context: >
+      Product Manager or Product Lead with product strategy, discovery, roadmap ownership,
+      experimentation and business impact. Adjacent product roles are worth manual review.
+      English working language. Remote hiring from Brazil or local work in Sao Paulo.
+    keywords: [Product Manager, Product Lead, Head of Product, Product Owner]
+    rules:
+      positive_title_signals: [product manager, product lead, head of product, product owner]
+      positive_description_signals: [product discovery, product strategy, roadmap, user research]
+    scoring:
+      title_weights: {product manager: 8, product lead: 8, head of product: 7, product owner: 5}
+      description_weights: {product discovery: 3, roadmap: 3, user research: 3, experimentation: 3}
+      bucket_a_signals: [product discovery, product strategy, roadmap]
+      bucket_b_signals: [stakeholder management, growth, pricing]
 
-bucket_c_signals:
-  - mlops
-  - platform
-  - ai engineer
-  - data engineering
-  - dashboarding
-  - reporting only
+  - id: analytics-leadership
+    name: Analytics Leadership
+    enabled: true
+    context: >
+      Head of Analytics, Analytics Manager, Product Analytics Lead, or adjacent analytics
+      leadership. Product-facing analytics, experimentation, pricing and monetization.
+      English working language. Remote hiring from Brazil or local work in Sao Paulo.
+    keywords: [Head of Analytics, Analytics Manager, Head of Data, Product Analytics Lead]
+    rules:
+      positive_title_signals: [head of analytics, head of data, analytics manager, product analytics, lead product analyst]
+      positive_description_signals: [experimentation, pricing, monetization, analytics leadership]
+    scoring:
+      title_weights: {head of analytics: 8, head of data: 7, analytics manager: 8, product analytics lead: 8, product analytics: 5}
+      description_weights: {experimentation: 3, pricing: 3, monetization: 3, unit economics: 3, kpi governance: 3}
+      bucket_a_signals: [experimentation, pricing, monetization, marketplace]
+      bucket_b_signals: [product strategy, growth analytics, strategic analytics]
 
-company_priority:
-  - netflix
-  - airbnb
-  - stripe
-  - uber
-  - doordash
-  - booking.com
+  - id: business-analytics
+    name: Business Analytics
+    enabled: true
+    context: >
+      Business Analyst Manager, Business Analytics Manager, Head of Business Analytics,
+      or adjacent business operations and decision support leadership.
+      English working language. Remote hiring from Brazil or local work in Sao Paulo.
+    keywords: [Business Analytics Manager, Business Analyst Manager, Head of Business Analytics]
+    rules:
+      positive_title_signals: [business analytics, business analyst manager, business analysis manager, business operations]
+      positive_description_signals: [business strategy, decision support, forecasting, stakeholder management]
+    scoring:
+      title_weights: {business analytics manager: 8, business analyst manager: 8, head of business analytics: 8, business analytics: 5, business operations: 4}
+      description_weights: {business strategy: 3, decision support: 3, forecasting: 3, stakeholder management: 2, business requirements: 2}
+      bucket_a_signals: [business strategy, decision support, forecasting]
+      bucket_b_signals: [strategic analytics, business requirements, revenue]
 
-source_weights:
-  dailyremote-bridge: 1.5
-  company-watchlist: 3.0
-
-title_weights:
-  head of analytics: 8
-  product analytics lead: 8
-  product data science manager: 7
-  senior product data science manager: 7
-  lead product analyst: 7
-  monetization: 6
-  pricing: 6
-  staff data scientist: 5
-  lead data scientist: 5
-  analytics manager: 4
-
-description_weights:
-  experimentation: 3
-  a/b testing: 3
-  unit economics: 4
-  marketplace: 4
-  pricing: 4
-  monetization: 4
-  forecasting: 3
-  decision systems: 3
-  product strategy: 2
-  revenue strategy: 2
-  kpi governance: 2
-
-threshold_a: 14
-threshold_b: 8
+  - id: data-science-management
+    name: Data Science Management
+    enabled: true
+    context: >
+      Data Science Manager or Product Data Science Manager with team leadership and
+      product/business ownership. Technical and adjacent data science roles remain reviewable.
+      English working language. Remote hiring from Brazil or local work in Sao Paulo.
+    keywords: [Data Science Manager, Product Data Science Manager, Head of Data Science, Data Science Lead]
+    rules:
+      positive_title_signals: [data science manager, head of data science, data scientist, data science lead]
+      positive_description_signals: [team leadership, experimentation, product analytics, decision science]
+      negative_title_signals: []
+      negative_description_signals: []
+    scoring:
+      title_weights: {data science manager: 8, product data science manager: 8, head of data science: 8, data science lead: 7, data scientist: 4}
+      description_weights: {team leadership: 3, experimentation: 3, product analytics: 3, decision science: 3, people management: 3}
+      bucket_a_signals: [team leadership, experimentation, product analytics]
+      bucket_b_signals: [forecasting, stakeholder management, business impact]

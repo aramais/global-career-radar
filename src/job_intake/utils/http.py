@@ -7,7 +7,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
-
 LOGGER = logging.getLogger(__name__)
 
 

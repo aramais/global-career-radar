@@ -1,6 +1,23 @@
+# Start with ATS boards already present in JobCRM; add other companies here.
 companies:
-  - name: Stripe
+  - name: Supabase
+    type: ashby
     enabled: true
+    bucket: core
+    params:
+      board_name: supabase
+      company: Supabase
+  - name: Wikimedia Foundation
+    type: greenhouse
+    enabled: true
+    bucket: core
+    params:
+      board_token: wikimedia
+      company: Wikimedia Foundation
+  - name: Stripe
+    type: html
+    # Validate these legacy selectors before enabling; this URL covers analytics only.
+    enabled: false
     bucket: core
     careers_url: https://stripe.com/jobs/search?query=analytics
     listing_selector: div[role="listitem"]
@@ -9,8 +26,8 @@ companies:
     location_selector: div[data-testid="job-location"]
     description_selector: div[data-testid="job-team"]
     apply_selector: a
-    job_id_attribute: data-testid
   - name: Airbnb
+    type: html
     enabled: false
     bucket: core
     careers_url: https://careers.airbnb.com/positions/

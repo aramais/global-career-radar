@@ -65,6 +65,10 @@ class JobEvaluation:
 class EvaluatedJob:
     record: JobRecord
     evaluation: JobEvaluation
+    profile_id: str = "default"
+    profile_name: str = ""
+    profile_version: str = ""
+    profile_context: str = ""
 
 
 @dataclass(slots=True)

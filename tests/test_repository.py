@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
@@ -46,7 +46,7 @@ def test_prune_removes_old_low_tier_only() -> None:
     repo.upsert_evaluated_job(_evaluated("Old A role", JobTier.A))
     session.flush()
 
-    old = datetime.now(timezone.utc) - timedelta(days=200)
+    old = datetime.now(UTC) - timedelta(days=200)
     for job in session.scalars(select(JobORM)):
         if job.title.startswith("Old"):
             job.last_seen_at = old
@@ -92,7 +92,7 @@ def test_alert_fires_again_after_window() -> None:
     session.flush()
 
     stored = session.scalar(select(JobORM).where(JobORM.job_uid == first.job_uid))
-    stored.last_alerted_at = datetime.now(timezone.utc) - timedelta(hours=48)
+    stored.last_alerted_at = datetime.now(UTC) - timedelta(hours=48)
     session.flush()
 
     repo.upsert_evaluated_job(_evaluated("Bridge role", JobTier.B))

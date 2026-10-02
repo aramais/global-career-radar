@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from job_intake.models.job import JobRecord
@@ -27,7 +28,7 @@ class JobDeduplicator:
                 normalize_text(job.title),
                 normalize_text(job.location_text),
                 normalize_text(job.remote_text),
-                normalize_text(job.description_clean[:800]),
+                normalize_text((job.description_clean or job.description_raw)[:800]),
             ]
         )
         fingerprint = stable_hash(body_basis)
@@ -36,10 +37,12 @@ class JobDeduplicator:
             "|".join(
                 [
                     body_basis,
+                    normalize_text(job.description_clean or job.description_raw),
                     normalize_text(job.salary_text),
                     normalize_text(job.timezone_text),
                     normalize_text(job.employment_type),
                     normalize_text(job.status.value),
+                    json.dumps(job.source_metadata, sort_keys=True, ensure_ascii=False),
                 ]
             )
         )
