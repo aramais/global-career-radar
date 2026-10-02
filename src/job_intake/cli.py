@@ -5,10 +5,12 @@ from pathlib import Path
 import typer
 
 from job_intake.config.settings import load_app_config, load_yaml_mapping
+from job_intake.crm.cli import app as crm_app
 from job_intake.pipeline import build_pipeline
 from job_intake.profiles import load_streams
 
 app = typer.Typer(add_completion=False, help="Personal multi-profile job search")
+app.add_typer(crm_app, name="crm")
 
 
 @app.command()

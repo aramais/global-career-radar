@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from sqlalchemy import create_engine, inspect, text
+from importlib import import_module
+from pathlib import Path
+
+from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from job_intake.storage.models import Base
@@ -8,12 +12,26 @@ from job_intake.storage.models import Base
 
 class Database:
     def __init__(self, url: str) -> None:
+        parsed = make_url(url)
+        if (
+            parsed.drivername.startswith("sqlite")
+            and parsed.database not in (None, ":memory:")
+            and not parsed.database.startswith("file:")
+        ):
+            Path(parsed.database).parent.mkdir(parents=True, exist_ok=True)
         self.engine = create_engine(url, future=True)
+        if parsed.drivername.startswith("sqlite"):
+            event.listen(self.engine, "connect", self._enable_foreign_keys)
         self.session_factory = sessionmaker(bind=self.engine, autoflush=False, future=True)
 
     def create_schema(self) -> None:
+        import_module("job_intake.crm.models")
         Base.metadata.create_all(self.engine)
         self._apply_lightweight_migrations()
+
+    @staticmethod
+    def _enable_foreign_keys(connection, _record) -> None:
+        connection.execute("PRAGMA foreign_keys=ON")
 
     # Additive columns that ``create_all`` cannot add to a pre-existing ``jobs`` table.
     _JOBS_ADDITIVE_COLUMNS = {

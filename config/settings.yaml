@@ -1,9 +1,13 @@
-database_url: ${JOB_INTAKE_DATABASE_URL:-sqlite:///data/job_intake.db}
+database_url: ${JOB_INTAKE_DATABASE_URL:-sqlite:///data/local/job_intake.db}
 log_level: ${JOB_INTAKE_LOG_LEVEL:-INFO}
 rules_path: rules.yaml
 search_profiles_path: search_profiles.yaml
 company_watchlist_path: company_watchlist.yaml
 export_dir: data
+
+crm:
+  team_interview_goal: 4
+  weekly_time_budget_hours: 10
 
 telegram:
   enabled: false

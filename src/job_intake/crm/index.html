@@ -1,0 +1,734 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Career Radar · CRM поиска</title>
+<style>
+:root{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#203347;
+background:#f5f7fa;font-size:15px;--muted:#607286;--line:#dce4ec;--ink:#203347;
+--blue:#205da5;--light:#eaf2fc;--green:#247658;--danger:#ad3c37;--amber:#916119}
+*{box-sizing:border-box}body{margin:0}button,input,select,textarea{font:inherit}
+button,a,input,select,textarea{outline-offset:3px}button{cursor:pointer;border:1px solid var(--line);
+background:white;color:var(--ink);padding:.65rem .85rem;border-radius:8px;font-weight:600}
+button:hover{background:#f2f6fb}button.primary{background:var(--blue);color:white;border-color:var(--blue)}
+button.primary:hover{background:#174e8f}button:disabled{opacity:.55;cursor:wait}a{color:var(--blue)}
+input,select,textarea{width:100%;border:1px solid #cbd6e1;border-radius:7px;padding:.65rem;
+background:white;color:var(--ink)}textarea{resize:vertical;min-height:90px}label{display:block;
+font-size:.84rem;font-weight:600;line-height:1.4}label>span{display:block;margin-bottom:.35rem}
+.muted{color:var(--muted)}.small{font-size:.82rem}.tiny{font-size:.75rem}.wrap{max-width:1450px;
+padding:24px 32px;margin:auto}.top{display:flex;align-items:center;justify-content:space-between;
+gap:18px}.brand{font-size:.78rem;color:var(--blue);text-transform:uppercase;letter-spacing:.13em;
+font-weight:750}h1{font-size:1.85rem;letter-spacing:-.04em;margin:.35rem 0 .5rem}h2{font-size:1.1rem;
+margin:0 0 .75rem}h3{font-size:1rem;margin:0 0 .35rem}p{line-height:1.5;margin:.4rem 0}.top p{max-width:760px}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.push{margin-left:auto}.status{font-size:.8rem;
+color:var(--muted)}.status.error{color:var(--danger)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);
+gap:14px;margin:22px 0 12px}.metric,.panel,.card{background:white;border:1px solid var(--line);
+border-radius:12px}.metric{padding:18px}.metric-value{font-size:1.8rem;letter-spacing:-.04em;
+font-weight:750;margin:.25rem 0}.metric-label{font-size:.82rem;color:var(--muted)}.metric-help{
+font-size:.77rem;color:var(--muted);min-height:1.1rem}.goal-meter{height:5px;border-radius:5px;
+background:#e4ebf2;margin:12px 0 0;overflow:hidden}.goal-meter>div{height:100%;background:var(--green)}
+.period-note{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:.8rem;
+color:var(--muted)}.tabs{display:flex;gap:5px;margin:22px 0 14px;border-bottom:1px solid var(--line);
+overflow:auto;padding-bottom:7px}.tab{white-space:nowrap;border:0;background:transparent;color:var(--muted)}
+.channel-panel{margin-top:13px;padding:13px 16px;overflow:auto}.channel-panel summary{cursor:pointer;
+font-size:.84rem;font-weight:650}.channel-panel table{width:100%;border-collapse:collapse;font-size:.8rem;
+margin-top:12px;white-space:nowrap}.channel-panel th,.channel-panel td{text-align:left;padding:8px;
+border-bottom:1px solid #edf1f5}.channel-panel th{color:var(--muted);font-weight:600}
+.tab.active{background:var(--light);color:var(--blue)}.filters{padding:16px;display:grid;
+grid-template-columns:1.6fr 1fr 1fr 1fr 1fr auto;gap:10px;align-items:end;margin-bottom:15px}
+.view-toolbar{display:flex;gap:12px;align-items:center;justify-content:space-between;margin:18px 0 12px}
+.list{display:grid;gap:11px}.card{padding:17px 19px}.card-head{display:flex;align-items:flex-start;
+gap:14px;justify-content:space-between}.card-title{font-size:1rem;font-weight:700;line-height:1.45}
+.card-company{font-size:.83rem;color:var(--muted);margin:.15rem 0 .5rem}.tags{display:flex;gap:7px;
+flex-wrap:wrap;margin:.55rem 0}.badge{display:inline-flex;border-radius:20px;background:#f0f3f7;
+font-size:.75rem;padding:.3rem .55rem;color:#4b627a}.badge.blue{background:var(--light);color:var(--blue)}
+.badge.green{background:#e7f4ed;color:var(--green)}.badge.red{background:#fff0ee;color:var(--danger)}
+.badge.amber{background:#fff6e5;color:var(--amber)}.action-line{margin:.75rem 0 0;padding-top:.7rem;
+border-top:1px solid #edf1f5;font-size:.85rem;line-height:1.5}.empty{padding:45px 20px;text-align:center;
+background:white;border:1px dashed #ccd7e2;border-radius:12px}.empty h3{margin-bottom:.45rem}
+.empty p{color:var(--muted);font-size:.88rem}.count{color:var(--muted);font-size:.83rem}
+[hidden]{display:none!important}.banner{padding:12px 16px;border-radius:9px;margin:12px 0;
+background:#fff1ec;color:#85362b;font-size:.9rem}.view-note{font-size:.85rem;color:var(--muted);
+line-height:1.5;margin:0 0 15px}.grid-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.card-notes{white-space:pre-wrap;font-size:.84rem;line-height:1.5;color:var(--muted);margin-top:.6rem}
+.job-description{white-space:pre-wrap;font-size:.84rem;line-height:1.6;max-height:300px;overflow:auto;
+border-top:1px solid var(--line);margin-top:12px;padding-top:12px}.inline-button{padding:.45rem .6rem;
+font-size:.8rem}.modal-shade{position:fixed;inset:0;background:#17304777;z-index:20;display:flex;
+justify-content:center;align-items:flex-start;padding:5vh 18px;overflow:auto}.modal{width:min(1030px,100%);
+background:white;border:1px solid var(--line);border-radius:16px;box-shadow:0 25px 90px #10233844}
+.modal-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:22px 25px;
+border-bottom:1px solid var(--line)}.modal-header h2{font-size:1.35rem;margin:0 0 .25rem}
+.close{font-size:1.2rem;padding:.3rem .65rem;line-height:1.1}.modal-body{padding:22px 25px}
+.detail-grid{display:grid;grid-template-columns:1.45fr 1fr;gap:25px}.form-grid{display:grid;
+grid-template-columns:repeat(2,1fr);gap:13px}.full{grid-column:1/-1}.form-actions{display:flex;
+justify-content:flex-end;gap:10px;margin-top:16px}.detail-section{margin-bottom:23px}
+.detail-section+.detail-section{border-top:1px solid var(--line);padding-top:21px}
+.history{list-style:none;padding:0;margin:10px 0}.history li{padding:0 0 14px 16px;
+border-left:2px solid #d6e4f4;position:relative;margin-left:4px}.history li:before{content:"";
+width:8px;height:8px;border-radius:50%;background:var(--blue);position:absolute;left:-5px;top:5px}
+.history-title{font-size:.85rem;font-weight:650}.history-note{font-size:.8rem;color:var(--muted);
+white-space:pre-wrap;margin-top:.25rem}.contact-row{background:#f7f9fc;border:1px solid #e8edf3;
+border-radius:8px;padding:10px;margin:9px 0}.contact-row p{font-size:.8rem}.contact-select{display:grid;
+grid-template-columns:1fr 1fr;gap:10px}.help{font-size:.76rem;color:var(--muted);line-height:1.5;margin:.5rem 0}
+footer{margin:28px 0 0;padding:18px 0 0;border-top:1px solid var(--line);font-size:.76rem;color:var(--muted)}
+@media(max-width:1050px){.filters{grid-template-columns:repeat(3,1fr)}.grid-cards{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:700px){.wrap{padding:18px 16px}.top{align-items:flex-start}.top .status{display:none}
+h1{font-size:1.5rem}.metrics{grid-template-columns:repeat(2,1fr);gap:9px}.metric{padding:13px}
+.metric-value{font-size:1.5rem}.filters{grid-template-columns:repeat(2,1fr);padding:12px}.filters .search{
+grid-column:1/-1}.filters button{width:100%}.detail-grid,.grid-cards{grid-template-columns:1fr}
+.card{padding:14px}.card-head{gap:8px}.modal-shade{padding:12px 8px}.modal-header,.modal-body{
+padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-select{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main class="wrap">
+  <header class="top">
+    <div><div class="brand">Career Radar · персональный поиск</div>
+    <h1>От вакансии к разговору с командой</h1>
+    <p class="muted small">Вакансии, отклики, рефералы и следующие шаги — в одном месте.</p></div>
+    <div class="row"><span class="status" id="saveStatus" role="status">Подключение к локальной CRM…</span>
+      <a class="small" href="/api/export.csv" download="crm.csv">Экспорт CSV</a>
+      <button id="importButton" type="button" disabled>Импорт JobCRM</button></div>
+  </header>
+  <div class="banner" id="errorBanner" role="alert" hidden></div>
+  <section class="metrics" id="metrics" aria-label="Воронка поиска"></section>
+  <div class="period-note"><span id="periodNote"></span><span id="unknownNote"></span></div>
+  <details class="panel channel-panel" id="channelPanel" hidden>
+    <summary>Сравнить каналы откликов</summary>
+    <div id="channelComparison"></div>
+  </details>
+  <nav class="tabs" aria-label="Разделы CRM">
+    <button class="tab active" data-view="applications">Отклики</button>
+    <button class="tab" data-view="actions">Следующие шаги</button>
+    <button class="tab" data-view="jobs">Найденные вакансии</button>
+    <button class="tab" data-view="companies">Компании</button>
+    <button class="tab" data-view="contacts">Контакты</button>
+  </nav>
+  <form class="panel filters" id="filters">
+    <label class="search"><span>Поиск</span><input id="query" type="search"
+      placeholder="Компания, роль, контакт или заметка"></label>
+    <label><span>Профиль поиска</span><select id="profileFilter"></select></label>
+    <label><span>Канал отклика</span><select id="channelFilter"></select></label>
+    <label><span>Период воронки: с</span><input id="sinceFilter" type="date"></label>
+    <label><span>По</span><input id="untilFilter" type="date"></label>
+    <button type="submit" id="applyFilters">Применить</button>
+  </form>
+  <div class="view-toolbar"><div class="row"><h2 id="viewTitle">Отклики</h2>
+    <span class="count" id="itemCount"></span><select id="stageFilter" aria-label="Этап отклика"></select>
+    <select id="actionFilter" aria-label="Срок следующего действия" hidden>
+      <option value="all">Все следующие шаги</option><option value="overdue">Просрочено</option>
+      <option value="today">Сегодня</option><option value="planned">Запланировано</option>
+      <option value="undated">Без даты</option></select></div>
+    <button class="primary" id="createButton" type="button" disabled>Добавить отклик</button></div>
+  <p class="view-note" id="viewNote"></p>
+  <section id="content" class="list" aria-live="polite"></section>
+  <footer>Изменения сохраняются в локальной базе проекта. Даты из истории не заполняются автоматически.
+    Сообщения контактам отправляете вы. Импорт JobCRM сохраняет исходную таблицу без изменений.</footer>
+</main>
+<div class="modal-shade" id="modalShade" hidden><section class="modal" id="modal" role="dialog"
+ aria-modal="true" aria-labelledby="modalTitle" tabindex="-1"></section></div>
+<script>
+'use strict';
+let state = null;
+let view = 'applications';
+let activeId = null;
+let busy = false;
+let priorFocus = null;
+const $ = (id) => document.getElementById(id);
+const defaults = {
+  stages: [{value:'saved',label:'Сохранено'},{value:'contacted',label:'Связался с контактом'},
+    {value:'applied',label:'Отклик отправлен'},{value:'hr_screen',label:'HR-скрининг'},
+    {value:'team_interview',label:'Интервью с командой'},{value:'assessment',label:'Тестовое задание'},
+    {value:'offer',label:'Оффер'},{value:'rejected',label:'Отказ'},{value:'withdrawn',label:'Снял отклик'},
+    {value:'archived',label:'В архиве'}],
+  channels: [{value:'unknown',label:'Канал неизвестен'},{value:'cold',label:'Холодный отклик'},
+    {value:'referral',label:'Реферальный отклик'},{value:'recruiter',label:'Контакт с рекрутером'}],
+  referral_states: [{value:'none',label:'Не нужен / не выбран'},{value:'to_find',label:'Найти реферала'},
+    {value:'requested',label:'Запрос отправлен'},{value:'referred',label:'Рекомендация получена'}],
+  relationships: [{value:'recruiter',label:'Рекрутер'},{value:'referral',label:'Реферал'},
+    {value:'hiring_manager',label:'Нанимающий менеджер'},{value:'other',label:'Другой контакт'}]
+};
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  if (cls) node.className = cls;
+  return node;
+}
+function values(kind) {
+  const options = state && state.options && state.options[kind];
+  return Array.isArray(options) && options.length ? options.map((item) => typeof item === 'string'
+    ? {value:item,label:(defaults[kind].find((candidate) => candidate.value === item)||{}).label||item}
+    : {value:item.value ?? item.id,label:item.label ?? item.name ?? item.value ?? item.id}) : defaults[kind];
+}
+function label(kind, value) {
+  const found = values(kind).find((item) => item.value === value);
+  return found ? found.label : (value || 'Не указано');
+}
+function profileName(id) {
+  const profile = (state.profiles || []).find((item) => (item.id || item.profile_id) === id);
+  return profile ? profile.name || profile.profile_name || id : id || 'Профиль не выбран';
+}
+function safeURL(value) {
+  if (!value || /[\s\\\u0000-\u001f\u007f]/.test(String(value))) return null;
+  try {
+    const url = new URL(String(value));
+    return ['http:', 'https:'].includes(url.protocol) && url.hostname && !url.username
+      && !url.password ? url.href : null;
+  } catch (_) { return null; }
+}
+function sourceLink(value, text) {
+  const url = safeURL(value);
+  if (!url) return el('span', value ? 'Ссылка недоступна' : 'Ссылка не указана', 'muted small');
+  const anchor = el('a', text || 'Открыть вакансию', 'small');
+  anchor.href = url; anchor.target = '_blank'; anchor.rel = 'noopener noreferrer';
+  return anchor;
+}
+function dateOnly(value) {
+  if (!value) return '';
+  const text = String(value);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  const timestamp = new Date(text);
+  if (Number.isNaN(timestamp.getTime())) return '';
+  const parts = new Intl.DateTimeFormat('en-CA', {timeZone:'America/Sao_Paulo',
+    year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(timestamp);
+  const part = (kind) => parts.find((item) => item.type === kind).value;
+  return part('year') + '-' + part('month') + '-' + part('day');
+}
+function dateText(value) {
+  const date = dateOnly(value);
+  if (!date) return 'Дата неизвестна';
+  return date.slice(8,10) + '.' + date.slice(5,7) + '.' + date.slice(0,4);
+}
+function badge(text, cls) { return el('span', text, 'badge' + (cls ? ' ' + cls : '')); }
+function button(text, fn, cls) {
+  const node = el('button', text, cls); node.type = 'button'; node.addEventListener('click', fn);
+  return node;
+}
+function field(text, input, full) {
+  const node = el('label', null, full ? 'full' : ''); node.append(el('span', text), input); return node;
+}
+function input(value, type, name) {
+  const node = el('input'); node.type = type || 'text'; node.name = name || '';
+  node.value = value ?? ''; return node;
+}
+function select(options, value, name) {
+  const node = el('select'); node.name = name || '';
+  options.forEach((option) => { const child = el('option', option.label); child.value = option.value;
+    node.append(child); });
+  if (value !== undefined && value !== null) node.value = value;
+  return node;
+}
+function textArea(value, name) {
+  const node = el('textarea'); node.name = name; node.value = value || ''; return node;
+}
+function errorMessage(error) {
+  return error && error.message ? error.message : 'Не удалось сохранить изменение.';
+}
+function showError(message) { $('errorBanner').textContent = message; $('errorBanner').hidden = false;
+  $('saveStatus').textContent = 'Требуется внимание'; $('saveStatus').classList.add('error'); }
+function clearError() { $('errorBanner').hidden = true; $('saveStatus').classList.remove('error'); }
+async function api(path, method, payload) {
+  const headers = {'Accept':'application/json'};
+  if (payload !== undefined) { headers['Content-Type'] = 'application/json';
+    headers['X-CSRF-Token'] = state && state.csrf_token || ''; }
+  const response = await fetch(path, {method:method || 'GET',headers,
+    credentials:'same-origin',cache:'no-store',body:payload === undefined ? undefined : JSON.stringify(payload)});
+  let data; try { data = await response.json(); } catch (_) { data = {}; }
+  if (!response.ok) {
+    const error = new Error(data.error || data.message || 'Ошибка сервера: ' + response.status);
+    error.status = response.status; throw error;
+  }
+  return data;
+}
+function stateQuery() {
+  const query = new URLSearchParams();
+  [['profile_id','profileFilter'],['channel','channelFilter'],['since','sinceFilter'],['until','untilFilter']]
+    .forEach(([name,id]) => { if ($(id).value) query.set(name,$(id).value); });
+  return '/api/state' + (query.toString() ? '?' + query.toString() : '');
+}
+async function refresh(initial) {
+  clearError(); $('saveStatus').textContent = 'Загрузка…';
+  try {
+    state = await api(initial ? '/api/state' : stateQuery());
+    if (initial) setupFilters();
+    render(); $('saveStatus').textContent = 'Сохранено в локальной базе';
+    $('createButton').disabled = false; $('importButton').disabled = false;
+  } catch (error) { showError(errorMessage(error)); }
+}
+async function write(path, method, payload, after) {
+  if (busy) return;
+  busy = true; clearError(); $('saveStatus').textContent = 'Сохранение…';
+  document.querySelectorAll('button').forEach((node) => node.disabled = true);
+  try {
+    const result = await api(path, method, payload);
+    await refresh(false);
+    busy = false;
+    if (after) await after(result);
+  } catch (error) {
+    if (error.status === 409) {
+      await refresh(false);
+      busy = false;
+      if (activeId !== null) openApplication(activeId);
+      else closeModal();
+      showError('Запись уже изменена. Загружена актуальная версия; проверьте её и повторите изменение.');
+    } else { showError(errorMessage(error)); }
+  } finally {
+    busy = false; document.querySelectorAll('button').forEach((node) => node.disabled = false);
+  }
+}
+function setupFilters() {
+  const profiles = [{value:'',label:'Все профили'}, ...(state.profiles || []).map((item) =>
+    ({value:item.id || item.profile_id,label:item.name || item.profile_name || item.id}))];
+  $('profileFilter').replaceChildren(...select(profiles).childNodes);
+  $('channelFilter').replaceChildren(...select([{value:'',label:'Все каналы'},...values('channels')]).childNodes);
+  $('stageFilter').replaceChildren(...select([{value:'',label:'Все этапы'},...values('stages')]).childNodes);
+  // Moving options between selects can change their selected state. Set defaults explicitly.
+  ['profileFilter','channelFilter','stageFilter'].forEach((id) => $(id).value = '');
+  const period = state.period || {};
+  $('sinceFilter').value = dateOnly(period.since);
+  $('untilFilter').value = dateOnly(period.until);
+}
+function renderMetrics() {
+  const metrics = state.metrics || {};
+  const unknownByStage = metrics.unknown_by_stage || metrics.unknown_date_reached_stages || {};
+  const cards = [
+    ['Отправленные отклики', metrics.applied ?? metrics.dated_reached_stages?.applied ?? 0,
+      'Без даты: ' + (unknownByStage.applied || 0)],
+    ['HR-скрининг', metrics.hr_screen ?? metrics.dated_reached_stages?.hr_screen ?? 0,
+      'Без даты: ' + (unknownByStage.hr_screen || 0)],
+    ['Интервью с командой', metrics.team_interview ?? metrics.dated_reached_stages?.team_interview ?? 0,
+      'Ориентир: ' + (metrics.goal || 4) + ' за месяц'],
+    ['Офферы', metrics.offer ?? metrics.dated_reached_stages?.offer ?? 0,
+      'Без даты: ' + (unknownByStage.offer || 0)]
+  ];
+  $('metrics').replaceChildren();
+  cards.forEach(([title,count,help],index) => {
+    const card = el('div', null, 'metric');
+    card.append(el('div',title,'metric-label'),el('div',count,'metric-value'),el('div',help,'metric-help'));
+    if (index === 2) { const meter = el('div',null,'goal-meter'); const fill = el('div');
+      fill.style.width = Math.max(0,Math.min(100,Number(count) / (metrics.goal || 4) * 100)) + '%';
+      meter.append(fill); card.append(meter); }
+    $('metrics').append(card);
+  });
+  const period = state.period || {};
+  $('periodNote').textContent = 'Воронка: ' + dateText(period.since) + ' — ' + dateText(period.until)
+    + '. Период применяется к датам этапов; список откликов сохраняет историю.';
+  const unknown = metrics.unknown_dates ?? metrics.unknown_date_reached_stages?.team_interview ?? 0;
+  $('unknownNote').textContent = 'Интервью с неизвестной датой: ' + unknown
+    + ' · отдельно от цели месяца';
+  renderChannels(metrics.by_channel || {});
+}
+function renderChannels(channels) {
+  const entries = Object.entries(channels); $('channelPanel').hidden = !entries.length;
+  $('channelComparison').replaceChildren(); if (!entries.length) return;
+  const table = el('table'); const head = el('thead'); const header = el('tr');
+  ['Канал','Отправлено с датой','Из них — с командой','Отклики без даты','Конверсия на конец периода'].forEach((text) =>
+    header.append(el('th',text))); head.append(header); table.append(head); const body = el('tbody');
+  entries.forEach(([channel,counts]) => {
+    const row = el('tr'); const rate = counts.team_from_applied_rate;
+    [label('channels',channel),counts.dated_applied ?? 0,counts.dated_team_interview ?? 0,
+      counts.unknown_date_applications ?? 0,typeof rate === 'number' && Number.isFinite(rate)
+        ? (rate * 100).toFixed(0) + '%' : 'Недостаточно данных']
+      .forEach((value) => row.append(el('td',value))); body.append(row);
+  }); table.append(body); $('channelComparison').append(table,el('p',
+    'Когорта — отклики с известной датой отправки в выбранном периоде; интервью учитываются '
+      + 'до конца этого периода. Канал неизвестен '
+      + 'и неполная история дат не используются для расчёта конверсии.','help'));
+}
+function matchesQuery(record) {
+  const query = $('query').value.trim().toLocaleLowerCase('ru');
+  if (!query) return true;
+  return [record.company,record.title,record.name,record.notes,record.next_action,record.email,
+    ...(record.contacts || []).map((item) => item.name)]
+    .join(' ').toLocaleLowerCase('ru').includes(query);
+}
+function currentApplications() {
+  return (state.applications || []).filter(matchesQuery).filter((app) => !$('stageFilter').value
+    || app.stage === $('stageFilter').value);
+}
+function dueState(app) {
+  const due = dateOnly(app.next_action_due);
+  const today = dateOnly(state.as_of);
+  if (!due) return 'undated';
+  if (today && due < today) return 'overdue';
+  return due === today ? 'today' : 'planned';
+}
+function render() {
+  if (!state) return;
+  renderMetrics();
+  const titles = {applications:'Отклики',actions:'Следующие шаги',jobs:'Найденные вакансии',
+    companies:'Компании',contacts:'Контакты'};
+  const notes = {
+    applications:'Все этапы сохраняются в истории. Канал отклика и реферальный статус задаются отдельно.',
+    actions:'Выберите конкретный следующий шаг: найти контакт, попросить рекомендацию, отправить отклик или подготовиться к интервью.',
+    jobs:'Сохранённые вакансии из поиска. При добавлении в CRM выберите поток; низкая оценка не мешает откликнуться.',
+    companies:'Ваш список компаний. Контакты и рекомендации помогают превратить широкий поиск в разговоры с командами.',
+    contacts:'Рекрутеры, рефералы и нанимающие менеджеры. Свяжите контакт с конкретным откликом в его карточке.'
+  };
+  $('viewTitle').textContent = titles[view]; $('viewNote').textContent = notes[view];
+  $('stageFilter').hidden = !['applications','actions'].includes(view);
+  $('actionFilter').hidden = view !== 'actions';
+  $('createButton').hidden = view === 'actions' || view === 'jobs';
+  $('createButton').textContent = view === 'companies' ? 'Добавить компанию'
+    : view === 'contacts' ? 'Добавить контакт' : 'Добавить отклик';
+  $('content').className = ['companies','contacts'].includes(view) ? 'grid-cards' : 'list';
+  $('content').replaceChildren();
+  let records = [];
+  if (view === 'applications' || view === 'actions') {
+    records = currentApplications();
+    if (view === 'actions') {
+      records = records.filter((app) => app.next_action && !['rejected','withdrawn','archived'].includes(app.stage))
+        .filter((app) => $('actionFilter').value === 'all'
+        || dueState(app) === $('actionFilter').value).sort((a,b) => {
+          const rank = {overdue:0,today:1,planned:2,undated:3};
+          return rank[dueState(a)] - rank[dueState(b)]
+            || (dateOnly(a.next_action_due) || '9999').localeCompare(dateOnly(b.next_action_due) || '9999');
+        });
+    }
+    records.forEach((app) => $('content').append(applicationCard(app)));
+  } else if (view === 'jobs') {
+    records = (state.jobs || []).filter(matchesQuery).filter((job) => !$('profileFilter').value
+      || (job.profiles || []).some((item) => (item.id || item.profile_id) === $('profileFilter').value));
+    records.forEach((job) => $('content').append(jobCard(job)));
+  } else if (view === 'companies') {
+    records = (state.companies || []).filter(matchesQuery);
+    records.forEach((company) => $('content').append(companyCard(company)));
+  } else {
+    records = (state.contacts || []).filter(matchesQuery);
+    records.forEach((contact) => $('content').append(contactCard(contact)));
+  }
+  $('itemCount').textContent = records.length + ' записей';
+  if (!records.length) {
+    const empty = el('div',null,'empty full');
+    empty.append(el('h3',view === 'jobs' ? 'Подходящих записей пока нет' : 'Пока нет записей'),
+      el('p',view === 'actions' ? 'Добавьте следующий шаг и срок в карточке отклика.'
+        : 'Измените фильтры или добавьте первую запись.'));
+    $('content').append(empty);
+  }
+}
+function applicationCard(app) {
+  const card = el('article',null,'card'); const head = el('div',null,'card-head');
+  const title = el('div'); title.append(el('div',app.title || 'Роль не указана','card-title'),
+    el('div',app.company || 'Компания не указана','card-company'));
+  head.append(title,button('Открыть',() => openApplication(app.id),'inline-button'));
+  const tags = el('div',null,'tags');
+  tags.append(badge(label('stages',app.stage),'blue'),badge(profileName(app.profile_id)),
+    badge(label('channels',app.channel),app.channel === 'referral' ? 'green' : ''));
+  if (app.referral_state && app.referral_state !== 'none')
+    tags.append(badge(label('referral_states',app.referral_state),'amber'));
+  card.append(head,tags);
+  const links = el('div',null,'row'); links.append(sourceLink(app.url),
+    el('span','Отклик: ' + dateText(app.applied_at),'small muted')); card.append(links);
+  if (app.next_action) {
+    const action = el('div',null,'action-line'); action.append(el('strong','Следующий шаг: '),
+      document.createTextNode(app.next_action + ' '));
+    const due = dueState(app); const labels = {overdue:'Просрочено',today:'Сегодня',planned:'До ',undated:'Без даты'};
+    action.append(badge((labels[due] || '') + (['overdue','planned'].includes(due)
+      ? ' ' + dateText(app.next_action_due) : ''),due === 'overdue' ? 'red' : due === 'today' ? 'amber' : ''));
+    card.append(action);
+  }
+  return card;
+}
+function jobCard(job) {
+  const card = el('article',null,'card'); const head = el('div',null,'card-head'); const title = el('div');
+  title.append(el('div',job.title || 'Вакансия','card-title'),el('div',job.company,'card-company'));
+  const existing = (state.applications || []).find((app) => app.job_uid === job.job_uid);
+  head.append(title,button(existing ? 'Открыть отклик' : 'Добавить в CRM',() => existing
+    ? openApplication(existing.id) : addJob(job),'inline-button'));
+  const tags = el('div',null,'tags');
+  (job.profiles || []).forEach((profile) => tags.append(badge((profile.name || profileName(profile.id
+    || profile.profile_id)) + ' · ' + (profile.tier || '—') + ' · ' + (profile.score ?? profile.fit_score ?? 0)
+    + (profile.decision ? ' · ' + ({pass:'Подходит',review:'Проверить условия',reject:'Есть ограничение'}[profile.decision]
+      || profile.decision) : ''))));
+  card.append(head,tags);
+  const links = el('div',null,'row'); links.append(sourceLink(job.url),
+    el('span',[job.location,job.remote].filter(Boolean).join(' · '),'small muted')); card.append(links);
+  if (job.description) { const details = el('details'); details.append(el('summary','Описание вакансии',
+    'small muted'),el('div',job.description,'job-description')); card.append(details); }
+  return card;
+}
+function companyCard(company) {
+  const card = el('article',null,'card'); const head = el('div',null,'card-head');
+  head.append(el('h3',company.name || company.company),button('Изменить',() => openCompany(company),
+    'inline-button')); card.append(head);
+  if (company.url || company.website) card.append(sourceLink(company.url || company.website,'Сайт компании'));
+  const count = (state.contacts || []).filter((contact) => contact.company === (company.name || company.company)).length;
+  card.append(el('p','Контактов: ' + count,'small muted'));
+  if (company.notes) card.append(el('p',company.notes,'card-notes'));
+  return card;
+}
+function contactCard(contact) {
+  const card = el('article',null,'card'); const head = el('div',null,'card-head');
+  const title = el('div'); title.append(el('h3',contact.name),el('p',contact.company,'small muted'));
+  head.append(title,button('Изменить',() => openContact(contact),'inline-button')); card.append(head);
+  if (contact.email) card.append(el('p',contact.email,'small'));
+  if (contact.linkedin_url) card.append(sourceLink(contact.linkedin_url,'LinkedIn'));
+  if (contact.notes) card.append(el('p',contact.notes,'card-notes'));
+  return card;
+}
+function showModal(title, subtitle) {
+  if ($('modalShade').hidden) priorFocus = document.activeElement;
+  $('modal').replaceChildren(); const header = el('header',null,'modal-header'); const heading = el('div');
+  const h = el('h2',title); h.id = 'modalTitle'; heading.append(h);
+  if (subtitle) heading.append(el('p',subtitle,'small muted'));
+  header.append(heading,button('×',closeModal,'close'));
+  const body = el('div',null,'modal-body'); $('modal').append(header,body); $('modalShade').hidden = false;
+  $('modal').focus(); return body;
+}
+function closeModal() {
+  if (busy) return;
+  $('modalShade').hidden = true; activeId = null;
+  if (priorFocus && priorFocus.isConnected) priorFocus.focus();
+}
+function formButtons(form, text) {
+  const row = el('div',null,'form-actions'); const submit = el('button',text || 'Сохранить','primary');
+  submit.type = 'submit'; row.append(submit); form.append(row);
+}
+function formValues(form) {
+  return Object.fromEntries(new FormData(form).entries());
+}
+function applicationFields(form, app) {
+  const grid = el('div',null,'form-grid');
+  const company = input(app.company,'text','company'); company.required = true;
+  const title = input(app.title,'text','title'); title.required = true;
+  const profiles = [{value:'',label:'Не выбран'},...(state.profiles || []).map((profile) =>
+    ({value:profile.id || profile.profile_id,label:profile.name || profile.profile_name || profile.id}))];
+  if (app.profile_id && !profiles.some((profile) => profile.value === app.profile_id))
+    profiles.push({value:app.profile_id,label:app.profile_id + ' · профиль выключен'});
+  grid.append(field('Компания',company),field('Роль',title),
+    field('Ссылка на вакансию',input(app.url,'url','url'),true),
+    field('Профиль поиска',select(profiles,app.profile_id || $('profileFilter').value,'profile_id')),
+    field('Канал отклика',select(values('channels'),app.channel || $('channelFilter').value
+      || 'unknown','channel')),
+    field('Реферальный статус',select(values('referral_states'),app.referral_state || 'none','referral_state')),
+    field('Дата отправки отклика',input(dateOnly(app.applied_at),'date','applied_at')),
+    field('Версия резюме',input(app.cv_version,'text','cv_version'),true),
+    field('Следующий шаг',input(app.next_action,'text','next_action'),true),
+    field('Срок следующего шага',input(dateOnly(app.next_action_due),'date','next_action_due'),true),
+    field('Заметки',textArea(app.notes,'notes'),true));
+  form.append(grid,el('p','Оставьте дату пустой, если она неизвестна. Реферальный статус не меняет канал автоматически.','help'));
+}
+function normalizeAppPayload(payload) {
+  ['profile_id','applied_at','next_action_due'].forEach((key) => { if (!payload[key]) payload[key] = null; });
+  return payload;
+}
+function openApplication(id) {
+  const app = (state.applications || []).find((item) => String(item.id) === String(id));
+  if (!app) { closeModal(); showError('Отклик больше не доступен при выбранных фильтрах.'); return; }
+  activeId = app.id; const body = showModal(app.title || 'Отклик',app.company);
+  const grid = el('div',null,'detail-grid'); const left = el('div'); const right = el('aside');
+  const section = el('section',null,'detail-section'); section.append(el('h3','Детали отклика'));
+  const form = el('form'); applicationFields(form,app); formButtons(form,'Сохранить детали');
+  form.addEventListener('submit', (event) => { event.preventDefault(); const payload = normalizeAppPayload(formValues(form));
+    if ((payload.applied_at || '') === dateOnly(app.applied_at)) delete payload.applied_at;
+    payload.expected_version = app.version;
+    write('/api/applications/' + app.id,'PATCH',payload,() => openCreatedApplication(app.id)); });
+  section.append(form); left.append(section);
+  const transition = el('section',null,'detail-section'); transition.append(el('h3','Изменить этап'));
+  const stageForm = el('form'); const stageGrid = el('div',null,'form-grid');
+  stageGrid.append(field('Новый этап',select(values('stages'),app.stage,'stage')),
+    field('Когда произошёл переход',input(state.as_of,'date','occurred_at')),
+    field('Комментарий к переходу',textArea('','note'),true)); stageForm.append(stageGrid,
+    el('p','Выбрана сегодняшняя дата São Paulo. Для старого события измените дату или очистите поле, если она неизвестна.','help'));
+  formButtons(stageForm,'Зафиксировать этап'); stageForm.addEventListener('submit',(event) => {
+    event.preventDefault(); const payload = formValues(stageForm); payload.expected_version = app.version;
+    payload.occurred_at = payload.occurred_at || null;
+    write('/api/applications/' + app.id + '/stage','POST',payload,() => openApplication(app.id));
+  }); transition.append(stageForm); left.append(transition);
+  right.append(contactSection(app),historySection(app));
+  grid.append(left,right); body.append(grid);
+}
+function historySection(app) {
+  const section = el('section',null,'detail-section'); section.append(el('h3','История этапов'));
+  if (app.original_status) section.append(el('p','Исходный статус в таблице: ' + app.original_status,'help'));
+  const history = el('ol',null,'history');
+  (app.history || []).slice().reverse().forEach((event) => {
+    const item = el('li'); item.append(el('div',label('stages',event.stage),'history-title'),
+      el('div',dateText(event.occurred_at),'small muted'));
+    if (event.note) item.append(el('div',event.note,'history-note'));
+    if (event.recorded_at) item.append(el('div','Записано: ' + dateText(event.recorded_at),'tiny muted'));
+    history.append(item);
+  });
+  if (!history.childNodes.length) section.append(el('p','История пока пуста.','small muted'));
+  else section.append(history);
+  return section;
+}
+function contactSection(app) {
+  const section = el('section',null,'detail-section'); section.append(el('h3','Контакты по отклику'));
+  (app.contacts || []).forEach((contact) => {
+    const row = el('div',null,'contact-row'); row.append(el('strong',contact.name),
+      el('p',label('relationships',contact.relationship),'muted'));
+    if (contact.email) row.append(el('p',contact.email));
+    if (contact.linkedin_url) row.append(sourceLink(contact.linkedin_url,'LinkedIn'));
+    row.append(button('Отвязать',() => write('/api/applications/' + app.id + '/contacts','DELETE',
+      {contact_id:contact.id,relationship:contact.relationship,expected_version:app.version},
+      () => openApplication(app.id)),'inline-button'));
+    section.append(row);
+  });
+  if (!(app.contacts || []).length) section.append(el('p','Контакт пока не привязан.','small muted'));
+  const form = el('form'); const inputs = el('div',null,'contact-select');
+  const contacts = (state.contacts || []).map((item) => ({value:String(item.id),label:item.name
+    + (item.company ? ' · ' + item.company : '')}));
+  const contactSelect = select([{value:'',label:'Выберите контакт'},...contacts],'','contact_id');
+  contactSelect.required = true;
+  inputs.append(field('Контакт',contactSelect),field('Роль контакта',select(values('relationships'),
+    'referral','relationship'))); form.append(inputs); formButtons(form,'Привязать контакт');
+  form.addEventListener('submit',(event) => { event.preventDefault(); const payload = formValues(form);
+    payload.expected_version = app.version;
+    write('/api/applications/' + app.id + '/contacts','POST',payload,() => openApplication(app.id)); });
+  section.append(form,button('Создать новый контакт',() => openContact(null,app.id),'inline-button'));
+  return section;
+}
+function createApplication() {
+  activeId = null; const body = showModal('Новый отклик','Создайте карточку и выберите следующий шаг.');
+  const form = el('form'); applicationFields(form,{}); formButtons(form,'Создать отклик');
+  form.addEventListener('submit',(event) => { event.preventDefault(); const payload = normalizeAppPayload(formValues(form));
+    payload.stage = 'saved'; write('/api/applications','POST',payload,(result) => {
+      const app = result.application || result;
+      if (app.id !== undefined) return openCreatedApplication(app.id);
+      closeModal();
+    }); }); body.append(form);
+}
+function addJob(job) {
+  activeId = null; const body = showModal('Добавить вакансию в CRM',job.company + ' · ' + job.title);
+  const form = el('form'); const options = (state.profiles || []).map((profile) => ({value:profile.id
+    || profile.profile_id,label:profile.name || profile.profile_name || profile.id}));
+  const selected = $('profileFilter').value || (job.profiles || [])[0]?.id
+    || (job.profiles || [])[0]?.profile_id || options[0]?.value;
+  const profile = select(options,selected,'profile_id'); profile.required = true;
+  form.append(field('Поток поиска',profile),el('p','Начальный этап — «Сохранено». Канал и контакт можно указать в карточке.','help'));
+  formButtons(form,'Добавить в CRM'); form.addEventListener('submit',(event) => { event.preventDefault();
+    const payload = formValues(form); payload.job_uid = job.job_uid;
+    write('/api/applications/from-job','POST',payload,(result) => {
+      const app = result.application || result;
+      if (app.id !== undefined) return openCreatedApplication(app.id);
+      closeModal();
+    }); }); body.append(form);
+}
+function openContact(contact, returnTo) {
+  activeId = returnTo || null; const item = contact || {};
+  const body = showModal(contact ? 'Изменить контакт' : 'Новый контакт','Контакты не получают автоматических сообщений.');
+  const form = el('form'); const grid = el('div',null,'form-grid'); const name = input(item.name,'text','name');
+  name.required = true;
+  grid.append(field('Имя',name),field('Компания',input(item.company,'text','company')),
+    field('Email',input(item.email,'email','email')),field('LinkedIn',input(item.linkedin_url,'url','linkedin_url')),
+    field('Заметки',textArea(item.notes,'notes'),true)); form.append(grid); formButtons(form,'Сохранить контакт');
+  form.addEventListener('submit',(event) => { event.preventDefault(); const payload = formValues(form);
+    if (item.version !== undefined) payload.expected_version = item.version;
+    write('/api/contacts' + (contact ? '/' + item.id : ''),contact ? 'PATCH' : 'POST',payload,() => {
+      if (returnTo) openApplication(returnTo); else closeModal();
+    }); }); body.append(form);
+}
+function openCompany(company) {
+  activeId = null; const item = company || {}; const body = showModal(company ? 'Изменить компанию' : 'Новая компания');
+  const form = el('form'); const grid = el('div',null,'form-grid'); const name = input(item.name,'text','name');
+  name.required = true; grid.append(field('Компания',name,true),field('Сайт',input(item.url || item.website,'url','url'),true),
+    field('Заметки',textArea(item.notes,'notes'),true)); form.append(grid); formButtons(form,'Сохранить компанию');
+  form.addEventListener('submit',(event) => { event.preventDefault(); const payload = formValues(form);
+    if (item.version !== undefined) payload.expected_version = item.version;
+    write('/api/companies' + (company ? '/' + item.id : ''),company ? 'PATCH' : 'POST',payload,closeModal);
+  }); body.append(form);
+}
+async function openCreatedApplication(id) {
+  if (!(state.applications || []).some((app) => String(app.id) === String(id))) {
+    $('profileFilter').value = ''; $('channelFilter').value = ''; await refresh(false);
+  }
+  view = 'applications';
+  document.querySelectorAll('.tab').forEach((tab) => tab.classList.toggle('active',tab.dataset.view === view));
+  render(); openApplication(id);
+}
+async function importAPI(file, dryRun) {
+  const response = await fetch('/api/import-xlsx' + (dryRun ? '?dry_run=true' : ''),{
+    method:'POST',credentials:'same-origin',cache:'no-store',body:file,
+    headers:{'Accept':'application/json','Content-Type':'application/octet-stream',
+      'X-CSRF-Token':state.csrf_token || '', 'X-File-Name':encodeURIComponent(file.name)}
+  });
+  let data; try { data = await response.json(); } catch (_) { data = {}; }
+  if (!response.ok) throw new Error(data.error || data.message || 'Ошибка импорта: ' + response.status);
+  return data;
+}
+function openImport() {
+  activeId = null; const body = showModal('Импорт JobCRM.xlsx',
+    'Сначала проверьте результат чтения. Исходный файл останется без изменений.');
+  const form = el('form'); const picker = input('','file','workbook'); picker.accept = '.xlsx';
+  picker.required = true; const preview = el('div',null,'detail-section');
+  const actions = el('div',null,'form-actions'); const previewButton = el('button','Проверить импорт');
+  previewButton.type = 'submit'; const commitButton = el('button','Импортировать в CRM','primary');
+  commitButton.type = 'button'; commitButton.hidden = true;
+  actions.append(previewButton,commitButton); let checkedFile = null;
+  form.append(field('Выберите JobCRM.xlsx',picker),el('p',
+    'Статусы и контакты сохранятся с исходными значениями. Неизвестные даты не будут угаданы. '
+      + 'Повторный импорт того же файла пропускает уже импортированные записи.','help'),preview,actions);
+  picker.addEventListener('change',() => { checkedFile = null; commitButton.hidden = true;
+    preview.replaceChildren(); });
+  form.addEventListener('submit',async(event) => {
+    event.preventDefault(); const file = picker.files[0]; if (!file || busy) return;
+    clearError(); previewButton.disabled = true; commitButton.hidden = true;
+    preview.replaceChildren(el('p','Проверяем структуру таблицы…','small muted'));
+    try {
+      const result = await importAPI(file,true); const report = result.summary || result.report || result;
+      const applications = Array.isArray(report.applications) ? report.applications.length : report.applications;
+      const companies = Array.isArray(report.companies) ? report.companies.length : report.companies;
+      const contacts = Array.isArray(report.contacts) ? report.contacts.length : report.contacts;
+      preview.replaceChildren(el('h3','Предпросмотр импорта'),el('p',
+        'Отклики: ' + (applications ?? 0) + ' · Компании: ' + (companies ?? 0)
+        + ' · Контакты: ' + (contacts ?? 0),'small'));
+      if (report.stage_counts) {
+        const stages = el('div',null,'tags'); Object.entries(report.stage_counts).forEach(([stage,count]) =>
+          stages.append(badge(label('stages',stage) + ': ' + count))); preview.append(stages);
+      }
+      const warnings = report.warnings || result.warnings || [];
+      if (warnings.length) { preview.append(el('p','Замечания к таблице:','small'));
+        const list = el('ul',null,'small muted'); warnings.forEach((warning) => list.append(el('li',
+          typeof warning === 'string' ? warning : warning.message || JSON.stringify(warning))));
+        preview.append(list); }
+      checkedFile = file; commitButton.hidden = false;
+    } catch(error) { preview.replaceChildren(); showError(errorMessage(error)); }
+    finally { previewButton.disabled = false; }
+  });
+  commitButton.addEventListener('click',async() => {
+    if (busy || !checkedFile || picker.files[0] !== checkedFile) return;
+    busy = true; clearError(); picker.disabled = true;
+    previewButton.disabled = true; commitButton.disabled = true;
+    $('saveStatus').textContent = 'Импорт…';
+    try {
+      const result = await importAPI(checkedFile,false);
+      await refresh(false); const report = result.summary || result.report || result;
+      preview.replaceChildren(el('h3','Импорт завершён'),el('p',
+        'Создано откликов: ' + (report.created_applications ?? report.applications_created ?? 0)
+        + ' · Пропущено: ' + (report.skipped_applications ?? report.applications_skipped ?? 0),'small'));
+      commitButton.hidden = true; checkedFile = null;
+    } catch(error) { showError(errorMessage(error)); }
+    finally { busy = false; picker.disabled = false;
+      previewButton.disabled = false; commitButton.disabled = false; }
+  }); body.append(form);
+}
+document.querySelectorAll('.tab').forEach((tab) => tab.addEventListener('click',() => {
+  view = tab.dataset.view; document.querySelectorAll('.tab').forEach((other) => other.classList.toggle('active',other === tab));
+  render();
+}));
+$('filters').addEventListener('submit',(event) => { event.preventDefault(); refresh(false); });
+$('query').addEventListener('input',render); $('stageFilter').addEventListener('change',render);
+$('actionFilter').addEventListener('change',render);
+$('createButton').addEventListener('click',() => view === 'companies' ? openCompany(null)
+  : view === 'contacts' ? openContact(null) : createApplication());
+$('importButton').addEventListener('click',openImport);
+$('modalShade').addEventListener('click',(event) => { if (event.target === $('modalShade')) closeModal(); });
+document.addEventListener('keydown',(event) => {
+  if ($('modalShade').hidden) return;
+  if (event.key === 'Escape') closeModal();
+  if (event.key === 'Tab') {
+    const nodes = [...$('modal').querySelectorAll('button,input,select,textarea,a[href]')]
+      .filter((node) => !node.disabled && !node.hidden);
+    const first = nodes[0], last = nodes[nodes.length - 1];
+    if (!nodes.length) { event.preventDefault(); return; }
+    if (event.shiftKey && (document.activeElement === first || document.activeElement === $('modal'))) {
+      event.preventDefault(); last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  }
+});
+refresh(true);
+</script>
+</body>
+</html>

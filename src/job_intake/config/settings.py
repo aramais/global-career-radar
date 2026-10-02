@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -51,6 +52,27 @@ class LLMConfig:
 
 
 @dataclass(slots=True)
+class CRMConfig:
+    team_interview_goal: int = 4
+    weekly_time_budget_hours: float = 10.0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.team_interview_goal, bool)
+            or not isinstance(self.team_interview_goal, int)
+            or self.team_interview_goal < 1
+        ):
+            raise ValueError("crm.team_interview_goal must be a positive integer")
+        if (
+            isinstance(self.weekly_time_budget_hours, bool)
+            or not isinstance(self.weekly_time_budget_hours, (int, float))
+            or not math.isfinite(self.weekly_time_budget_hours)
+            or self.weekly_time_budget_hours <= 0
+        ):
+            raise ValueError("crm.weekly_time_budget_hours must be positive")
+
+
+@dataclass(slots=True)
 class AppConfig:
     database_url: str
     log_level: str
@@ -61,6 +83,7 @@ class AppConfig:
     sources: list[SourceDefinition]
     telegram: TelegramConfig
     llm: LLMConfig
+    crm: CRMConfig = field(default_factory=CRMConfig)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -122,7 +145,7 @@ def load_app_config(path: str | Path) -> AppConfig:
         }
     )
     return AppConfig(
-        database_url=raw.get("database_url", "sqlite:///data/job_intake.db"),
+        database_url=raw.get("database_url", "sqlite:///data/local/job_intake.db"),
         log_level=raw.get("log_level", "INFO"),
         rules_path=(config_path.parent / raw.get("rules_path", "rules.yaml")).resolve(),
         search_profiles_path=(
@@ -135,6 +158,7 @@ def load_app_config(path: str | Path) -> AppConfig:
         sources=sources,
         telegram=telegram,
         llm=llm,
+        crm=CRMConfig(**raw.get("crm", {})),
     )
 
 
