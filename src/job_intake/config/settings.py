@@ -128,6 +128,12 @@ def load_app_config(path: str | Path) -> AppConfig:
         for item in raw.get("sources", [])
     ]
     for source in sources:
+        if source.type == "dailyremote" and source.params.get("cookies_file"):
+            source.params["cookies_file"] = str(
+                (
+                    config_path.parent.parent / Path(source.params["cookies_file"]).expanduser()
+                ).resolve()
+            )
         if source.type == "watchlist" and "watchlist_path" in source.params:
             source.params["watchlist_path"] = str(
                 (config_path.parent.parent / source.params["watchlist_path"]).resolve()

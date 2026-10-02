@@ -55,7 +55,9 @@ class JobIntakePipeline:
     def _source_with_queries(self, source: SourceDefinition) -> SourceDefinition:
         params = dict(source.params)
         if source.type == "dailyremote" and params.get("use_profile_queries"):
-            template = params.get("search_url_template", "https://dailyremote.com/?search={query}")
+            template = params.get(
+                "search_url_template", "https://dailyremote.com/remote-jobs?search={query}"
+            )
             keywords = dict.fromkeys(k for stream in self.streams for k in stream.keywords)
             params["search_urls"] = [template.replace("{query}", quote_plus(k)) for k in keywords]
         return replace(source, params=params)

@@ -4,6 +4,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
+from job_intake.adapters._dailyremote_auth import fetch_dailyremote_text, load_dailyremote_cookies
 from job_intake.adapters._parsing import (
     bounded_int,
     enrich_from_detail,
@@ -20,7 +21,13 @@ from job_intake.utils.text import compact_text
 class DailyRemoteAdapter(JobSourceAdapter):
     def fetch_jobs(self) -> list[JobRecord]:
         self.errors.clear()
-        session = build_session()
+        with build_session() as session:
+            return self._fetch_jobs(session)
+
+    def _fetch_jobs(self, session) -> list[JobRecord]:
+        cookies_file = self.params.get("cookies_file")
+        if cookies_file:
+            load_dailyremote_cookies(session, cookies_file)
         jobs: list[JobRecord] = []
         max_pages = bounded_int(self.params, "max_pages", 1, 20)
         max_details = bounded_int(self.params, "max_detail_fetches", 100, 1000)
@@ -34,7 +41,11 @@ class DailyRemoteAdapter(JobSourceAdapter):
                     break
                 visited.add(url)
                 try:
-                    html = fetch_text(session, url)
+                    html = (
+                        fetch_dailyremote_text(session, url)
+                        if cookies_file
+                        else fetch_text(session, url)
+                    )
                     soup = BeautifulSoup(html, "html.parser")
                     page_jobs = self._parse_listing_page(url, soup)
                 except Exception as exc:
@@ -50,7 +61,11 @@ class DailyRemoteAdapter(JobSourceAdapter):
                     elif self.params.get("fetch_details", True):
                         job.source_metadata["detail_error"] = "Detail fetch limit reached"
                     jobs.append(job)
-                next_node = soup.select_one(self.params.get("next_selector", 'a[rel="next"]'))
+                next_node = soup.select_one(
+                    self.params.get(
+                        "next_selector", 'a[rel="next"], a[aria-label="Go to next page"]'
+                    )
+                )
                 if next_node is None or not next_node.get("href"):
                     break
                 next_url = urljoin(url, next_node["href"])
@@ -71,9 +86,12 @@ class DailyRemoteAdapter(JobSourceAdapter):
             job.source_metadata["detail_error"] = "Detail link outside listing origin"
             return
         try:
-            soup = BeautifulSoup(
-                fetch_detail_text(session, job.original_url, listing_url), "html.parser"
+            html = (
+                fetch_dailyremote_text(session, job.original_url)
+                if self.params.get("cookies_file")
+                else fetch_detail_text(session, job.original_url, listing_url)
             )
+            soup = BeautifulSoup(html, "html.parser")
             # Current anonymous pages contain dummy HTML Ipsum inside this wrapper,
             # not the vacancy body. Even a custom CSS selector must not turn the
             # placeholder or premium marketing text into a complete description.

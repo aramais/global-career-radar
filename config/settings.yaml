@@ -43,8 +43,9 @@ sources:
     type: dailyremote
     enabled: true
     params:
+      cookies_file: ${DAILYREMOTE_COOKIES_FILE}
       use_profile_queries: true
-      search_url_template: https://dailyremote.com/?search={query}
+      search_url_template: https://dailyremote.com/remote-jobs?search={query}
       fetch_details: true
       max_detail_fetches: 40
       max_pages: 1

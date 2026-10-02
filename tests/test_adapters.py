@@ -188,6 +188,38 @@ def test_dailyremote_pagination_is_bounded_and_duplicates_are_not_refetched(monk
     assert "pagination limit" in adapter.errors[0]
 
 
+def test_dailyremote_current_next_page_link_collects_unique_jobs_within_limit(monkeypatch):
+    # Current /remote-jobs pagination uses this aria-label and no rel attribute.
+    page1 = "https://dailyremote.com/remote-jobs?search=analytics"
+    page2 = "https://dailyremote.com/remote-jobs?search=analytics&page=2"
+    second = LISTING.replace("head-analytics-123", "head-analytics-124")
+    next_link = (
+        '<a class="lst-page-link" aria-label="Go to next page" '
+        'href="/remote-jobs?search=analytics&page={page}">Next</a>'
+    )
+    first_detail = "https://dailyremote.com/remote-job/head-analytics-123"
+    second_detail = "https://dailyremote.com/remote-job/head-analytics-124"
+    calls = mock_pages(
+        monkeypatch,
+        dailyremote,
+        {
+            page1: LISTING + next_link.format(page=2),
+            page2: LISTING + second + next_link.format(page=3),
+        },
+        dict.fromkeys(
+            [first_detail, second_detail],
+            '<section class="job-description"><p>Full description</p></section>',
+        ),
+    )
+    adapter = DailyRemoteAdapter("dailyremote", {"search_urls": [page1], "max_pages": 2})
+    jobs = adapter.fetch_jobs()
+    assert [job.original_url for job in jobs] == [first_detail, second_detail]
+    assert all(job.source_metadata["description_complete"] for job in jobs)
+    assert calls == [page1, first_detail, page2, second_detail]
+    assert len(adapter.errors) == 1
+    assert "pagination limit" in adapter.errors[0]
+
+
 def test_dailyremote_does_not_fetch_offsite_links_or_blog_body(monkeypatch):
     outside = LISTING.replace("/remote-job/head-analytics-123", "https://outside.example/job")
     calls = mock_pages(monkeypatch, dailyremote, {LISTING_URL: outside})
