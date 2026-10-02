@@ -4,6 +4,8 @@ from job_intake.adapters.ats import AshbyAdapter, GreenhouseAdapter, LeverAdapte
 from job_intake.adapters.base import JobSourceAdapter
 from job_intake.adapters.company_watchlist import CompanyWatchlistAdapter
 from job_intake.adapters.dailyremote import DailyRemoteAdapter
+from job_intake.adapters.email_files import EmailFilesAdapter
+from job_intake.adapters.gmail import GmailSnapshotAdapter
 from job_intake.adapters.html_page import HtmlPageAdapter
 from job_intake.config.settings import SourceDefinition
 
@@ -11,6 +13,10 @@ from job_intake.config.settings import SourceDefinition
 def build_adapter(source: SourceDefinition) -> JobSourceAdapter:
     if source.type == "dailyremote":
         return DailyRemoteAdapter(source.name, source.params)
+    if source.type == "email_files":
+        return EmailFilesAdapter(source.name, source.params)
+    if source.type == "gmail_snapshot":
+        return GmailSnapshotAdapter(source.name, source.params)
     if source.type == "watchlist":
         return CompanyWatchlistAdapter(source.name, source.params)
     if source.type == "html":

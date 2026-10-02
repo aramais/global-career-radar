@@ -1,0 +1,9 @@
+# Used by Codex's connected Gmail search; no credentials are stored here.
+# Search/read only. The connector supplies messages to import-gmail locally.
+source_name: email-vacancies
+max_messages: 100
+query: >-
+  newer_than:30d -in:spam -in:trash
+  {from:jobalerts-noreply@linkedin.com from:dailyremote.com from:indeed.com
+  from:wellfound.com from:remoteok.com from:weworkremotely.com from:otta.com
+  subject:"job alert" subject:"remote jobs" subject:вакансии}

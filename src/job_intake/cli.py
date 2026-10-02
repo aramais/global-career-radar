@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+from typing import Annotated
 
 import typer
 
-from job_intake.config.settings import load_app_config, load_yaml_mapping
+from job_intake.config.settings import SourceDefinition, load_app_config, load_yaml_mapping
 from job_intake.crm.cli import app as crm_app
-from job_intake.pipeline import build_pipeline
+from job_intake.pipeline import JobIntakePipeline, build_pipeline
 from job_intake.profiles import load_streams
 
 app = typer.Typer(add_completion=False, help="Personal multi-profile job search")
@@ -38,6 +40,66 @@ def profiles(config: str = typer.Option("config/settings.yaml", help="App config
     for stream in streams:
         typer.echo(f"{stream.id}: {stream.name} (version {stream.version[:8]})")
         typer.echo(f"  Keywords: {', '.join(stream.keywords)}")
+
+
+@app.command("import-email")
+def import_email(
+    directory: Annotated[
+        Path, typer.Argument(help="Directory containing selected .eml job emails")
+    ],
+    config: str = typer.Option("config/settings.yaml", help="App config YAML"),
+    max_messages: int = typer.Option(100, min=1, max=1000, help="Maximum messages per import"),
+) -> None:
+    """Import selected job emails offline and evaluate them in all enabled profiles."""
+    _import_email_source(
+        SourceDefinition(
+            name="email-vacancies",
+            type="email_files",
+            params={
+                "directory": str(directory.expanduser().absolute()),
+                "max_messages": max_messages,
+            },
+        ),
+        config,
+    )
+
+
+@app.command("import-gmail")
+def import_gmail(
+    snapshot_file: Annotated[
+        Path, typer.Argument(help="JSON snapshot from connected Gmail message reads")
+    ],
+    config: str = typer.Option("config/settings.yaml", help="App config YAML"),
+) -> None:
+    """Import a Gmail connector snapshot offline into all enabled search profiles."""
+    _import_email_source(
+        SourceDefinition(
+            name="email-vacancies",
+            type="gmail_snapshot",
+            params={"snapshot_file": str(snapshot_file.expanduser().absolute())},
+        ),
+        config,
+    )
+
+
+def _import_email_source(source: SourceDefinition, config: str) -> None:
+    settings = load_app_config(config)
+    settings = replace(
+        settings,
+        sources=[source],
+        llm=replace(settings.llm, enabled=False),
+        telegram=replace(settings.telegram, enabled=False),
+    )
+    result = JobIntakePipeline(settings).run()
+    typer.echo(
+        f"Email import completed: ingested={result['ingested']} persisted={result['persisted']} "
+        f"evaluations={result['evaluations']} source_errors={result['source_errors']} "
+        f"record_errors={result['record_errors']}"
+    )
+    for error in result["errors"]:
+        typer.echo(error, err=True)
+    if result["source_errors"] or result["record_errors"]:
+        raise typer.Exit(code=1)
 
 
 @app.command("reevaluate")

@@ -38,6 +38,12 @@ llm:
   batch_max_wait: 86400.0
 
 sources:
+  - name: email-vacancies
+    type: email_files
+    enabled: false
+    params:
+      directory: data/local/job-emails
+      max_messages: 100
   # Keep the existing source ID so re-fetching March history updates the same records.
   - name: dailyremote-bridge
     type: dailyremote

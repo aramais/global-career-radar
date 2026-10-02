@@ -134,6 +134,18 @@ def load_app_config(path: str | Path) -> AppConfig:
                     config_path.parent.parent / Path(source.params["cookies_file"]).expanduser()
                 ).resolve()
             )
+        if source.type == "email_files" and source.params.get("directory"):
+            source.params["directory"] = str(
+                (
+                    config_path.parent.parent / Path(source.params["directory"]).expanduser()
+                ).absolute()
+            )
+        if source.type == "gmail_snapshot" and source.params.get("snapshot_file"):
+            source.params["snapshot_file"] = str(
+                (
+                    config_path.parent.parent / Path(source.params["snapshot_file"]).expanduser()
+                ).absolute()
+            )
         if source.type == "watchlist" and "watchlist_path" in source.params:
             source.params["watchlist_path"] = str(
                 (config_path.parent.parent / source.params["watchlist_path"]).resolve()
