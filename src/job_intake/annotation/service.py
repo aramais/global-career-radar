@@ -13,6 +13,7 @@ from job_intake.annotation.ai import (
     build_review_prompt,
     prompts_version,
 )
+from job_intake.annotation.jev import JEV_VERSION, JevReviewClient, normalize_jev_review
 from job_intake.annotation.schema import prepare_claims, review_claims, summarize_claims
 from job_intake.annotation.text import (
     asserted_phrase_hits,
@@ -95,7 +96,11 @@ def _drafts(payload: dict, source_id: str, units: list[dict], chunk_id: str) -> 
     return list(by_id.values()), local_rejects + rejects
 
 
-def _reviewed(drafts: list[dict], payload: dict) -> tuple[list, list]:
+def _reviewed(
+    drafts: list[dict], payload: dict, provider: str = "", jev_options: dict | None = None,
+) -> tuple[list, list]:
+    if provider == "jev":
+        payload = normalize_jev_review(payload, drafts, **(jev_options or {}))
     claims, rejects = review_claims(drafts, payload)
     invalid = {row["index"] for row in rejects}
     supplied = {
@@ -103,13 +108,46 @@ def _reviewed(drafts: list[dict], payload: dict) -> tuple[list, list]:
     }
     for claim in claims:
         claim["review_method"] = "model" if claim["claim_id"] in supplied else "unreviewed"
+        if provider == "jev" and claim["claim_id"] in supplied:
+            row = next(row for row in payload["reviews"] if row["claim_id"] == claim["claim_id"])
+            claim["review_adapter"] = "jev"
+            for field in ("review_choice", "review_probabilities", "review_confidence",
+                          "review_model", "review_gate"):
+                claim[field] = row[field]
     return claims, rejects
+
+
+class AnnotationStageClients:
+    """Route independent stages without conflating Responses and Chat Completions."""
+
+    def __init__(self, config: AnnotationConfig) -> None:
+        self.extract = AnnotationModelClient(config.resolved_stage("extract"))
+        review = config.resolved_stage("review")
+        self.review = (
+            JevReviewClient(review) if review.provider == "jev" else AnnotationModelClient(review)
+        )
+
+    def generate(self, model: str, prompt: str) -> tuple[dict, dict]:
+        """Compatibility entry point for callers with distinct model identifiers."""
+        if self.extract.config.model == self.review.config.model:
+            raise ValueError("Ambiguous model identifier; use generate_stage")
+        if model == self.extract.config.model:
+            return self.extract.generate(model, prompt)
+        if model == self.review.config.model and not isinstance(self.review, JevReviewClient):
+            return self.review.generate(model, prompt)
+        raise ValueError("Unknown generative annotation model")
+
+    def generate_stage(self, stage: str, model: str, prompt: str) -> tuple[dict, dict]:
+        if self.extract.config.model != self.review.config.model:
+            return self.generate(model, prompt)
+        client = self.extract if stage == "extract" else self.review
+        return client.generate(model, prompt)
 
 
 class VacancyAnnotator:
     def __init__(self, config: AnnotationConfig) -> None:
         self.config = config
-        self.client = AnnotationModelClient(config)
+        self.client = AnnotationStageClients(config)
         self.stats = {"extraction_calls": 0, "review_calls": 0, "cache_hits": 0, "errors": 0}
 
     def _cache_key(self, record: JobRecord) -> str:
@@ -122,11 +160,67 @@ class VacancyAnnotator:
                     "source_hash": source_hash(record),
                     "config": config,
                     "prompts": prompts_version(),
+                    "jev_prompt": (
+                        JEV_VERSION if self.config.resolved_stage("review").provider == "jev"
+                        else None
+                    ),
                 },
                 sort_keys=True,
                 ensure_ascii=False,
             )
         )
+
+    def _extraction_key(self, record: JobRecord, chunk: dict) -> str:
+        spec = asdict(self.config.resolved_stage("extract"))
+        for name in ("jev_min_probability", "jev_min_confidence", "jev_batch_size"):
+            spec.pop(name, None)
+        # Reviewer changes must not pay for the same extraction again.
+        from job_intake.annotation import ai
+
+        return stable_hash(json.dumps({
+            "version": ANNOTATION_VERSION, "source_hash": source_hash(record),
+            "chunk": chunk, "spec": spec, "prompt": ai.EXTRACTION_PROMPT,
+        }, sort_keys=True, ensure_ascii=False))
+
+    def _review_key(self, extraction_key: str, drafts: list) -> str:
+        return stable_hash(json.dumps({
+            "extraction": extraction_key, "claims": drafts,
+            "spec": asdict(self.config.resolved_stage("review")),
+            "prompts": prompts_version(),
+            "jev": JEV_VERSION if self.config.resolved_stage("review").provider == "jev" else None,
+        }, sort_keys=True, ensure_ascii=False))
+
+    def _extraction_path(self, record: JobRecord, key: str) -> Path:
+        return (
+            Path(self.config.cache_dir) / source_identity(record) / "extractions" / (key + ".json")
+        )
+
+    def _generate(self, stage: str, model: str, prompt: str) -> tuple[dict, dict]:
+        if hasattr(self.client, "generate_stage"):
+            return self.client.generate_stage(stage, model, prompt)
+        # Existing embedders may inject a single fake/model gateway implementing generate.
+        return self.client.generate(model, prompt)
+
+    def _review(self, source_id: str, chunk: dict, draft: list) -> tuple[dict, dict]:
+        if self.config.resolved_stage("review").provider == "jev":
+            client = self.client.review
+            before = client.calls
+            try:
+                return client.review(source_id, chunk, draft)
+            finally:
+                self.stats["review_calls"] += client.calls - before
+        self.stats["review_calls"] += 1
+        return self._generate(
+            "review", self.config.review_model, build_review_prompt(source_id, chunk, draft)
+        )
+
+    def _provenance(self, stage: str) -> dict:
+        spec = self.config.resolved_stage(stage)
+        return {"provider": spec.provider, "model": spec.model, "endpoint": spec.base_url}
+
+    def _jev_options(self, model: str) -> dict:
+        return {"min_probability": self.config.jev_min_probability,
+                "min_confidence": self.config.jev_min_confidence, "model": model}
 
     @staticmethod
     def _write(path: Path, annotation: dict) -> None:
@@ -155,7 +249,11 @@ class VacancyAnnotator:
         return stages
 
     @staticmethod
-    def _review_complete(drafts: list[dict], payload: dict) -> bool:
+    def _review_complete(
+        drafts: list[dict], payload: dict, provider: str = "", jev_options: dict | None = None,
+    ) -> bool:
+        if provider == "jev":
+            payload = normalize_jev_review(payload, drafts, **(jev_options or {}))
         _, rejects = review_claims(drafts, payload)
         invalid = {row["index"] for row in rejects}
         supplied = {
@@ -177,8 +275,20 @@ class VacancyAnnotator:
             for name in ("extract_model", "review_model")
         ):
             return None
-        if saved["extract_model"] == saved["review_model"]:
-            return None
+        if (
+            saved["extract_model"] == saved["review_model"]
+            and saved.get("extract_provider") == saved.get("review_provider")
+        ):
+            metadata = saved.get("model_stages", {})
+            if not isinstance(metadata, dict):
+                return None
+            extract_meta, review_meta = metadata.get("extract", {}), metadata.get("review", {})
+            if (
+                not isinstance(extract_meta, dict) or not isinstance(review_meta, dict)
+                or not extract_meta.get("endpoint") or not review_meta.get("endpoint")
+                or extract_meta["endpoint"] == review_meta["endpoint"]
+            ):
+                return None
         by_id = {}
         rejected = []
         completed = 0
@@ -196,8 +306,10 @@ class VacancyAnnotator:
                 )
                 rejected.extend(bad)
                 review = stage.get("review", {"reviews": []})
-                claims, bad = _reviewed(drafts, review)
-                if self._review_complete(drafts, review):
+                provider = saved.get("review_provider", "")
+                options = self._jev_options(saved["review_model"])
+                claims, bad = _reviewed(drafts, review, provider, options)
+                if self._review_complete(drafts, review, provider, options):
                     completed += 1
                 rejected.extend(bad)
                 by_id.update({claim["claim_id"]: claim for claim in claims})
@@ -226,7 +338,10 @@ class VacancyAnnotator:
         source_id, content_hash = source_identity(record), source_hash(record)
         key = self._cache_key(record)
         requested_ai = use_ai and self.config.ai_enabled
-        available_ai = requested_ai and bool(os.getenv(self.config.api_key_env))
+        extract_spec = self.config.resolved_stage("extract")
+        review_spec = self.config.resolved_stage("review")
+        jev_options = self._jev_options(review_spec.model)
+        available_ai = requested_ai and bool(os.getenv(extract_spec.api_key_env))
         saved = record.annotation
         annotation = {
             "version": ANNOTATION_VERSION,
@@ -244,6 +359,9 @@ class VacancyAnnotator:
             "usage": [],
             "extract_model": self.config.extract_model,
             "review_model": self.config.review_model,
+            "extract_provider": extract_spec.provider,
+            "review_provider": review_spec.provider,
+            "model_stages": {stage: self._provenance(stage) for stage in ("extract", "review")},
             "chunk_chars": self.config.chunk_chars,
             "description_complete": record.source_metadata.get("description_complete") is not False,
         }
@@ -269,6 +387,25 @@ class VacancyAnnotator:
             claim["review_method"] = "local"
         annotation["claims"] = local
         annotation["rejected"] = rejects + review_rejects
+        if (
+            requested_ai and self._matches(saved, record)
+            and saved.get("cache_key") != key
+        ):
+            # A reviewer change can reuse a matching persisted extraction even after
+            # cache files are removed; old review decisions are deliberately discarded.
+            try:
+                previous_stages = self._stages(saved)
+                for chunk in chunk_source(units, self.config.chunk_chars):
+                    previous = previous_stages.get(chunk["chunk_id"], {})
+                    extraction_key = self._extraction_key(record, chunk)
+                    if previous.get("extraction_key") == extraction_key:
+                        annotation["stages"][chunk["chunk_id"]] = {
+                            name: previous[name] for name in (
+                                "extraction", "extraction_key", "extraction_provenance"
+                            ) if name in previous
+                        }
+            except (KeyError, TypeError, ValueError):
+                annotation["stages"] = {}
         if isinstance(saved, dict) and (not requested_ai or saved.get("cache_key") == key):
             verified = self._saved_review(saved, record)
             if verified is not None and (not available_ai or verified["status"] == "reviewed"):
@@ -286,7 +423,7 @@ class VacancyAnnotator:
                     "Previous independent review is incomplete or invalid; rerun with --ai."
                 )
             if requested_ai:
-                annotation["issues"].append("AI unavailable: set " + self.config.api_key_env)
+                annotation["issues"].append("AI unavailable: set " + extract_spec.api_key_env)
             annotation["summary"] = summarize_claims(local)
             record.annotation = annotation
             return annotation
@@ -315,9 +452,30 @@ class VacancyAnnotator:
             chunk_id = chunk["chunk_id"]
             chunk_units = [unit for unit in chunk["units"] if unit["text"].strip()]
             stage = annotation["stages"].setdefault(chunk_id, {})
+            extraction_key = self._extraction_key(record, chunk)
+            extraction_path = self._extraction_path(record, extraction_key)
             seeded, _ = _drafts({"claims": []}, source_id, chunk_units, chunk_id)
             claims.extend(seeded)
             try:
+                if stage.get("extraction_key", extraction_key) != extraction_key:
+                    stage.clear()
+                if "extraction" not in stage and extraction_path.is_file():
+                    try:
+                        cached_extract = json.loads(extraction_path.read_text(encoding="utf-8"))
+                        if (
+                            cached_extract.get("extraction_key") != extraction_key
+                            or cached_extract.get("source_hash") != content_hash
+                            or cached_extract.get("chunk_id") != chunk_id
+                        ):
+                            raise ValueError("Mismatched extraction cache")
+                        prepare_claims(
+                            cached_extract["extraction"], source_id, chunk_units, chunk_id
+                        )
+                        stage["extraction"] = cached_extract["extraction"]
+                        stage["extraction_key"] = extraction_key
+                        stage["extraction_provenance"] = self._provenance("extract")
+                    except (OSError, KeyError, TypeError, ValueError):
+                        annotation["issues"].append(chunk_id + ": invalid extraction cache rebuilt")
                 if "extraction" in stage:
                     try:
                         prepare_claims(stage["extraction"], source_id, chunk_units, chunk_id)
@@ -326,17 +484,26 @@ class VacancyAnnotator:
                         annotation["issues"].append(chunk_id + ": invalid extraction cache rebuilt")
                 if "extraction" not in stage:
                     self.stats["extraction_calls"] += 1
-                    payload, usage = self.client.generate(
-                        self.config.extract_model, build_extraction_prompt(source_id, chunk)
+                    payload, usage = self._generate(
+                        "extract", self.config.extract_model,
+                        build_extraction_prompt(source_id, chunk)
                     )
                     # An invalid envelope is never cached as a completed extraction.
                     prepare_claims(payload, source_id, chunk_units, chunk_id)
                     stage["extraction"] = payload
+                    stage["extraction_key"] = extraction_key
+                    stage["extraction_provenance"] = self._provenance("extract")
+                    self._write(extraction_path, {
+                        "extraction_key": extraction_key, "source_hash": content_hash,
+                        "chunk_id": chunk_id, "extraction": payload,
+                        "provenance": self._provenance("extract"), "usage": usage,
+                    })
                     annotation["usage"].append(
                         {
                             "stage": "extract",
                             "chunk_id": chunk_id,
                             "model": self.config.extract_model,
+                            "provider": extract_spec.provider,
                             **usage,
                         }
                     )
@@ -345,19 +512,21 @@ class VacancyAnnotator:
                     self.stats["cache_hits"] += 1
                 draft, bad = _drafts(stage["extraction"], source_id, chunk_units, chunk_id)
                 rejected.extend(bad)
+                review_key = self._review_key(extraction_key, draft)
+                if stage.get("review_key", review_key) != review_key:
+                    stage.pop("review", None)
                 if "review" in stage:
                     try:
-                        if not self._review_complete(draft, stage["review"]):
+                        if not self._review_complete(
+                            draft, stage["review"], review_spec.provider, jev_options
+                        ):
                             raise ValueError("Missing exact-ID reviews")
                     except (TypeError, ValueError):
                         stage.pop("review")
                         annotation["issues"].append(chunk_id + ": invalid review cache rebuilt")
                 if "review" not in stage:
                     if draft:
-                        self.stats["review_calls"] += 1
-                        payload, usage = self.client.generate(
-                            self.config.review_model, build_review_prompt(source_id, chunk, draft)
-                        )
+                        payload, usage = self._review(source_id, chunk, draft)
                         review_claims(draft, payload)
                         stage["review"] = payload
                         annotation["usage"].append(
@@ -365,16 +534,29 @@ class VacancyAnnotator:
                                 "stage": "review",
                                 "chunk_id": chunk_id,
                                 "model": self.config.review_model,
+                                "provider": review_spec.provider,
                                 **usage,
                             }
                         )
                     else:
                         stage["review"] = {"reviews": []}
+                        if review_spec.provider == "jev":
+                            stage["review"]["jev"] = {
+                                "model": review_spec.model, "answers": {},
+                                "min_probability": self.config.jev_min_probability,
+                                "min_confidence": self.config.jev_min_confidence,
+                            }
+                    stage["review_key"] = review_key
+                    stage["review_provenance"] = self._provenance("review")
                     self._write(path, annotation)
-                reviewed, bad = _reviewed(draft, stage["review"])
+                reviewed, bad = _reviewed(
+                    draft, stage["review"], review_spec.provider, jev_options
+                )
                 rejected.extend(bad)
                 claims.extend(reviewed)
-                if not self._review_complete(draft, stage["review"]):
+                if not self._review_complete(
+                    draft, stage["review"], review_spec.provider, jev_options
+                ):
                     raise ValueError("Missing exact-ID reviews")
                 completed += 1
             except Exception as exc:  # Any model failure must leave the vacancy reviewable.
@@ -385,7 +567,9 @@ class VacancyAnnotator:
                     try:
                         draft, bad = _drafts(stage["extraction"], source_id, chunk_units, chunk_id)
                         if "review" in stage:
-                            draft, review_bad = _reviewed(draft, stage["review"])
+                            draft, review_bad = _reviewed(
+                                draft, stage["review"], review_spec.provider, jev_options
+                            )
                             rejected.extend(review_bad)
                         claims.extend(draft)
                         rejected.extend(bad)

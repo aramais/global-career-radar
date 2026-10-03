@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from job_intake.alerts.digest import DigestJob
 from job_intake.models.job import EvaluatedJob, JobRecord, JobTier
@@ -27,6 +27,10 @@ class UpsertResult:
     changed: bool
     tier_changed: bool
     should_alert: bool
+
+
+class JobArchiveConflictError(ValueError):
+    """The archive state changed after the caller loaded the vacancy."""
 
 
 class JobRepository:
@@ -157,9 +161,9 @@ class JobRepository:
                     },
                 )
             )
-        if tier_changed and item.evaluation.tier == JobTier.A:
+        if tier_changed and item.evaluation.tier == JobTier.A and existing.archived_at is None:
             existing.alert_pending = True
-        should_alert = item.evaluation.tier == JobTier.A and (
+        should_alert = existing.archived_at is None and item.evaluation.tier == JobTier.A and (
             existing.last_alerted_tier != JobTier.A.value or existing.alert_pending
         )
         if should_alert and not self._dedup_window_elapsed(existing.last_alerted_at, now):
@@ -292,7 +296,7 @@ class JobRepository:
         cutoff = datetime.now(UTC) - timedelta(hours=hours)
         stmt = (
             select(JobORM)
-            .where(JobORM.last_seen_at >= cutoff)
+            .where(JobORM.last_seen_at >= cutoff, JobORM.archived_at.is_(None))
             .order_by(JobORM.tier.asc(), JobORM.fit_score.desc())
         )
         if active_profile_versions is None:
@@ -336,13 +340,61 @@ class JobRepository:
         jobs.sort(key=lambda job: (job.tier, -job.fit_score, job.title))
         return jobs
 
-    def list_jobs(self, limit: int | None = 100, tier: str | None = None) -> list[JobORM]:
+    def list_jobs(
+        self, limit: int | None = 100, tier: str | None = None, *, archived: bool | None = None,
+    ) -> list[JobORM]:
         stmt = select(JobORM).order_by(JobORM.updated_at.desc(), JobORM.job_uid)
+        if archived is not None:
+            stmt = stmt.where(
+                JobORM.archived_at.is_not(None) if archived else JobORM.archived_at.is_(None)
+            )
         if limit is not None:
             stmt = stmt.limit(limit)
         if tier:
             stmt = stmt.where(JobORM.tier == tier)
         return list(self.session.scalars(stmt))
+
+    def set_archived(
+        self, job_uid: str, archived: bool, *, expected_version: int,
+    ) -> JobORM | None:
+        if type(archived) is not bool:
+            raise ValueError("archived must be Boolean")
+        if type(expected_version) is not int or expected_version < 1:
+            raise ValueError("expected_version must be a positive integer")
+        job = self.session.scalar(
+            select(JobORM).where(JobORM.job_uid == job_uid)
+            .execution_options(populate_existing=True)
+        )
+        if job is None:
+            return None
+        if job.archive_version != expected_version:
+            raise JobArchiveConflictError("Archive version changed")
+        if (job.archived_at is not None) == archived:
+            return job
+        result = self.session.execute(
+            update(JobORM).where(
+                JobORM.job_uid == job_uid, JobORM.archive_version == expected_version,
+            ).values(
+                archived_at=datetime.now(UTC) if archived else None,
+                archive_version=expected_version + 1,
+                **({"alert_pending": False} if archived else {}),
+            ).execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            raise JobArchiveConflictError("Archive version changed")
+        self.session.expire(job)
+        self.session.add(JobEventORM(
+            job_uid=job_uid, event_type="archived" if archived else "restored",
+            payload={"archive_version": expected_version + 1},
+        ))
+        if archived:
+            self.session.execute(
+                update(AlertOutboxORM).where(
+                    AlertOutboxORM.job_uid == job_uid, AlertOutboxORM.status == "pending",
+                ).values(status="cancelled")
+            )
+        self.session.flush()
+        return job
 
     def add_feedback(self, job_uid: str, label: str, note: str = "") -> None:
         self.session.add(FeedbackORM(job_uid=job_uid, label=label, note=note))
@@ -357,6 +409,7 @@ class JobRepository:
         stmt = select(JobORM).where(
             JobORM.last_seen_at < cutoff,
             JobORM.tier.in_(list(tiers)),
+            JobORM.archived_at.is_(None),
         )
         rows = list(self.session.scalars(stmt))
         for row in rows:
@@ -376,7 +429,7 @@ class JobRepository:
         # Resolve active evaluations before filtering/limiting: the saved aggregate
         # may belong to a disabled profile or criteria that have since changed.
         entries = []
-        for row in self.list_jobs(limit=None):
+        for row in self.list_jobs(limit=None, archived=False):
             profiles = [
                 p
                 for p in row.profile_evaluations

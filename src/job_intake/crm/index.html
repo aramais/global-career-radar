@@ -39,10 +39,17 @@ border-bottom:1px solid #edf1f5}.channel-panel th{color:var(--muted);font-weight
 grid-template-columns:1.6fr 1fr 1fr 1fr 1fr auto;gap:10px;align-items:end;margin-bottom:15px}
 .view-toolbar{display:flex;gap:12px;align-items:center;justify-content:space-between;margin:18px 0 12px}
 .job-controls{padding:16px;margin-bottom:15px}.job-filter-grid{display:grid;
-grid-template-columns:1fr 1fr 1fr 1.5fr auto;gap:10px;align-items:end}
+grid-template-columns:1.1fr .8fr .8fr .8fr 1.5fr auto;gap:10px;align-items:end}
 .grading-help{font-size:.82rem;margin-top:12px;line-height:1.5}.grading-help summary{cursor:pointer;
 color:var(--blue);font-weight:600}.grading-help ul{margin:.5rem 0;padding-left:20px}
 .filter-error{color:var(--danger);font-size:.84rem;margin-top:10px}
+.job-bulk{position:sticky;top:10px;z-index:5;padding:12px 16px;margin-bottom:15px;
+display:flex;align-items:center;gap:12px;flex-wrap:wrap;box-shadow:0 4px 14px #2033470d}
+.job-select{display:flex;align-items:center;gap:8px}.job-select input{width:18px;height:18px;
+margin:0;accent-color:var(--blue)}.job-bulk .help{flex-basis:100%;margin:0}
+.job-select>span{margin:0}
+.job-card.selected{border-color:var(--blue);background:#f8fbff}
+.job-card .job-title{flex:1;min-width:0}.job-card .job-select{padding-top:3px}
 .list{display:grid;gap:11px}.card{padding:17px 19px}.card-head{display:flex;align-items:flex-start;
 gap:14px;justify-content:space-between}.card-title{font-size:1rem;font-weight:700;line-height:1.45}
 .card-company{font-size:.83rem;color:var(--muted);margin:.15rem 0 .5rem}.tags{display:flex;gap:7px;
@@ -138,6 +145,9 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
   <p class="view-note" id="viewNote"></p>
   <section class="panel job-controls" id="jobControls" aria-label="Фильтры оценки вакансий" hidden>
     <div class="job-filter-grid">
+      <label><span>Архив вакансий</span><select id="jobArchiveFilter">
+        <option value="active">Активные</option><option value="archived">Архив</option>
+        <option value="all">Все вакансии</option></select></label>
       <label><span>Категория</span><select id="tierFilter">
         <option value="">Все категории</option><option value="A">A</option>
         <option value="B">B</option><option value="C">C</option>
@@ -161,6 +171,15 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
         низкий балл может означать неполное описание и не мешает откликнуться.</p>
     </details>
   </section>
+  <section class="panel job-bulk" id="jobBulkActions" aria-label="Массовые действия с вакансиями" hidden>
+    <label class="job-select"><input id="selectAllJobs" type="checkbox">
+      <span id="selectAllJobsLabel">Выбрать все в списке</span></label>
+    <span class="count" id="jobSelectionCount" role="status">Выбрано: 0</span>
+    <button id="archiveSelectedJobs" class="primary" type="button" disabled>Архивировать выбранные</button>
+    <button id="restoreSelectedJobs" type="button" hidden disabled>Восстановить выбранные</button>
+    <button id="clearJobSelection" type="button" disabled>Снять выбор</button>
+    <p class="help">Выбор действует на текущий список после поиска и фильтров.</p>
+  </section>
   <section id="content" class="list" aria-live="polite"></section>
   <footer>Изменения сохраняются в локальной базе проекта. Даты из истории не заполняются автоматически.
     Сообщения контактам отправляете вы. Импорт JobCRM сохраняет исходную таблицу без изменений.</footer>
@@ -173,6 +192,10 @@ let state = null;
 let view = 'applications';
 let activeId = null;
 let busy = false;
+let loading = false;
+let refreshSequence = 0;
+let visibleJobs = [];
+let jobSelection = new Map();
 let priorFocus = null;
 const $ = (id) => document.getElementById(id);
 const defaults = {
@@ -282,23 +305,30 @@ async function api(path, method, payload) {
 }
 function stateQuery() {
   const query = new URLSearchParams();
-  [['profile_id','profileFilter'],['channel','channelFilter'],['since','sinceFilter'],['until','untilFilter']]
+  [['profile_id','profileFilter'],['channel','channelFilter'],['since','sinceFilter'],['until','untilFilter'],
+    ['job_archive','jobArchiveFilter']]
     .forEach(([name,id]) => { if ($(id).value) query.set(name,$(id).value); });
   return '/api/state' + (query.toString() ? '?' + query.toString() : '');
 }
 async function refresh(initial) {
+  const request = ++refreshSequence;
+  loading = true; renderJobSelection();
   clearError(); $('saveStatus').textContent = 'Загрузка…';
   try {
-    state = await api(initial ? '/api/state' : stateQuery());
+    const latest = await api(initial ? '/api/state' : stateQuery());
+    if (request !== refreshSequence) return;
+    state = latest;
     if (initial) setupFilters();
     render(); $('saveStatus').textContent = 'Сохранено в локальной базе';
     $('createButton').disabled = false; $('importButton').disabled = false;
-  } catch (error) { showError(errorMessage(error)); }
+  } catch (error) { if (request === refreshSequence) showError(errorMessage(error)); }
+  finally { if (request === refreshSequence) { loading = false; renderJobSelection(); } }
 }
 async function write(path, method, payload, after) {
   if (busy) return;
   busy = true; clearError(); $('saveStatus').textContent = 'Сохранение…';
   document.querySelectorAll('button').forEach((node) => node.disabled = true);
+  renderJobSelection();
   try {
     const result = await api(path, method, payload);
     await refresh(false);
@@ -314,6 +344,7 @@ async function write(path, method, payload, after) {
     } else { showError(errorMessage(error)); }
   } finally {
     busy = false; document.querySelectorAll('button').forEach((node) => node.disabled = false);
+    renderJobSelection();
   }
 }
 function setupFilters() {
@@ -414,7 +445,9 @@ function filterAndSortJobs(jobs, options = {}) {
   const min = scoreNumber(options.minScore), max = scoreNumber(options.maxScore);
   if (min !== null && max !== null && min > max) return [];
   const sort = options.sort || 'tier-asc';
-  return jobs.map((job) => ({job,assessment:jobAssessment(job,options.profileId)}))
+  const archive = options.archive || 'active';
+  return jobs.filter((job) => archive === 'all' || Boolean(job.archived)
+    === (archive === 'archived')).map((job) => ({job,assessment:jobAssessment(job,options.profileId)}))
     .filter(({assessment}) => {
       if (options.profileId && !assessment) return false;
       const tier = ['A','B','C'].includes(assessment?.tier) ? assessment.tier : 'unrated';
@@ -429,6 +462,54 @@ function filterAndSortJobs(jobs, options = {}) {
       return (sort.startsWith('score-') ? scoreOrder || tierOrder : tierOrder || scoreOrder)
         || String(a.job.job_uid || '').localeCompare(String(b.job.job_uid || ''));
     }).map(({job}) => job);
+}
+function retainedJobSelection(jobs, selection) {
+  return new Map(jobs.filter((job) => selection.has(job.job_uid)
+    && selection.get(job.job_uid) === job.archive_version)
+    .map((job) => [job.job_uid,job.archive_version]));
+}
+function selectedJobs(jobs, selection) {
+  return jobs.filter((job) => selection.has(job.job_uid)
+    && selection.get(job.job_uid) === job.archive_version);
+}
+function jobArchivePayload(jobs, selection, archived) {
+  return {archived,jobs:selectedJobs(jobs,selection)
+    .filter((job) => Boolean(job.archived) !== archived)
+    .map((job) => ({job_uid:job.job_uid,expected_version:job.archive_version}))};
+}
+function renderJobSelection() {
+  $('jobBulkActions').hidden = view !== 'jobs';
+  const chosen = selectedJobs(visibleJobs,jobSelection);
+  const active = chosen.filter((job) => !job.archived).length;
+  const archived = chosen.length - active;
+  $('selectAllJobsLabel').textContent = 'Выбрать все в списке (' + visibleJobs.length + ')';
+  $('selectAllJobs').checked = visibleJobs.length > 0 && chosen.length === visibleJobs.length;
+  $('selectAllJobs').indeterminate = chosen.length > 0 && chosen.length < visibleJobs.length;
+  $('selectAllJobs').disabled = busy || loading || !visibleJobs.length;
+  $('jobSelectionCount').textContent = 'Выбрано: ' + chosen.length;
+  $('archiveSelectedJobs').textContent = 'Архивировать выбранные' + (active ? ' (' + active + ')' : '');
+  $('archiveSelectedJobs').disabled = busy || loading || !active;
+  $('archiveSelectedJobs').hidden = $('jobArchiveFilter').value === 'archived';
+  $('restoreSelectedJobs').textContent = 'Восстановить выбранные' + (archived ? ' (' + archived + ')' : '');
+  $('restoreSelectedJobs').hidden = $('jobArchiveFilter').value === 'active';
+  $('restoreSelectedJobs').disabled = busy || loading || !archived;
+  $('clearJobSelection').disabled = busy || loading || !chosen.length;
+  document.querySelectorAll('.job-card').forEach((card) => {
+    const checked = jobSelection.has(card.dataset.jobUid);
+    card.classList.toggle('selected',checked);
+    const checkbox = card.querySelector('input[type="checkbox"]');
+    checkbox.checked = checked; checkbox.disabled = busy || loading;
+  });
+}
+async function setSelectedJobsArchived(archived) {
+  if (busy || loading) return;
+  const payload = jobArchivePayload(visibleJobs,jobSelection,archived);
+  if (!payload.jobs.length) return;
+  await write('/api/jobs/archive','PATCH',payload,(result) => {
+    payload.jobs.forEach((job) => jobSelection.delete(job.job_uid));
+    renderJobSelection();
+    $('saveStatus').textContent = (archived ? 'Архивировано: ' : 'Восстановлено: ') + result.count;
+  });
 }
 function renderJobFilters() {
   const profileId = $('profileFilter').value;
@@ -498,6 +579,7 @@ function render() {
     : view === 'contacts' ? 'Добавить контакт' : 'Добавить отклик';
   $('content').className = ['companies','contacts'].includes(view) ? 'grid-cards' : 'list';
   $('content').replaceChildren();
+  if (view !== 'jobs') { visibleJobs = []; jobSelection.clear(); }
   let records = [];
   if (view === 'applications' || view === 'actions') {
     records = currentApplications();
@@ -514,7 +596,10 @@ function render() {
   } else if (view === 'jobs') {
     records = renderJobFilters() ? filterAndSortJobs((state.jobs || []).filter(matchesQuery),
       {profileId:$('profileFilter').value,tier:$('tierFilter').value,minScore:$('scoreMinFilter').value,
-        maxScore:$('scoreMaxFilter').value,sort:$('jobSort').value}) : [];
+        maxScore:$('scoreMaxFilter').value,sort:$('jobSort').value,
+        archive:$('jobArchiveFilter').value}) : [];
+    visibleJobs = records;
+    jobSelection = retainedJobSelection(records,jobSelection);
     records.forEach((job) => $('content').append(jobCard(job)));
   } else if (view === 'companies') {
     records = (state.companies || []).filter(matchesQuery);
@@ -524,6 +609,7 @@ function render() {
     records.forEach((contact) => $('content').append(contactCard(contact)));
   }
   $('itemCount').textContent = records.length + ' записей';
+  renderJobSelection();
   if (!records.length) {
     const empty = el('div',null,'empty full');
     empty.append(el('h3',view === 'jobs' ? 'Подходящих записей пока нет' : 'Пока нет записей'),
@@ -556,12 +642,27 @@ function applicationCard(app) {
   return card;
 }
 function jobCard(job) {
-  const card = el('article',null,'card'); const head = el('div',null,'card-head'); const title = el('div');
+  const card = el('article',null,'card job-card'); card.dataset.jobUid = job.job_uid;
+  const head = el('div',null,'card-head'); const title = el('div',null,'job-title');
+  const choice = el('label',null,'job-select'); const checkbox = el('input'); checkbox.type = 'checkbox';
+  checkbox.setAttribute('aria-label','Выбрать вакансию: ' + (job.title || 'Вакансия')
+    + (job.company ? ' · ' + job.company : ''));
+  checkbox.addEventListener('change',() => {
+    if (checkbox.checked) jobSelection.set(job.job_uid,job.archive_version);
+    else jobSelection.delete(job.job_uid);
+    renderJobSelection();
+  });
+  choice.append(checkbox);
   title.append(el('div',job.title || 'Вакансия','card-title'),el('div',job.company,'card-company'));
   const existing = (state.applications || []).find((app) => app.job_uid === job.job_uid);
-  head.append(title,button(existing ? 'Открыть отклик' : 'Добавить в CRM',() => existing
-    ? openApplication(existing.id) : addJob(job),'inline-button'));
+  const actions = el('div',null,'row');
+  actions.append(button(existing ? 'Открыть отклик' : 'Добавить в CRM',() => existing
+    ? openApplication(existing.id) : addJob(job),'inline-button'),
+    button(job.archived ? 'Восстановить' : 'В архив',() => setJobArchived(job,!job.archived),
+      'inline-button'));
+  head.append(choice,title,actions);
   const tags = el('div',null,'tags');
+  if (job.archived) tags.append(badge('В архиве · ' + dateText(job.archived_at),'amber'));
   const assessment = jobAssessment(job,$('profileFilter').value);
   (job.profiles || []).forEach((profile) => tags.append(badge((profile.name || profileName(profile.id
     || profile.profile_id)) + ' · ' + (profile.tier || '—') + ' · '
@@ -576,6 +677,10 @@ function jobCard(job) {
   if (job.description) { const details = el('details'); details.append(el('summary','Описание вакансии',
     'small muted'),el('div',job.description,'job-description')); card.append(details); }
   return card;
+}
+async function setJobArchived(job, archived) {
+  await write('/api/jobs/' + encodeURIComponent(job.job_uid) + '/archive','PATCH',
+    {archived,expected_version:job.archive_version});
 }
 const annotationKinds = {role:'Роль',responsibility:'Задачи',skill:'Навыки',
   hiring_location:'Страны найма',work_mode:'Формат работы',working_language:'Рабочий язык',
@@ -596,6 +701,7 @@ function annotationFact(claim,conflicted = false) {
   else if (claim.review_method === 'model') tags.append(badge('Проверено второй моделью','blue'));
   else if (['UNREVIEWED','NEEDS_VERIFICATION'].includes(claim.review_status))
     tags.append(badge('Независимая проверка не завершена','amber'));
+  if (claim.review_adapter === 'jev') tags.append(badge('Jev','blue'));
   const requirements = {required:'Обязательно',preferred:'Предпочтительно',
     not_required:'Не требуется',informational:'Указано в источнике'};
   tags.append(badge(requirements[claim.requirement] || claim.requirement || 'Условие не указано'));
@@ -617,7 +723,9 @@ function renderJobAnnotation(job,assessment) {
     ? 'Независимая проверка выполнена частично. Непроверенные условия остаются неизвестными.'
     : 'Факты извлечены из текста и проверены второй моделью.')
     : 'Прямые поля источника и явные фразы. Проверка моделями не выполнялась.','muted'));
-  if (twoPass) body.append(el('p',annotation.extract_model + ' → ' + annotation.review_model,'tiny muted'));
+  if (twoPass) body.append(el('p',
+    [annotation.extract_provider,annotation.extract_model].filter(Boolean).join(': ') + ' → ' +
+    [annotation.review_provider,annotation.review_model].filter(Boolean).join(': '),'tiny muted'));
   if (annotation.description_complete === false)
     body.append(el('p','Источник содержит неполное описание: другие ограничения могут быть пропущены.',
       'small status error'));
@@ -925,11 +1033,20 @@ $('query').addEventListener('input',render); $('stageFilter').addEventListener('
 $('actionFilter').addEventListener('change',render);
 $('profileFilter').addEventListener('change',() => { if (view === 'jobs') render(); });
 ['tierFilter','jobSort'].forEach((id) => $(id).addEventListener('change',render));
+$('jobArchiveFilter').addEventListener('change',() => { jobSelection.clear(); refresh(false); });
 ['scoreMinFilter','scoreMaxFilter'].forEach((id) => $(id).addEventListener('input',render));
 $('resetJobFilters').addEventListener('click',() => {
   ['tierFilter','scoreMinFilter','scoreMaxFilter'].forEach((id) => $(id).value = '');
-  $('jobSort').value = 'tier-asc'; render();
+  $('jobSort').value = 'tier-asc'; $('jobArchiveFilter').value = 'active'; refresh(false);
 });
+$('selectAllJobs').addEventListener('change',() => {
+  jobSelection = $('selectAllJobs').checked
+    ? new Map(visibleJobs.map((job) => [job.job_uid,job.archive_version])) : new Map();
+  renderJobSelection();
+});
+$('clearJobSelection').addEventListener('click',() => { jobSelection.clear(); renderJobSelection(); });
+$('archiveSelectedJobs').addEventListener('click',() => setSelectedJobsArchived(true));
+$('restoreSelectedJobs').addEventListener('click',() => setSelectedJobsArchived(false));
 $('createButton').addEventListener('click',() => view === 'companies' ? openCompany(null)
   : view === 'contacts' ? openContact(null) : createApplication());
 $('importButton').addEventListener('click',openImport);

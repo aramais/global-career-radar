@@ -361,7 +361,8 @@ def test_cache_is_invalidated_by_source_model_or_prompt_changes(config, monkeypa
         monkeypatch.setattr(ai, "REVIEW_PROMPT", ai.REVIEW_PROMPT + "Additional instruction.\n")
     second, retry = annotator_with_fake(config)
     result = second.annotate(changed, use_ai=True)
-    assert [stage for stage, _ in retry.calls] == ["extract", "review"]
+    expected = ["review"] if change in {"model", "prompts"} else ["extract", "review"]
+    assert [stage for stage, _ in retry.calls] == expected
     assert result["status"] == "reviewed"
 
 

@@ -134,6 +134,50 @@ def _filtered_job_ids(jobs: list[dict], **options: object) -> object:
     )
 
 
+def test_job_archive_filter_defaults_to_active_and_combines_with_scores():
+    jobs = [
+        {"job_uid": "active", "archived": False,
+         "profiles": [{"id": "p", "tier": "A", "score": 20}]},
+        {"job_uid": "archived", "archived": True,
+         "profiles": [{"id": "p", "tier": "B", "score": 8}]},
+    ]
+    assert _filtered_job_ids(jobs) == ["active"]
+    assert _filtered_job_ids(jobs, archive="archived") == ["archived"]
+    assert _filtered_job_ids(jobs, archive="all") == ["active", "archived"]
+    assert _filtered_job_ids(jobs, archive="archived", minScore=10) == []
+    page = render_crm_page()
+    assert 'id="jobArchiveFilter"' in page
+    assert "job.archived ? 'Восстановить' : 'В архив'" in page
+    assert "{archived,expected_version:job.archive_version}" in page
+
+
+def test_bulk_selection_is_scoped_to_visible_results_and_current_archive_versions():
+    assert _run_javascript(
+        "const selected=new Map([['a',1],['b',1],['hidden',1],['stale',1]]);"
+        "const visible=[{job_uid:'a',archive_version:1},{job_uid:'b',archive_version:1},"
+        "{job_uid:'stale',archive_version:2},{job_uid:'unselected',archive_version:1}];"
+        "[...retainedJobSelection(visible,selected)]"
+    ) == [["a", 1], ["b", 1]]
+    assert _run_javascript(
+        "selectedJobs([{job_uid:'missing-version'}],new Map()).map(job=>job.job_uid)"
+    ) == []
+
+
+def test_bulk_payload_uses_only_selected_visible_jobs_that_need_the_target_state():
+    assert _run_javascript(
+        "const jobs=[{job_uid:'active',archived:false,archive_version:1},"
+        "{job_uid:'archived',archived:true,archive_version:2},"
+        "{job_uid:'untouched',archived:false,archive_version:1}];"
+        "const selected=new Map([['active',1],['archived',2],['hidden',1]]);"
+        "[jobArchivePayload(jobs,selected,true),jobArchivePayload(jobs,selected,false),"
+        "jobArchivePayload(jobs,new Map(),true)]"
+    ) == [
+        {"archived": True, "jobs": [{"job_uid": "active", "expected_version": 1}]},
+        {"archived": False, "jobs": [{"job_uid": "archived", "expected_version": 2}]},
+        {"archived": True, "jobs": []},
+    ]
+
+
 @pytest.mark.parametrize(
     ("sort", "expected"),
     [

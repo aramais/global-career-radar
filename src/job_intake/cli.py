@@ -7,13 +7,41 @@ from typing import Annotated
 
 import typer
 
-from job_intake.config.settings import SourceDefinition, load_app_config, load_yaml_mapping
+from job_intake.config.settings import (
+    ANNOTATION_PROVIDER_DEFAULTS,
+    SourceDefinition,
+    load_app_config,
+    load_yaml_mapping,
+)
 from job_intake.crm.cli import app as crm_app
 from job_intake.pipeline import JobIntakePipeline, build_pipeline
 from job_intake.profiles import load_streams
 
 app = typer.Typer(add_completion=False, help="Personal multi-profile job search")
 app.add_typer(crm_app, name="crm")
+
+_ANNOTATION_PRESETS = {
+    "budget-jev": {
+        "provider": "openai",
+        "api_key_env": "OPENAI_API_KEY",
+        "extract_provider": "openai",
+        "review_provider": "jev",
+        "extract_model": "gpt-6-luna",
+        "review_model": "jev-1.13.0",
+        "extract_reasoning_effort": "none",
+        "review_reasoning_effort": "low",
+    },
+    "balanced": {
+        "provider": "gemini",
+        "api_key_env": "GEMINI_API_KEY",
+        "extract_provider": "gemini",
+        "review_provider": "gemini",
+        "extract_model": "gemini-3.5-flash-lite",
+        "review_model": "gemini-3.8-flash",
+        "extract_reasoning_effort": "minimal",
+        "review_reasoning_effort": "low",
+    },
+}
 
 
 @app.command()
@@ -121,36 +149,92 @@ def annotate(
     config: str = typer.Option("config/settings.yaml", help="App config YAML"),
     ai: bool = typer.Option(False, "--ai", help="Extract and independently review with models"),
     limit: int | None = typer.Option(None, min=1, help="Maximum saved vacancies; default all"),
-    provider: str | None = typer.Option(None, help="gemini or openai; default from settings"),
+    provider: str | None = typer.Option(None, help="Legacy shared provider; default from settings"),
+    preset: str | None = typer.Option(None, help="Model preset: budget-jev or balanced"),
+    extract_provider: str | None = typer.Option(None, help="Extraction provider"),
+    review_provider: str | None = typer.Option(None, help="Independent review provider"),
     extract_model: str | None = typer.Option(None, help="Extraction model"),
     review_model: str | None = typer.Option(None, help="Different model for source review"),
+    extract_api_key_env: str | None = typer.Option(None, help="Extraction key environment name"),
+    review_api_key_env: str | None = typer.Option(None, help="Review key environment name"),
+    extract_base_url: str | None = typer.Option(None, help="Extraction API base URL"),
+    review_base_url: str | None = typer.Option(None, help="Review API base URL"),
+    extract_reasoning_effort: str | None = typer.Option(None, help="Extraction reasoning effort"),
+    review_reasoning_effort: str | None = typer.Option(None, help="Review reasoning effort"),
 ) -> None:
     """Annotate saved source texts and rescore profiles, without fetching or sending alerts."""
-    settings = load_app_config(config)
+    try:
+        settings = load_app_config(config)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     changes = {"enabled": True, "ai_enabled": ai}
-    if provider:
+    if preset is not None:
+        if preset not in _ANNOTATION_PRESETS:
+            raise typer.BadParameter("preset must be budget-jev or balanced")
+        if provider is not None:
+            raise typer.BadParameter("Use either --provider or --preset")
+        changes.update(_ANNOTATION_PRESETS[preset])
+        for stage in ("extract", "review"):
+            changes[f"{stage}_api_key_env"] = None
+            changes[f"{stage}_base_url"] = None
+    if provider is not None:
+        if provider not in ANNOTATION_PROVIDER_DEFAULTS:
+            raise typer.BadParameter("provider must name a supported annotation provider")
         changes["provider"] = provider
-        if provider == "openai" and settings.annotation.provider != "openai":
+        switching = settings.annotation.provider != provider or any(
+            settings.annotation.resolved_stage(stage).provider != provider
+            for stage in ("extract", "review")
+        )
+        for stage in ("extract", "review"):
+            changes[f"{stage}_provider"] = None
+            changes[f"{stage}_api_key_env"] = None
+            changes[f"{stage}_base_url"] = None
+            changes[f"{stage}_reasoning_effort"] = None
+        if provider == "openai" and switching:
             changes.update(
                 api_key_env="OPENAI_API_KEY", extract_model="gpt-5-mini", review_model="gpt-5"
             )
-        elif provider == "gemini" and settings.annotation.provider != "gemini":
+        elif provider == "gemini" and switching:
             changes.update(
                 api_key_env="GEMINI_API_KEY",
                 extract_model="gemini-2.5-flash-lite",
                 review_model="gemini-2.5-pro",
             )
-    if extract_model:
-        changes["extract_model"] = extract_model
-    if review_model:
-        changes["review_model"] = review_model
+        elif switching:
+            changes["api_key_env"] = ANNOTATION_PROVIDER_DEFAULTS[provider][0]
+            if extract_model is None or review_model is None:
+                raise typer.BadParameter(
+                    "Switching the shared provider requires --extract-model and --review-model"
+                )
+    overrides = {
+        "extract_provider": extract_provider,
+        "review_provider": review_provider,
+        "extract_model": extract_model,
+        "review_model": review_model,
+        "extract_api_key_env": extract_api_key_env,
+        "review_api_key_env": review_api_key_env,
+        "extract_base_url": extract_base_url,
+        "review_base_url": review_base_url,
+        "extract_reasoning_effort": extract_reasoning_effort,
+        "review_reasoning_effort": review_reasoning_effort,
+    }
+    for name, value in overrides.items():
+        if value is not None:
+            changes[name] = value
     try:
         annotation = replace(settings.annotation, **changes)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    if ai and not os.getenv(annotation.api_key_env):
-        typer.echo("Set " + annotation.api_key_env + " locally before running --ai.", err=True)
-        raise typer.Exit(code=1)
+    if ai:
+        missing_envs = dict.fromkeys(
+            annotation.resolved_stage(stage).api_key_env
+            for stage in ("extract", "review")
+            if not os.getenv(annotation.resolved_stage(stage).api_key_env, "").strip()
+        )
+        if missing_envs:
+            for env_name in missing_envs:
+                typer.echo("Set " + env_name + " locally before running --ai.", err=True)
+            raise typer.Exit(code=1)
     settings = replace(
         settings,
         annotation=annotation,

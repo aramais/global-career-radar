@@ -12,8 +12,11 @@ import math
 import os
 import re
 import time
+from ipaddress import ip_address
 from typing import Any, Protocol
+from urllib.parse import unquote, urlsplit
 
+import httpx
 import requests
 
 EXTRACTION_PROMPT = """Extract factual statements from a vacancy advertisement.
@@ -119,6 +122,7 @@ def build_review_prompt(
 class AnnotationModelConfig(Protocol):
     provider: str
     api_key_env: str
+    base_url: str
     request_timeout: float
     max_output_tokens: int
     reasoning_effort: str
@@ -171,39 +175,152 @@ def _parse_json(text: Any) -> dict[str, Any]:
     return parsed
 
 
+def _is_token_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def _token_count(value: Any) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+    return value if _is_token_count(value) else 0
+
+
+def _sum_token_counts(*values: Any) -> int | None:
+    if not any(_is_token_count(value) for value in values):
+        return None
+    return sum(_token_count(value) for value in values)
 
 
 def _usage(input_tokens: Any, output_tokens: Any, total_tokens: Any) -> dict[str, int]:
     input_count = _token_count(input_tokens)
     output_count = _token_count(output_tokens)
     total_count = _token_count(total_tokens)
-    return {
+    result = {
         "input_tokens": input_count,
         "output_tokens": output_count,
         "total_tokens": total_count,
+    }
+    if not all(_is_token_count(value) for value in (input_tokens, output_tokens, total_tokens)):
+        result["usage_known"] = False
+    return result
+
+
+_COMPATIBLE_PROVIDERS = {
+    "mistral", "deepseek", "qwen", "zai", "openrouter", "openai_compatible",
+}
+
+
+def _base_url(config: AnnotationModelConfig) -> str:
+    """Accept an explicitly configured API prefix without credentials or redirects."""
+    base = getattr(config, "base_url", None)
+    if not base:
+        # AnnotationConfig before per-stage providers remains usable.
+        base = {
+            "gemini": "https://generativelanguage.googleapis.com/v1beta",
+            "openai": "https://api.openai.com/v1",
+        }.get(config.provider)
+    try:
+        if (
+            not isinstance(base, str)
+            or any(char.isspace() or ord(char) < 32 for char in base) or "\\" in base
+        ):
+            raise ValueError("Invalid prefix.")
+        parsed = urlsplit(base)
+        try:
+            loopback = ip_address(parsed.hostname or "").is_loopback
+        except ValueError:
+            loopback = parsed.hostname == "localhost"
+        if (
+            not parsed.hostname or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or parsed.port == 0
+            or "%" in parsed.hostname
+            or parsed.scheme not in {"https", "http"}
+            or (parsed.scheme == "http" and not loopback)
+            or any(part in {".", ".."} for part in unquote(parsed.path).split("/"))
+        ):
+            raise ValueError("Invalid prefix.")
+    except (ValueError, TypeError):
+        raise AnnotationModelError("Invalid annotation API base URL.") from None
+    return base.rstrip("/")
+
+
+def _valid_model(model: Any, *, compatible: bool) -> bool:
+    pattern = r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"
+    if not isinstance(model, str) or len(model) > 256:
+        return False
+    parts = model.split("/") if compatible else [model]
+    return all(re.fullmatch(pattern, part) for part in parts)
+
+
+def _openai_reasoning_model(model: str) -> bool:
+    """Only current reasoning families; chat/search aliases and unknown IDs omit effort."""
+    return bool(re.fullmatch(
+        r"(?:gpt-(?:5(?:\.[1-6])?|6(?:\.1)?)"
+        r"(?:-(?:mini|nano|pro|sol|terra|luna|astra|codex(?:-mini|-max)?))?"
+        r"|o[134](?:-mini|-pro)?)(?:-\d{4}-\d{2}-\d{2})?",
+        model,
+    ))
+
+
+def _anthropic_schema(prompt: str) -> dict[str, Any]:
+    """Use a fixed application schema; source strings never control its shape."""
+    if prompt.startswith(REVIEW_PROMPT):
+        name = "reviews"
+        fields = {
+            "claim_id": {"type": "string"},
+            "review_status": {"type": "string", "enum": [
+                "SUPPORTED", "WEAKLY_SUPPORTED", "CONFLICTING", "UNSUPPORTED",
+                "NEEDS_VERIFICATION",
+            ]},
+            "review_notes": {"type": "string"},
+            "is_inference": {"type": "boolean"},
+        }
+    else:
+        name = "claims"
+        fields = {
+            "kind": {"type": "string", "enum": [
+                "role", "responsibility", "skill", "hiring_location", "work_mode",
+                "working_language", "employment", "timezone", "salary", "status",
+                "work_authorization",
+            ]},
+            "value": {"type": "string"},
+            "unit_id": {"type": "string"},
+            "source_snippet": {"type": "string"},
+            "requirement": {"type": "string", "enum": [
+                "required", "preferred", "not_required", "informational",
+            ]},
+            "polarity": {"type": "string", "enum": ["affirmative", "negative"]},
+            "is_inference": {"type": "boolean"},
+        }
+    return {
+        "type": "object",
+        "properties": {name: {"type": "array", "items": {
+            "type": "object", "properties": fields, "required": list(fields),
+            "additionalProperties": False,
+        }}},
+        "required": [name],
+        "additionalProperties": False,
     }
 
 
 class AnnotationModelClient:
     def __init__(self, config: AnnotationModelConfig) -> None:
-        self.config = config
+        resolver = getattr(config, "resolved_stage", None)
+        self.config = resolver("extract") if callable(resolver) else config
 
     def generate(self, model: str, prompt: str) -> tuple[dict[str, Any], dict[str, int]]:
         """Return complete JSON only; invalid output is not retried as a new draft."""
-        if self.config.provider not in {"gemini", "openai"}:
+        if self.config.provider not in {"gemini", "openai", "anthropic"} | _COMPATIBLE_PROVIDERS:
             raise AnnotationModelError("Unsupported annotation provider.")
-        if not isinstance(model, str) or not re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", model
-        ):
+        if not _valid_model(model, compatible=self.config.provider in _COMPATIBLE_PROVIDERS):
             raise AnnotationModelError("Invalid annotation model identifier.")
+        _base_url(self.config)
         api_key = os.getenv(self.config.api_key_env)
         if not api_key:
             raise AnnotationModelError(
                 "Annotation API key is missing from the process environment."
             )
-        call = self._gemini if self.config.provider == "gemini" else self._openai
+        call = {
+            "gemini": self._gemini, "openai": self._openai, "anthropic": self._anthropic,
+        }.get(self.config.provider, self._compatible)
         for attempt in range(self.config.max_retries + 1):
             try:
                 return call(model, prompt, api_key)
@@ -220,24 +337,10 @@ class AnnotationModelClient:
                 raise AnnotationModelError("Annotation model request failed.") from None
         raise AnnotationModelError("Annotation model request failed.")
 
-    def _gemini(
-        self, model: str, prompt: str, api_key: str
-    ) -> tuple[dict[str, Any], dict[str, int]]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    def _post(self, url: str, headers: dict[str, str], payload: dict[str, Any]) -> Any:
         try:
             response = requests.post(
-                url,
-                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                json={
-                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "temperature": 0,
-                        "candidateCount": 1,
-                        "responseMimeType": "application/json",
-                        "maxOutputTokens": self.config.max_output_tokens,
-                    },
-                },
-                timeout=self.config.request_timeout,
+                url, headers=headers, json=payload, timeout=self.config.request_timeout,
                 allow_redirects=False,
             )
         except (requests.Timeout, requests.ConnectionError):
@@ -248,6 +351,44 @@ class AnnotationModelClient:
             raise AnnotationModelError("Annotation provider rejected the request.")
         try:
             body = response.json()
+            if not isinstance(body, dict) or body.get("error"):
+                raise ValueError("Invalid response envelope.")
+        except (ValueError, TypeError):
+            raise AnnotationModelError(
+                "Annotation provider returned an incomplete result."
+            ) from None
+        return body
+
+    def _gemini(
+        self, model: str, prompt: str, api_key: str
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        generation: dict[str, Any] = {
+            "responseMimeType": "application/json",
+            "maxOutputTokens": self.config.max_output_tokens,
+        }
+        if re.match(r"gemini-3(?:[.-])", model):
+            effort = self.config.reasoning_effort
+            levels = {"low", "medium", "high"}
+            if model.startswith((
+                "gemini-3.5-flash", "gemini-3.6-flash", "gemini-3-flash-preview",
+            )):
+                levels.add("minimal")
+            if model.startswith("gemini-3-pro-preview"):
+                levels = {"low", "high"}
+            elif model.startswith("gemini-3.1-flash-lite-image"):
+                levels = {"minimal", "high"}
+            if effort not in levels:
+                raise AnnotationModelError("Unsupported thinking level for annotation model.")
+            generation["thinkingConfig"] = {"thinkingLevel": effort}
+        else:
+            generation.update(temperature=0, candidateCount=1)
+        body = self._post(
+            f"{_base_url(self.config)}/models/{model}:generateContent",
+            {"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+             "generationConfig": generation},
+        )
+        try:
             candidates = body.get("candidates")
             if not isinstance(candidates, list) or len(candidates) != 1:
                 raise ValueError("No unique result.")
@@ -266,10 +407,107 @@ class AnnotationModelClient:
             usage = body.get("usageMetadata") or {}
             normalized_usage = _usage(
                 usage.get("promptTokenCount"),
-                _token_count(usage.get("candidatesTokenCount"))
-                + _token_count(usage.get("thoughtsTokenCount")),
+                _sum_token_counts(
+                    usage.get("candidatesTokenCount"), usage.get("thoughtsTokenCount"),
+                ),
                 usage.get("totalTokenCount"),
             )
+            if (
+                not _is_token_count(usage.get("candidatesTokenCount"))
+                or ("thoughtsTokenCount" in usage
+                    and not _is_token_count(usage["thoughtsTokenCount"]))
+            ):
+                normalized_usage["usage_known"] = False
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise AnnotationModelError(
+                "Annotation provider returned an incomplete result."
+            ) from None
+        return _parse_json(text), normalized_usage
+
+    def _compatible(
+        self, model: str, prompt: str, api_key: str
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        body = self._post(
+            f"{_base_url(self.config)}/chat/completions",
+            {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": self.config.max_output_tokens,
+                "response_format": {"type": "json_object"},
+            },
+        )
+        try:
+            choices = body["choices"]
+            if not isinstance(choices, list) or len(choices) != 1:
+                raise ValueError("No unique result.")
+            choice = choices[0]
+            if choice.get("finish_reason") != "stop":
+                raise ValueError("Result did not complete.")
+            message = choice["message"]
+            if message.get("refusal"):
+                raise AnnotationModelError("Annotation provider refused the request.")
+            if (
+                message.get("role") != "assistant" or message.get("tool_calls")
+                or message.get("function_call")
+            ):
+                raise ValueError("Not a final text result.")
+            text = message.get("content")
+            usage = body.get("usage") or {}
+            normalized_usage = _usage(
+                usage.get("prompt_tokens"), usage.get("completion_tokens"),
+                usage.get("total_tokens"),
+            )
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise AnnotationModelError(
+                "Annotation provider returned an incomplete result."
+            ) from None
+        return _parse_json(text), normalized_usage
+
+    def _anthropic(
+        self, model: str, prompt: str, api_key: str
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        # Native Messages structured outputs; see Claude's official JSON outputs contract.
+        body = self._post(
+            f"{_base_url(self.config)}/messages",
+            {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+             "Content-Type": "application/json"},
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": self.config.max_output_tokens,
+                "output_config": {"format": {
+                    "type": "json_schema", "schema": _anthropic_schema(prompt),
+                }},
+            },
+        )
+        if body.get("stop_reason") == "refusal":
+            raise AnnotationModelError("Annotation provider refused the request.")
+        try:
+            if body.get("stop_reason") != "end_turn":
+                raise ValueError("Result did not complete.")
+            content = body["content"]
+            if not isinstance(content, list) or not all(
+                isinstance(block, dict)
+                and block.get("type") in {"text", "thinking", "redacted_thinking"}
+                for block in content
+            ):
+                raise ValueError("Not a final text result.")
+            texts = [block["text"] for block in content if block.get("type") == "text"]
+            text = "".join(texts)
+            usage = body.get("usage") or {}
+            input_tokens = _sum_token_counts(*(usage.get(name) for name in (
+                "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+            )))
+            output_tokens = usage.get("output_tokens")
+            normalized_usage = _usage(
+                input_tokens, output_tokens, _sum_token_counts(input_tokens, output_tokens),
+            )
+            if not _is_token_count(usage.get("input_tokens")) or any(
+                name in usage and not _is_token_count(usage[name])
+                for name in ("cache_creation_input_tokens", "cache_read_input_tokens")
+            ):
+                normalized_usage["usage_known"] = False
         except (ValueError, TypeError, KeyError, AttributeError):
             raise AnnotationModelError(
                 "Annotation provider returned an incomplete result."
@@ -282,20 +520,23 @@ class AnnotationModelClient:
         from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
         try:
-            with OpenAI(
+            with httpx.Client(follow_redirects=False) as transport, OpenAI(
                 api_key=api_key,
-                base_url="https://api.openai.com/v1",
+                base_url=_base_url(self.config),
                 timeout=self.config.request_timeout,
                 max_retries=0,
+                http_client=transport,
             ) as client:
-                response = client.responses.create(
-                    model=model,
-                    input=prompt,
-                    reasoning={"effort": self.config.reasoning_effort},
-                    max_output_tokens=self.config.max_output_tokens,
-                    text={"format": {"type": "json_object"}},
-                    store=False,
-                )
+                arguments: dict[str, Any] = {
+                    "model": model,
+                    "input": prompt,
+                    "max_output_tokens": self.config.max_output_tokens,
+                    "text": {"format": {"type": "json_object"}},
+                    "store": False,
+                }
+                if _openai_reasoning_model(model):
+                    arguments["reasoning"] = {"effort": self.config.reasoning_effort}
+                response = client.responses.create(**arguments)
         except (APIConnectionError, APITimeoutError):
             raise _RetryableModelError("Annotation transport temporarily unavailable.") from None
         except APIStatusError as exc:

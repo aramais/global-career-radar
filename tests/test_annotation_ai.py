@@ -138,7 +138,8 @@ def test_strict_json_rejects_invalid_objects_without_retry(monkeypatch, model_co
 def test_missing_usage_is_zero_without_guessing(monkeypatch, model_config):
     install_responses(monkeypatch, [gemini_response(usageMetadata={})])
     _, usage = AnnotationModelClient(model_config).generate("gemini-test", "prompt")
-    assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                     "usage_known": False}
 
 
 def test_malformed_usage_does_not_become_a_cost_estimate(monkeypatch, model_config):
@@ -149,7 +150,8 @@ def test_malformed_usage_does_not_become_a_cost_estimate(monkeypatch, model_conf
         "totalTokenCount": None,
     })])
     _, usage = AnnotationModelClient(model_config).generate("gemini-test", "prompt")
-    assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                     "usage_known": False}
 
 
 def test_retryable_statuses_are_bounded_with_exponential_backoff(monkeypatch, model_config):
@@ -255,6 +257,9 @@ def test_openai_uses_responses_without_sdk_retries_or_stored_response(monkeypatc
     payload, usage = AnnotationModelClient(model_config).generate("gpt-5-mini", "JSON prompt")
     assert payload == {"claims": []}
     assert usage == {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30}
+    transport = options[0].pop("http_client")
+    assert transport.follow_redirects is False
+    assert transport.is_closed
     assert options == [{
         "api_key": "test-only-secret",
         "base_url": "https://api.openai.com/v1",
@@ -301,6 +306,107 @@ def test_openai_429_retries_but_error_body_stays_private(monkeypatch, model_conf
     payload, _ = AnnotationModelClient(model_config).generate("gpt-5-mini", "JSON prompt")
     assert payload == {"claims": []}
     assert len(calls) == 2
+
+
+def test_real_openai_sdk_never_follows_redirect_with_credentials(monkeypatch, model_config):
+    model_config.provider = "openai"
+    requests_seen = []
+
+    def redirect(request):
+        requests_seen.append(request)
+        return httpx.Response(307, headers={"Location": "https://other.example/private"}, json={})
+
+    class RedirectProbeClient(httpx.Client):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(redirect), **kwargs)
+
+    monkeypatch.setattr(ai.httpx, "Client", RedirectProbeClient)
+    with pytest.raises(AnnotationModelError, match="rejected") as caught:
+        AnnotationModelClient(model_config).generate("gpt-5-mini", "private JSON prompt")
+    assert len(requests_seen) == 1
+    assert requests_seen[0].url == "https://api.openai.com/v1/responses"
+    assert "test-only-secret" not in str(caught.value)
+    assert "private JSON prompt" not in str(caught.value)
+
+
+@pytest.mark.parametrize("changes", [
+    {"input_tokens": 10}, {"input_tokens": 10, "output_tokens": 20},
+    {"input_tokens": True, "output_tokens": 20, "total_tokens": 30},
+])
+def test_openai_partial_or_invalid_usage_is_unknown(monkeypatch, model_config, changes):
+    model_config.provider = "openai"
+    install_openai(monkeypatch, [openai_response(usage=SimpleNamespace(**changes))])
+    _, usage = AnnotationModelClient(model_config).generate("gpt-4o-mini", "JSON prompt")
+    assert usage["usage_known"] is False
+
+
+@pytest.mark.parametrize("counters", [
+    {"promptTokenCount": 10, "totalTokenCount": 30, "thoughtsTokenCount": 20},
+    {"promptTokenCount": 10, "candidatesTokenCount": 20, "totalTokenCount": 30,
+     "thoughtsTokenCount": "not a count"},
+])
+def test_gemini_partial_or_invalid_output_usage_is_unknown(monkeypatch, model_config, counters):
+    install_responses(monkeypatch, [gemini_response(usageMetadata=counters)])
+    _, usage = AnnotationModelClient(model_config).generate("gemini-2.5-pro", "JSON prompt")
+    assert usage["usage_known"] is False
+
+
+def test_gemini_without_optional_thought_counter_retains_known_usage(monkeypatch, model_config):
+    install_responses(monkeypatch, [gemini_response(usageMetadata={
+        "promptTokenCount": 10, "candidatesTokenCount": 20, "totalTokenCount": 30,
+    })])
+    _, usage = AnnotationModelClient(model_config).generate("gemini-2.5-flash-lite", "JSON prompt")
+    assert usage == {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30}
+
+
+@pytest.mark.parametrize("model", [
+    "gpt-4o-mini", "gpt-4.1", "gpt-5-chat-latest", "gpt-5-custom-unknown", "future-text-model",
+])
+def test_openai_omits_reasoning_for_models_without_known_support(monkeypatch, model_config, model):
+    model_config.provider = "openai"
+    calls, _ = install_openai(monkeypatch, [openai_response()])
+    AnnotationModelClient(model_config).generate(model, "JSON prompt")
+    assert "reasoning" not in calls[0]
+    assert calls[0]["store"] is False
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "high"])
+def test_gemini38_respects_thinking_level_without_legacy_sampling_fields(
+    monkeypatch, model_config, level,
+):
+    model_config.reasoning_effort = level
+    calls = install_responses(monkeypatch, [gemini_response()])
+    AnnotationModelClient(model_config).generate("gemini-3.8-flash", "JSON prompt")
+    assert calls[0][1]["json"]["generationConfig"] == {
+        "responseMimeType": "application/json",
+        "maxOutputTokens": 1200,
+        "thinkingConfig": {"thinkingLevel": level},
+    }
+
+
+def test_gemini35_lite_accepts_minimal(monkeypatch, model_config):
+    model_config.reasoning_effort = "minimal"
+    calls = install_responses(monkeypatch, [gemini_response()])
+    AnnotationModelClient(model_config).generate("gemini-3.5-flash-lite", "JSON prompt")
+    assert calls[0][1]["json"]["generationConfig"]["thinkingConfig"] == {
+        "thinkingLevel": "minimal",
+    }
+
+
+def test_gemini38_rejects_unsupported_thinking_level_before_request(monkeypatch, model_config):
+    model_config.reasoning_effort = "minimal"
+    calls = install_responses(monkeypatch, [])
+    with pytest.raises(AnnotationModelError, match="thinking level"):
+        AnnotationModelClient(model_config).generate("gemini-3.8-flash", "JSON prompt")
+    assert calls == []
+
+
+def test_gemini3_pro_preview_has_no_medium_thinking_level(monkeypatch, model_config):
+    model_config.reasoning_effort = "medium"
+    calls = install_responses(monkeypatch, [])
+    with pytest.raises(AnnotationModelError, match="thinking level"):
+        AnnotationModelClient(model_config).generate("gemini-3-pro-preview", "JSON prompt")
+    assert calls == []
 
 
 def test_prompts_preserve_full_units_and_context_without_truncation():

@@ -271,7 +271,8 @@ class JobIntakePipeline:
                         continue
                     job = outbox.job
                     if (
-                        job.tier != "A"
+                        job.archived_at is not None
+                        or job.tier != "A"
                         or job.best_profile_id not in self.profile_versions
                         or not any(
                             p.profile_id == job.best_profile_id
@@ -310,7 +311,7 @@ class JobIntakePipeline:
         """Apply profiles to saved data; AI is explicit opt-in, notifications stay disabled."""
         stats = self._stats()
         with self.database.session() as session:
-            jobs = JobRepository(session).list_jobs(limit=limit)
+            jobs = JobRepository(session).list_jobs(limit=limit, archived=False)
             records = [
                 JobRecord(
                     source=j.source,
@@ -378,7 +379,7 @@ class JobIntakePipeline:
 
         self._validate_profile(profile_id)
         with self.database.session() as session:
-            jobs = JobRepository(session).list_jobs(limit=limit)
+            jobs = JobRepository(session).list_jobs(limit=limit, archived=False)
             return render_html_report(
                 jobs,
                 output_path,

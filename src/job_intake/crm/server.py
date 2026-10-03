@@ -23,7 +23,7 @@ from job_intake.crm.schemas import CRMConflictError
 from job_intake.profiles import load_streams
 from job_intake.storage.database import Database
 from job_intake.storage.models import JobORM
-from job_intake.storage.repository import JobRepository
+from job_intake.storage.repository import JobArchiveConflictError, JobRepository
 
 LOGGER = logging.getLogger(__name__)
 LOCAL_ZONE = ZoneInfo("America/Sao_Paulo")
@@ -126,6 +126,42 @@ def _version(payload: dict) -> int:
     return value
 
 
+def _job_archive(job: JobORM) -> dict:
+    archived_at = job.archived_at
+    if archived_at is not None and archived_at.tzinfo is None:
+        archived_at = archived_at.replace(tzinfo=UTC)
+    return {
+        "job_uid": job.job_uid,
+        "archived": archived_at is not None,
+        "archived_at": archived_at.isoformat() if archived_at else None,
+        "archive_version": job.archive_version,
+    }
+
+
+def _archive_batch(payload: dict) -> tuple[bool, list[tuple[str, int]]]:
+    data = _fields(payload, {"archived", "jobs"})
+    if type(data.get("archived")) is not bool:
+        raise RequestError("Состояние архива должно быть true или false")
+    jobs = data.get("jobs")
+    if not isinstance(jobs, list) or not 1 <= len(jobs) <= 1000:
+        raise RequestError("Выберите от 1 до 1000 вакансий")
+    requests = []
+    seen = set()
+    for item in jobs:
+        if not isinstance(item, dict):
+            raise RequestError("Некорректный список вакансий")
+        item = dict(item)
+        version = _version(item)
+        uid = _fields(item, {"job_uid"}).get("job_uid")
+        if not isinstance(uid, str) or not uid.strip() or len(uid) > 100:
+            raise RequestError("Некорректный ID вакансии")
+        if uid in seen:
+            raise RequestError("Вакансия повторяется в списке")
+        seen.add(uid)
+        requests.append((uid, version))
+    return data["archived"], requests
+
+
 def _identifier(value: object) -> int:
     if isinstance(value, str) and value.isdigit():
         value = int(value)
@@ -205,7 +241,10 @@ class CRMService:
         raise RequestError("Выберите активный профиль поиска")
 
     def state(self, query: dict[str, str]) -> dict:
-        _fields(query, {"profile_id", "channel", "since", "until"})
+        _fields(query, {"profile_id", "channel", "since", "until", "job_archive"})
+        archive_filter = query.get("job_archive") or "active"
+        if archive_filter not in {"active", "archived", "all"}:
+            raise RequestError("Неизвестный фильтр архива вакансий")
         today = datetime.now(LOCAL_ZONE).date()
         first = today.replace(day=1)
         last = today.replace(day=calendar.monthrange(today.year, today.month)[1])
@@ -227,7 +266,10 @@ class CRMService:
                 profile_id=profile, channel=channel, since=since, until=until
             )
             jobs = []
-            for job in JobRepository(session).list_jobs(limit=1000):
+            for job in JobRepository(session).list_jobs(
+                limit=1000,
+                archived={"active": False, "archived": True, "all": None}[archive_filter],
+            ):
                 evaluations = [
                     p
                     for p in job.profile_evaluations
@@ -251,6 +293,12 @@ class CRMService:
                         "job_uid": job.job_uid,
                         "company": job.company,
                         "title": job.title,
+                        "archived": job.archived_at is not None,
+                        "archived_at": (
+                            job.archived_at.replace(tzinfo=UTC).isoformat()
+                            if job.archived_at else None
+                        ),
+                        "archive_version": job.archive_version,
                         "url": job.apply_url or job.original_url,
                         "location": job.location_text,
                         "remote": job.remote_text,
@@ -258,7 +306,9 @@ class CRMService:
                         "annotation": {
                             key: value for key, value in (job.annotation or {}).items()
                             if key in {"version", "status", "method", "summary", "claims", "issues",
-                                "extract_model", "review_model", "coverage", "description_complete"}
+                                "extract_model", "review_model",
+                                "extract_provider", "review_provider",
+                                "coverage", "description_complete"}
                         },
                         "fit_score": best.fit_score if best else None,
                         "tier": best.tier if best else None,
@@ -325,7 +375,41 @@ class CRMService:
         parts = path.strip("/").split("/")
         with self.database.session() as session:
             repo = CRMRepository(session)
-            if method == "POST" and path == "/api/applications/from-job":
+            if method == "PATCH" and path == "/api/jobs/archive":
+                archived, requests = _archive_batch(payload)
+                jobs = JobRepository(session)
+                results = []
+                for uid, version in requests:
+                    try:
+                        job = jobs.set_archived(uid, archived, expected_version=version)
+                    except JobArchiveConflictError as exc:
+                        raise RequestError(
+                            "Архив вакансии изменён. Обновите список; группа не изменена", 409
+                        ) from exc
+                    if job is None:
+                        raise RequestError("Вакансия не найдена; группа не изменена", 404)
+                    results.append(_job_archive(job))
+                result = {"jobs": results, "count": len(results)}
+            elif (
+                method == "PATCH" and len(parts) == 4 and parts[:2] == ["api", "jobs"]
+                and parts[3] == "archive"
+            ):
+                version = _version(payload)
+                data = _fields(payload, {"archived"})
+                if type(data.get("archived")) is not bool:
+                    raise RequestError("Состояние архива должно быть true или false")
+                if not parts[2] or len(parts[2]) > 100:
+                    raise RequestError("Некорректный ID вакансии")
+                try:
+                    job = JobRepository(session).set_archived(
+                        parts[2], data["archived"], expected_version=version
+                    )
+                except JobArchiveConflictError as exc:
+                    raise RequestError("Архив вакансии изменён. Обновите список", 409) from exc
+                if job is None:
+                    raise RequestError("Вакансия не найдена", 404)
+                result = _job_archive(job)
+            elif method == "POST" and path == "/api/applications/from-job":
                 data = _fields(payload, {"job_uid", "profile_id"})
                 if (
                     not isinstance(data.get("job_uid"), str)

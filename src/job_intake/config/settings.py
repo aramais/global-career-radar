@@ -4,8 +4,10 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 from dotenv import load_dotenv
@@ -72,6 +74,73 @@ class CRMConfig:
             raise ValueError("crm.weekly_time_budget_hours must be positive")
 
 
+ANNOTATION_PROVIDER_DEFAULTS = {
+    "gemini": ("GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta"),
+    "openai": ("OPENAI_API_KEY", "https://api.openai.com/v1"),
+    "jev": ("TYPESAFE_API_KEY", "https://api.typesafe.ai/v1"),
+    "mistral": ("MISTRAL_API_KEY", "https://api.mistral.ai/v1"),
+    "deepseek": ("DEEPSEEK_API_KEY", "https://api.deepseek.com/v1"),
+    "qwen": ("DASHSCOPE_API_KEY", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+    "zai": ("ZAI_API_KEY", "https://api.z.ai/api/paas/v4"),
+    "openrouter": ("OPENROUTER_API_KEY", "https://openrouter.ai/api/v1"),
+    "anthropic": ("ANTHROPIC_API_KEY", "https://api.anthropic.com/v1"),
+    "openai_compatible": ("LLM_API_KEY", None),
+}
+ANNOTATION_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+
+def _annotation_base_url(value: Any, name: str) -> str:
+    message = f"annotation.{name} must be an API URL without credentials, query or fragment"
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(char.isspace() or ord(char) < 32 for char in value)
+        or any(char in value for char in "\\?#")
+    ):
+        raise ValueError(message)
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise ValueError(message) from None
+    if (
+        parsed.scheme not in {"https", "http"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "%" in hostname
+    ):
+        raise ValueError(message)
+    if parsed.scheme == "http":
+        try:
+            is_loopback = ip_address(hostname).is_loopback
+        except ValueError:
+            is_loopback = hostname.lower() == "localhost"
+        if not is_loopback:
+            raise ValueError(f"annotation.{name} requires HTTPS except on loopback hosts")
+    host = f"[{hostname.lower()}]" if ":" in hostname else hostname.lower()
+    if port is not None and port != {"https": 443, "http": 80}[parsed.scheme]:
+        host += f":{port}"
+    return urlunsplit((parsed.scheme, host, parsed.path.rstrip("/"), "", ""))
+
+
+@dataclass(frozen=True, slots=True)
+class AnnotationStageSpec:
+    provider: str
+    model: str
+    api_key_env: str
+    base_url: str
+    reasoning_effort: str
+    request_timeout: float
+    max_output_tokens: int
+    max_retries: int
+    retry_backoff: float
+    jev_min_probability: float
+    jev_min_confidence: float
+    jev_batch_size: int
+
+
 @dataclass(slots=True)
 class AnnotationConfig:
     enabled: bool = True
@@ -87,23 +156,70 @@ class AnnotationConfig:
     max_retries: int = 2
     retry_backoff: float = 1.0
     reasoning_effort: str = "low"
+    extract_provider: str | None = None
+    review_provider: str | None = None
+    extract_api_key_env: str | None = None
+    review_api_key_env: str | None = None
+    extract_base_url: str | None = None
+    review_base_url: str | None = None
+    extract_reasoning_effort: str | None = None
+    review_reasoning_effort: str | None = None
+    jev_min_probability: float = 0.95
+    jev_min_confidence: float = 0.8
+    jev_batch_size: int = 16
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool or type(self.ai_enabled) is not bool:
             raise ValueError("annotation.enabled and ai_enabled must be Boolean")
-        if self.provider not in {"gemini", "openai"}:
-            raise ValueError("annotation.provider must be gemini or openai")
-        if not all(
-            isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", model)
-            for model in (self.extract_model, self.review_model)
+        for name in ("provider", "extract_provider", "review_provider"):
+            value = getattr(self, name)
+            if value is None and name != "provider":
+                continue
+            if not isinstance(value, str) or value not in ANNOTATION_PROVIDER_DEFAULTS:
+                raise ValueError(f"annotation.{name} must name a supported annotation provider")
+        for name in ("api_key_env", "extract_api_key_env", "review_api_key_env"):
+            value = getattr(self, name)
+            if value is None and name != "api_key_env":
+                continue
+            if not isinstance(value, str) or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", value):
+                raise ValueError(f"annotation.{name} must name an environment variable")
+        for name in ("reasoning_effort", "extract_reasoning_effort", "review_reasoning_effort"):
+            value = getattr(self, name)
+            if value is None and name != "reasoning_effort":
+                continue
+            if not isinstance(value, str) or value not in ANNOTATION_REASONING_EFFORTS:
+                raise ValueError(f"annotation.{name} must name a supported reasoning effort")
+        for name in ("extract_base_url", "review_base_url"):
+            value = getattr(self, name)
+            if value is not None:
+                _annotation_base_url(value, name)
+        extract = self.resolved_stage("extract")
+        review = self.resolved_stage("review")
+        for stage, spec in (("extract", extract), ("review", review)):
+            pattern = (
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+                if spec.provider == "gemini"
+                else r"[A-Za-z0-9][A-Za-z0-9._:-]*(?:/[A-Za-z0-9][A-Za-z0-9._:-]*)*"
+            )
+            if (
+                not isinstance(spec.model, str)
+                or len(spec.model) > 255
+                or not re.fullmatch(pattern, spec.model)
+            ):
+                raise ValueError(f"annotation.{stage}_model must name a safe model ID")
+        if extract.provider == "jev":
+            raise ValueError("annotation Jev is supported only for review")
+        if review.provider == "jev":
+            if review.base_url != ANNOTATION_PROVIDER_DEFAULTS["jev"][1]:
+                raise ValueError(
+                    "annotation Jev review requires the official TypeSafe API endpoint"
+                )
+            if not re.fullmatch(r"jev-(?:\d+\.\d+\.\d+|latest|preview)", review.model):
+                raise ValueError("annotation Jev review_model must name a Jev version or alias")
+        if (extract.provider, extract.base_url, extract.model) == (
+            review.provider, review.base_url, review.model
         ):
-            raise ValueError("annotation extraction and review models must be specified")
-        if self.extract_model.strip() == self.review_model.strip():
             raise ValueError("annotation review must use a different model from extraction")
-        if not isinstance(self.api_key_env, str) or not re.fullmatch(
-            r"[A-Z_][A-Z0-9_]*", self.api_key_env
-        ):
-            raise ValueError("annotation.api_key_env must name an environment variable")
         for name in ("chunk_chars", "max_output_tokens"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 256:
@@ -123,6 +239,48 @@ class AnnotationConfig:
                 or value <= 0
             ):
                 raise ValueError(f"annotation.{name} must be positive and finite")
+        for name in ("jev_min_probability", "jev_min_confidence"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not 0 <= value <= 1
+            ):
+                raise ValueError(f"annotation.{name} must be finite and between 0 and 1")
+        if (
+            isinstance(self.jev_batch_size, bool)
+            or not isinstance(self.jev_batch_size, int)
+            or not 1 <= self.jev_batch_size <= 64
+        ):
+            raise ValueError("annotation.jev_batch_size must be an integer from 1 to 64")
+
+    def resolved_stage(self, stage: str) -> AnnotationStageSpec:
+        if stage not in {"extract", "review"}:
+            raise ValueError("annotation stage must be extract or review")
+        provider = getattr(self, f"{stage}_provider") or self.provider
+        default_env, default_url = ANNOTATION_PROVIDER_DEFAULTS[provider]
+        api_key_env = getattr(self, f"{stage}_api_key_env")
+        if api_key_env is None:
+            api_key_env = self.api_key_env if provider == self.provider else default_env
+        base_url = getattr(self, f"{stage}_base_url")
+        if base_url is None:
+            base_url = default_url
+        base_url = _annotation_base_url(base_url, f"{stage}_base_url")
+        return AnnotationStageSpec(
+            provider=provider,
+            model=getattr(self, f"{stage}_model"),
+            api_key_env=api_key_env,
+            base_url=base_url,
+            reasoning_effort=getattr(self, f"{stage}_reasoning_effort") or self.reasoning_effort,
+            request_timeout=self.request_timeout,
+            max_output_tokens=self.max_output_tokens,
+            max_retries=self.max_retries,
+            retry_backoff=self.retry_backoff,
+            jev_min_probability=self.jev_min_probability,
+            jev_min_confidence=self.jev_min_confidence,
+            jev_batch_size=self.jev_batch_size,
+        )
 
 
 @dataclass(slots=True)

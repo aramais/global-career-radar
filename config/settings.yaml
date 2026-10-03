@@ -25,6 +25,25 @@ annotation:
   max_retries: 2
   retry_backoff: 1
 
+  # Mixed-provider example: equivalent to annotate --ai --preset budget-jev.
+  # Replace existing model values below and uncomment other stage overrides.
+  # AI remains opt-in; do not introduce duplicate YAML keys.
+  # extract_provider: openai
+  # extract_model: gpt-6-luna
+  # extract_api_key_env: OPENAI_API_KEY
+  # extract_reasoning_effort: none
+  # review_provider: jev
+  # review_model: jev-1.13.0
+  # review_api_key_env: TYPESAFE_API_KEY
+  # jev_min_probability: 0.95
+  # jev_min_confidence: 0.8
+  # jev_batch_size: 16
+  # Custom Chat Completions endpoint requires an explicit HTTPS base URL:
+  # extract_provider: openai_compatible
+  # extract_base_url: https://gateway.example.com/v1
+  # extract_api_key_env: CUSTOM_LLM_API_KEY
+  # Never put API key values in this YAML.
+
 telegram:
   enabled: false
   bot_token_env: TELEGRAM_BOT_TOKEN

@@ -41,6 +41,8 @@ class Database:
         "best_profile_name": "VARCHAR(255)",
         "alert_pending": "BOOLEAN NOT NULL DEFAULT 0",
         "annotation": "JSON NOT NULL DEFAULT '{}'",
+        "archived_at": "DATETIME",
+        "archive_version": "INTEGER NOT NULL DEFAULT 1",
     }
 
     def _apply_lightweight_migrations(self) -> None:

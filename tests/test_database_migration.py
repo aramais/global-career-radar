@@ -142,6 +142,8 @@ def test_additive_migration_preserves_legacy_data_and_is_idempotent(
             "best_profile_id",
             "best_profile_name",
             "alert_pending",
+            "archived_at",
+            "archive_version",
         } <= set(columns)
         assert columns["alert_pending"]["nullable"] is False
         with closing(sqlite3.connect(path)) as connection:
@@ -156,6 +158,8 @@ def test_additive_migration_preserves_legacy_data_and_is_idempotent(
             assert job.best_profile_id is None
             assert job.best_profile_name is None
             assert job.alert_pending is False
+            assert job.archived_at is None
+            assert job.archive_version == 1
             assert job.source_metadata == {"listing_url": "https://example.com/search"}
             assert job.risks == ["working_language_unconfirmed"]
             assert job.profile_evaluations == []
