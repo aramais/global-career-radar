@@ -70,6 +70,7 @@ def load_streams(rules: dict[str, Any], config: dict[str, Any]) -> list[SearchSt
                     "context": context,
                     "rules": resolved_rules,
                     "scoring": resolved_scoring,
+                    "text_processing_version": "grounded-v1",
                 },
                 sort_keys=True,
                 ensure_ascii=False,

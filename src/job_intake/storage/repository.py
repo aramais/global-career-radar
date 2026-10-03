@@ -56,7 +56,11 @@ class JobRepository:
                 title=item.record.title,
                 original_url=item.record.original_url,
                 apply_url=item.record.apply_url,
-                posted_at=item.record.posted_at,
+                posted_at=(
+                    item.record.posted_at.astimezone(UTC)
+                    if item.record.posted_at and item.record.posted_at.tzinfo
+                    else item.record.posted_at
+                ),
                 location_text=item.record.location_text,
                 remote_text=item.record.remote_text,
                 employment_type=item.record.employment_type,
@@ -77,6 +81,7 @@ class JobRepository:
                 audit_log=item.evaluation.audit_log,
                 bridge_role=item.evaluation.bridge_role,
                 source_metadata=item.record.source_metadata,
+                annotation=item.record.annotation,
                 best_profile_id=item.profile_id,
                 best_profile_name=item.profile_name or item.profile_id,
             )
@@ -107,7 +112,11 @@ class JobRepository:
         existing.title = item.record.title
         existing.original_url = item.record.original_url
         existing.apply_url = item.record.apply_url
-        existing.posted_at = item.record.posted_at
+        existing.posted_at = (
+            item.record.posted_at.astimezone(UTC)
+            if item.record.posted_at and item.record.posted_at.tzinfo
+            else item.record.posted_at
+        )
         existing.location_text = item.record.location_text
         existing.remote_text = item.record.remote_text
         existing.employment_type = item.record.employment_type
@@ -128,6 +137,7 @@ class JobRepository:
         existing.audit_log = item.evaluation.audit_log
         existing.bridge_role = item.evaluation.bridge_role
         existing.source_metadata = item.record.source_metadata
+        existing.annotation = item.record.annotation
         existing.best_profile_id = item.profile_id
         existing.best_profile_name = item.profile_name or item.profile_id
         if observed:

@@ -73,6 +73,59 @@ class CRMConfig:
 
 
 @dataclass(slots=True)
+class AnnotationConfig:
+    enabled: bool = True
+    ai_enabled: bool = False
+    provider: str = "gemini"
+    extract_model: str = "gemini-2.5-flash-lite"
+    review_model: str = "gemini-2.5-pro"
+    api_key_env: str = "GEMINI_API_KEY"
+    cache_dir: str = "data/local/annotations"
+    chunk_chars: int = 6000
+    max_output_tokens: int = 4096
+    request_timeout: float = 60.0
+    max_retries: int = 2
+    retry_backoff: float = 1.0
+    reasoning_effort: str = "low"
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool or type(self.ai_enabled) is not bool:
+            raise ValueError("annotation.enabled and ai_enabled must be Boolean")
+        if self.provider not in {"gemini", "openai"}:
+            raise ValueError("annotation.provider must be gemini or openai")
+        if not all(
+            isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", model)
+            for model in (self.extract_model, self.review_model)
+        ):
+            raise ValueError("annotation extraction and review models must be specified")
+        if self.extract_model.strip() == self.review_model.strip():
+            raise ValueError("annotation review must use a different model from extraction")
+        if not isinstance(self.api_key_env, str) or not re.fullmatch(
+            r"[A-Z_][A-Z0-9_]*", self.api_key_env
+        ):
+            raise ValueError("annotation.api_key_env must name an environment variable")
+        for name in ("chunk_chars", "max_output_tokens"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 256:
+                raise ValueError(f"annotation.{name} must be an integer >= 256")
+        if (
+            isinstance(self.max_retries, bool)
+            or not isinstance(self.max_retries, int)
+            or not 0 <= self.max_retries <= 5
+        ):
+            raise ValueError("annotation.max_retries must be an integer from 0 to 5")
+        for name in ("request_timeout", "retry_backoff"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"annotation.{name} must be positive and finite")
+
+
+@dataclass(slots=True)
 class AppConfig:
     database_url: str
     log_level: str
@@ -84,6 +137,7 @@ class AppConfig:
     telegram: TelegramConfig
     llm: LLMConfig
     crm: CRMConfig = field(default_factory=CRMConfig)
+    annotation: AnnotationConfig = field(default_factory=AnnotationConfig)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -162,6 +216,18 @@ def load_app_config(path: str | Path) -> AppConfig:
             ),
         }
     )
+    annotation_raw = raw.get("annotation", {})
+    annotation = AnnotationConfig(
+        **{
+            **annotation_raw,
+            "cache_dir": str(
+                (
+                    config_path.parent.parent
+                    / annotation_raw.get("cache_dir", "data/local/annotations")
+                ).resolve()
+            ),
+        }
+    )
     return AppConfig(
         database_url=raw.get("database_url", "sqlite:///data/local/job_intake.db"),
         log_level=raw.get("log_level", "INFO"),
@@ -177,6 +243,7 @@ def load_app_config(path: str | Path) -> AppConfig:
         telegram=telegram,
         llm=llm,
         crm=CRMConfig(**raw.get("crm", {})),
+        annotation=annotation,
     )
 
 

@@ -5,6 +5,11 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
+from job_intake.annotation.text import (
+    asserted_phrase_hits,
+    eligibility_description,
+    role_description,
+)
 from job_intake.models.job import EvaluatedJob, FilterDecision, JobEvaluation, JobRecord, JobTier
 from job_intake.utils.text import compact_text, contains_any, normalize_text
 
@@ -25,6 +30,31 @@ TARGET_GEO_TOKENS = [
     "mexico",
     "canada",
 ]
+
+_CANDIDATE_EXCLUSIONS = (
+    re.compile(
+        r"\b(?:candidates?|applicants?|applications?|residents?)\s+"
+        r"(?:who (?:are|live)\s+)?(?:in|from|of|based in|located in|residing in|living in)\s+"
+        r"(?P<location>[^.;!?\n|]+?)\s+"
+        r"(?:(?:will|shall|can|may) not be (?:considered|hired|accepted|eligible|allowed)|"
+        r"(?:are|is) (?:not (?:eligible|accepted|allowed|considered)|ineligible)|"
+        r"(?:cannot|can'?t) (?:apply|be (?:hired|considered|accepted)))\b", re.I,
+    ),
+    re.compile(
+        r"\b(?P<location>[\w -]+?)-based (?:candidates?|applicants?|residents?)\s+"
+        r"(?:(?:will|shall|can) not be (?:considered|hired|accepted)|"
+        r"(?:are|is) (?:not eligible|ineligible))\b", re.I,
+    ),
+    re.compile(
+        r"\b(?:do not|don'?t|cannot|can'?t|will not) (?:consider|accept|hire)\s+"
+        r"(?:candidates?|applicants?|applications?)\s+(?:in|from|based in)\s+"
+        r"(?P<location>[^.;!?\n|]+)", re.I,
+    ),
+)
+
+
+def _candidate_exclusion_matches(clause: str) -> list[re.Match[str]]:
+    return [match for pattern in _CANDIDATE_EXCLUSIONS for match in pattern.finditer(clause)]
 
 
 @dataclass(slots=True)
@@ -76,6 +106,7 @@ class RuleEngine:
 
     def evaluate(self, job: JobRecord) -> JobEvaluation:
         text_blob = self._build_text_blob(job)
+        role_text = role_description(job)
         title_text = normalize_text(job.title)
         company_text = normalize_text(job.company)
         matched = []
@@ -94,7 +125,7 @@ class RuleEngine:
             blockers.append("status:closed")
             reasons.append("Job is marked closed by the source.")
 
-        closed_hits = contains_any(text_blob, self.rules.closed_phrases)
+        closed_hits = asserted_phrase_hits(text_blob, self.rules.closed_phrases, required=True)
         if closed_hits:
             blockers.extend([f"status_phrase:{hit}" for hit in closed_hits])
             reasons.append("Job description indicates the role is no longer open.")
@@ -109,7 +140,7 @@ class RuleEngine:
             reasons.append("Role explicitly requires a hiring location outside the search profile.")
         risks.extend(geo_risks)
 
-        timezone_hits = contains_any(text_blob, self.rules.timezone_blockers)
+        timezone_hits = asserted_phrase_hits(text_blob, self.rules.timezone_blockers, required=True)
         if timezone_hits:
             blockers.extend([f"timezone_blocker:{hit}" for hit in timezone_hits])
             reasons.append(
@@ -122,13 +153,15 @@ class RuleEngine:
             target.extend([f"title_blocker:{hit}" for hit in negative_title_hits])
             reasons.append("Title contains a role-family mismatch.")
 
-        negative_desc_hits = contains_any(text_blob, self.rules.negative_description_signals)
+        negative_desc_hits = asserted_phrase_hits(
+            role_text, self.rules.negative_description_signals
+        )
         if negative_desc_hits:
             target = risks if self.rules.recall_first else blockers
             target.extend([f"desc_blocker:{hit}" for hit in negative_desc_hits])
             reasons.append("Description contains role-family mismatch signals.")
 
-        blocker_hits = contains_any(text_blob, self.rules.blocker_phrases)
+        blocker_hits = asserted_phrase_hits(text_blob, self.rules.blocker_phrases, required=True)
         if self._allowed_onsite(job):
             generic_onsite = {"on-site required", "on site required", "onsite required"}
             blocker_hits = [
@@ -144,7 +177,9 @@ class RuleEngine:
         risks.extend(language_risks)
 
         positive_title_hits = contains_any(title_text, self.rules.positive_title_signals)
-        positive_desc_hits = contains_any(text_blob, self.rules.positive_description_signals)
+        positive_desc_hits = asserted_phrase_hits(
+            role_text, self.rules.positive_description_signals
+        )
         matched.extend([f"title_signal:{hit}" for hit in positive_title_hits])
         matched.extend([f"description_signal:{hit}" for hit in positive_desc_hits])
 
@@ -202,12 +237,11 @@ class RuleEngine:
             compact_text(value)
             for value in [
                 job.title,
-                job.company,
                 job.location_text,
                 job.remote_text,
                 job.timezone_text,
                 job.employment_type,
-                job.description_clean or job.description_raw,
+                eligibility_description(job),
             ]
             if value
         )
@@ -266,7 +300,11 @@ class RuleEngine:
         risks: list[str] = []
         # Keep punctuation here: an unrelated "global" later in a posting cannot
         # cancel a mandatory residency clause in an earlier sentence.
-        text = self._geo_text(text_blob)
+        geography_text = " | ".join(filter(None, [
+            job.title, job.location_text, job.remote_text, job.timezone_text,
+            eligibility_description(job),
+        ]))
+        text = self._geo_text(geography_text)
         location_requirements = job.source_metadata.get("applicant_location_requirements")
         structured_eligibility = False
         if isinstance(location_requirements, list) and location_requirements:
@@ -285,7 +323,12 @@ class RuleEngine:
             r"([^.;!\n|]+)"
         )
         residency_matches = list(residency.finditer(text))
+        asserted_residency = []
         for match in residency_matches:
+            constraint = re.split(r"\b(?:but|however|although)\b", match[0])[0].strip()
+            if not asserted_phrase_hits(text, [constraint], required=True):
+                continue
+            asserted_residency.append(match)
             location = re.split(
                 r"\b(?:and (?:have|be|work)|with|for this role|as|where|because|but|however|"
                 r"although|while|contractor|async|distributed|remote|remotely|we|our)\b", match[1]
@@ -306,6 +349,18 @@ class RuleEngine:
             if self._target_residency(match[1]):
                 blockers.append(match[0].strip())
 
+        for clause in re.split(r"[.;!\n|]+", text):
+            for match in _candidate_exclusion_matches(clause):
+                if not self._target_residency(match["location"]):
+                    continue
+                if re.search(
+                    r"\?|\b(?:unless|if|without|except|may|might|could|sponsorship|"
+                    r"benefits?|relocation|bonus|insurance|discount)\b", clause,
+                ):
+                    risks.append("geography:candidate_exclusion_unconfirmed")
+                else:
+                    blockers.append(match[0].strip())
+
         generic_residency = {
             "must be based in", "must reside in", "must live in", "current residence in",
         }
@@ -314,7 +369,7 @@ class RuleEngine:
             if normalized in generic_residency:
                 # The complete clause above determines whether residency is allowed.
                 continue
-            if contains_any(text, [normalized]):
+            if asserted_phrase_hits(text, [normalized], required=True):
                 blockers.append(phrase)
 
         # On-site eligibility is based on the actual source location, not a
@@ -328,14 +383,43 @@ class RuleEngine:
         if self.rules.recall_first and not blockers:
             location_info = " ".join(filter(None, [job.location_text, job.remote_text]))
             permitted = structured_eligibility or self._target_location(location_info) or any(
-                self._target_location(match[1]) for match in residency_matches
+                self._target_location(match[1]) for match in asserted_residency
             )
             # Positive region/remote statements are evidence of eligibility;
             # contract type or an async team alone are not.
-            permitted = permitted or self._target_location(text_blob)
+            permitted = permitted or self._description_confirms_eligibility(job)
             if not permitted:
                 risks.append("geography:eligibility_unconfirmed")
         return sorted(set(blockers)), risks
+
+    def _description_confirms_eligibility(self, job: JobRecord) -> bool:
+        for clause in re.split(r"[.;!\n|]+", eligibility_description(job)):
+            if _candidate_exclusion_matches(clause):
+                continue
+            if re.search(
+                r"\b(?:citizenship|citizens?|nationality|passport|visa|sponsorship|"
+                r"work (?:authorization|permit)|right to work)\b", clause, re.I,
+            ):
+                # A nationality or permission mentioned in a role clause does
+                # not state where the employer is able to hire its applicants.
+                continue
+            if re.search(
+                r"\b(?:ineligible|excluded|not eligible|not considered|not accepted|"
+                r"not permitted|not allowed)\b", clause, re.I,
+            ):
+                continue
+            if not re.search(
+                r"\b(?:remote|remotely|work from|work anywhere|hire|hiring|eligible|"
+                r"eligibility|applicants?|candidates?|this role|role|position|contractor|"
+                r"location|based|reside|live)\b", clause, re.I,
+            ):
+                continue
+            targets = self.rules.target_geographies + (self.rules.onsite_locations or [])
+            if asserted_phrase_hits(
+                self._geo_text(clause), [self._geo_text(place) for place in targets]
+            ):
+                return True
+        return False
 
     def _language_signals(self, job: JobRecord, text_blob: str) -> tuple[list[str], list[str]]:
         languages = self.rules.required_languages or []
@@ -349,23 +433,32 @@ class RuleEngine:
                 language for language in working_language if isinstance(language, str)
             )
         if isinstance(working_language, str) and working_language.strip():
-            if contains_any(working_language, languages):
+            if asserted_phrase_hits(working_language, languages, required=True):
                 return [], []
+            if contains_any(working_language, languages) or contains_any(
+                working_language, ["no", "not", "unspecified", "unknown", "tbd", "optional"]
+            ):
+                return [], ["language:working_language_unconfirmed"]
             return [f"language:working_language:{working_language}"], []
         text = self._geo_text(text_blob)
         explicit_work_language = re.search(
             r"\bworking language\s*(?:(?:is|will be)\s*|:\s*)([^.;|]+)", text
         )
-        if explicit_work_language and not contains_any(explicit_work_language[1], languages):
+        if explicit_work_language and not contains_any(
+            explicit_work_language[1], languages + [
+                "no", "not", "optional", "preferred", "unspecified", "unknown", "tbd",
+            ]
+        ):
             return [f"language:working_language:{explicit_work_language[1].strip()}"], []
         for language in languages:
             token = re.escape(self._geo_text(language))
-            if re.search(
+            clauses = re.split(r"[.;!\n|]+", text)
+            if any(re.search(
                 rf"\b(?:fluen\w*|proficien\w*|working language|business|native|"
                 rf"professional|spoken|written)\b[^.;|]{{0,30}}\b{token}\b|"
                 rf"\b{token}\b[^.;|]{{0,30}}\b(?:required|fluen\w*|proficien\w*|"
-                rf"communication|skills|working language)\b", text
-            ):
+                rf"communication|skills|working language)\b", clause
+            ) and asserted_phrase_hits(clause, [language], required=True) for clause in clauses):
                 return [], []
         return [], ["language:working_language_unconfirmed"] if self.rules.recall_first else []
 

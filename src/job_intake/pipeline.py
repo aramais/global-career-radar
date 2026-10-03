@@ -13,6 +13,8 @@ from sqlalchemy import select
 from job_intake.adapters.factory import build_adapter
 from job_intake.alerts.digest import build_daily_digest, build_instant_alert
 from job_intake.alerts.telegram import TelegramNotifier
+from job_intake.annotation.service import VacancyAnnotator, apply_annotation_constraints
+from job_intake.annotation.text import role_description
 from job_intake.config.settings import (
     AppConfig,
     SourceDefinition,
@@ -47,6 +49,7 @@ class JobIntakePipeline:
         )
         self.telegram = TelegramNotifier(config.telegram)
         self.deduplicator = JobDeduplicator()
+        self.annotator = VacancyAnnotator(config.annotation)
 
     @property
     def profile_versions(self) -> dict[str, str]:
@@ -76,6 +79,10 @@ class JobIntakePipeline:
             "llm_cache_hits": 0,
             "llm_skipped": 0,
             "llm_batched": 0,
+            "annotation_extraction_calls": 0,
+            "annotation_review_calls": 0,
+            "annotation_cache_hits": 0,
+            "annotation_errors": 0,
             "errors": [],
         }
 
@@ -163,20 +170,30 @@ class JobIntakePipeline:
         pending = []
         with self.database.session() as session:
             repository = JobRepository(session)
+            saved = repository.find_by_record(record)
+            if saved is not None and not record.annotation:
+                record.annotation = saved.annotation or {}
+            before = dict(self.annotator.stats)
+            self.annotator.annotate(record, use_ai=use_llm)
+            for name, value in self.annotator.stats.items():
+                stats["annotation_" + name] += value - before[name]
             for stream in self.streams:
-                item = stream.engine.apply(record)
+                engine = stream.engine
+                item = engine.apply(record)
+                apply_annotation_constraints(record, item.evaluation, engine)
                 item.profile_id, item.profile_name = stream.id, stream.name
                 item.profile_version, item.profile_context = stream.version, stream.context
                 stream.scorer.score(
                     record.source,
                     record.company,
                     record.title,
-                    record.description_clean or record.description_raw,
+                    role_description(record),
                     item.evaluation,
                 )
                 if (
                     use_llm
                     and self.config.llm.enabled
+                    and not (self.config.annotation.enabled and self.config.annotation.ai_enabled)
                     and item.evaluation.decision != FilterDecision.REJECT
                 ):
                     key = self._cache_key(record, stream)
@@ -289,11 +306,11 @@ class JobIntakePipeline:
             except Exception as exc:
                 self._error(stats, "alert_errors", str(outbox_id), exc)
 
-    def reevaluate_saved(self) -> dict[str, Any]:
-        """Apply profiles offline; preserve discovery dates and send no notifications."""
+    def reevaluate_saved(self, *, use_ai: bool = False, limit: int | None = None) -> dict[str, Any]:
+        """Apply profiles to saved data; AI is explicit opt-in, notifications stay disabled."""
         stats = self._stats()
         with self.database.session() as session:
-            jobs = JobRepository(session).list_jobs(limit=None)
+            jobs = JobRepository(session).list_jobs(limit=limit)
             records = [
                 JobRecord(
                     source=j.source,
@@ -312,12 +329,13 @@ class JobIntakePipeline:
                     description_clean=j.description_clean,
                     status=JobStatus(j.status),
                     source_metadata=j.source_metadata,
+                    annotation=j.annotation or {},
                 )
                 for j in jobs
             ]
         for record in records:
             try:
-                items, keys, _ = self._evaluate_record(record, stats, use_llm=False)
+                items, keys, _ = self._evaluate_record(record, stats, use_llm=use_ai)
                 self._save(items, keys, observed=False, queue_alert=False)
                 stats["persisted"] += 1
                 stats["evaluations"] += len(items)

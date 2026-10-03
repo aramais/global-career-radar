@@ -292,3 +292,178 @@ def test_same_sentence_contractor_geography_does_not_override_mandatory_residenc
         description_clean="Must reside in Germany, but we hire contractors across LATAM.",
     )
     assert RuleEngine(broad_rules()).evaluate(job).decision == FilterDecision.REJECT
+
+
+@pytest.mark.parametrize("blocker", [
+    "No US work authorization required.",
+    "No relocation required.",
+    "US work authorization required is optional.",
+])
+def test_negated_or_optional_requirement_does_not_hard_reject(blocker: str) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Remote, Brazil",
+        description_clean=f"{blocker} Fluent English required.",
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.PASS
+    assert result.blocker_signals == []
+
+
+@pytest.mark.parametrize("language", [
+    "English not required.", "No English proficiency required.",
+    "Professional English is not required.", "English skills aren't required.",
+])
+def test_negated_english_requirement_stays_unconfirmed(language: str) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Remote, Brazil",
+        description_clean=language,
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.risks == ["language:working_language_unconfirmed"]
+    assert result.blocker_signals == []
+
+
+@pytest.mark.parametrize("company_context", [
+    "About us\nWe have offices in Brazil and serve customers worldwide.",
+    "Our offices are in Brazil. Our customers are in LATAM.",
+    "We serve customers worldwide through our global remote network.",
+])
+def test_company_country_and_customer_footprint_cannot_confirm_eligibility(
+    company_context: str,
+) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", remote_text="Remote",
+        source_metadata={"working_language": "English"}, description_clean=company_context,
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.risks == ["geography:eligibility_unconfirmed"]
+
+
+def test_company_business_domain_does_not_create_a_bridge_role() -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Payroll Analyst",
+        original_url="https://example.com/job", location_text="Remote, Brazil",
+        source_metadata={"working_language": "English"},
+        description_clean=(
+            "About us\nWe provide experimentation and pricing tools for marketplaces.\n"
+            "Responsibilities\nReconcile payroll and maintain accounting records."
+        ),
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.bridge_role is False
+    assert result.matched_signals == []
+
+
+def test_explicit_eligibility_constraint_in_company_section_remains_a_blocker() -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", remote_text="Worldwide remote",
+        description_clean="About us\nMust reside in Germany. Fluent English required.",
+    )
+    assert RuleEngine(broad_rules()).evaluate(job).decision == FilterDecision.REJECT
+
+
+def test_foreign_customer_residency_is_not_applicant_eligibility() -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Remote, Brazil",
+        source_metadata={"working_language": "English"},
+        description_clean="Our customers must reside in Germany to use the banking service.",
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.PASS
+    assert result.blocker_signals == []
+
+
+def test_negated_other_working_language_does_not_imply_an_incompatible_language() -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Remote, Brazil",
+        description_clean="The working language is not Portuguese.",
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.blocker_signals == []
+    assert result.risks == ["language:working_language_unconfirmed"]
+
+
+def test_negated_secondary_condition_cannot_cancel_real_hard_blocker() -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Remote, Brazil",
+        source_metadata={"working_language": "English"},
+        description_clean="US work authorization required, relocation not required.",
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REJECT
+    assert result.blocker_signals == ["phrase_blocker:us work authorization required"]
+
+
+@pytest.mark.parametrize("exclusion", [
+    "Candidates in Brazil will not be considered.",
+    "Applicants from Brazil are not eligible for this role.",
+    "Candidates based in Brazil cannot apply.",
+    "Brazil-based candidates will not be considered.",
+    "We do not consider candidates from Brazil.",
+])
+def test_explicit_target_candidate_exclusions_are_hard_geography_blockers(exclusion: str) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", remote_text="Worldwide remote",
+        source_metadata={"working_language": "English"}, description_clean=exclusion,
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REJECT
+    assert any(signal.startswith("geo_blocker:") for signal in result.blocker_signals)
+
+
+@pytest.mark.parametrize("statement", [
+    "Brazil citizenship is not required for this remote role.",
+    "A Brazil work permit is not required for candidates.",
+    "Candidates do not need a Brazil passport for this role.",
+])
+def test_nationality_and_permission_mentions_do_not_confirm_hiring_region(statement: str) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", remote_text="Remote",
+        source_metadata={"working_language": "English"}, description_clean=statement,
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.blocker_signals == []
+    assert result.risks == ["geography:eligibility_unconfirmed"]
+
+
+def test_independent_positive_hiring_statement_survives_citizenship_negation() -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", remote_text="Remote",
+        source_metadata={"working_language": "English"},
+        description_clean="We hire candidates in Brazil. Brazil citizenship is not required.",
+    )
+    assert RuleEngine(broad_rules()).evaluate(job).decision == FilterDecision.PASS
+
+
+@pytest.mark.parametrize("condition", [
+    "Candidates in Brazil without work authorization will not be considered.",
+    "Candidates in Brazil will not be considered unless authorized to work.",
+    "Applicants from Brazil are not eligible for visa sponsorship.",
+])
+def test_conditional_or_benefit_exclusion_is_reviewed_instead_of_blanket_country_rejection(
+    condition: str,
+) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Brazil", remote_text="Remote",
+        source_metadata={"working_language": "English"}, description_clean=condition,
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.blocker_signals == []
+    assert "geography:candidate_exclusion_unconfirmed" in result.risks

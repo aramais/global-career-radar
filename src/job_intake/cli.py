@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
@@ -112,6 +113,60 @@ def reevaluate(config: str = typer.Option("config/settings.yaml", help="App conf
     for error in result["errors"]:
         typer.echo(error, err=True)
     if result["record_errors"]:
+        raise typer.Exit(code=1)
+
+
+@app.command("annotate")
+def annotate(
+    config: str = typer.Option("config/settings.yaml", help="App config YAML"),
+    ai: bool = typer.Option(False, "--ai", help="Extract and independently review with models"),
+    limit: int | None = typer.Option(None, min=1, help="Maximum saved vacancies; default all"),
+    provider: str | None = typer.Option(None, help="gemini or openai; default from settings"),
+    extract_model: str | None = typer.Option(None, help="Extraction model"),
+    review_model: str | None = typer.Option(None, help="Different model for source review"),
+) -> None:
+    """Annotate saved source texts and rescore profiles, without fetching or sending alerts."""
+    settings = load_app_config(config)
+    changes = {"enabled": True, "ai_enabled": ai}
+    if provider:
+        changes["provider"] = provider
+        if provider == "openai" and settings.annotation.provider != "openai":
+            changes.update(
+                api_key_env="OPENAI_API_KEY", extract_model="gpt-5-mini", review_model="gpt-5"
+            )
+        elif provider == "gemini" and settings.annotation.provider != "gemini":
+            changes.update(
+                api_key_env="GEMINI_API_KEY",
+                extract_model="gemini-2.5-flash-lite",
+                review_model="gemini-2.5-pro",
+            )
+    if extract_model:
+        changes["extract_model"] = extract_model
+    if review_model:
+        changes["review_model"] = review_model
+    try:
+        annotation = replace(settings.annotation, **changes)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if ai and not os.getenv(annotation.api_key_env):
+        typer.echo("Set " + annotation.api_key_env + " locally before running --ai.", err=True)
+        raise typer.Exit(code=1)
+    settings = replace(
+        settings,
+        annotation=annotation,
+        llm=replace(settings.llm, enabled=False),
+        telegram=replace(settings.telegram, enabled=False),
+    )
+    result = JobIntakePipeline(settings).reevaluate_saved(use_ai=ai, limit=limit)
+    typer.echo(
+        f"Annotated {result['persisted']} jobs, {result['evaluations']} profile evaluations. "
+        f"Extraction calls={result['annotation_extraction_calls']}, "
+        f"review calls={result['annotation_review_calls']}, "
+        f"cache hits={result['annotation_cache_hits']}, errors={result['annotation_errors']}"
+    )
+    for error in result["errors"]:
+        typer.echo(error, err=True)
+    if result["record_errors"] or result["annotation_errors"]:
         raise typer.Exit(code=1)
 
 

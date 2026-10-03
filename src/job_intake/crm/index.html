@@ -77,6 +77,12 @@ white-space:pre-wrap;margin-top:.25rem}.contact-row{background:#f7f9fc;border:1p
 border-radius:8px;padding:10px;margin:9px 0}.contact-row p{font-size:.8rem}.contact-select{display:grid;
 grid-template-columns:1fr 1fr;gap:10px}.help{font-size:.76rem;color:var(--muted);line-height:1.5;margin:.5rem 0}
 footer{margin:28px 0 0;padding:18px 0 0;border-top:1px solid var(--line);font-size:.76rem;color:var(--muted)}
+.job-annotation{font-size:.84rem;line-height:1.5;margin-top:12px}.job-annotation>summary{cursor:pointer;
+color:var(--blue);font-weight:600}.annotation-body{max-height:550px;overflow:auto;margin-top:10px;
+padding-top:10px;border-top:1px solid var(--line)}.annotation-fact{padding:10px 0;
+border-bottom:1px solid #edf1f5}.annotation-fact blockquote{white-space:pre-wrap;overflow-wrap:anywhere;
+margin:7px 0;padding:6px 12px;border-left:3px solid #cbd9ea;color:var(--muted)}
+.annotation-body h4{margin:14px 0 6px}.annotation-body .tags{margin:.4rem 0}
 @media(max-width:1050px){.filters{grid-template-columns:repeat(3,1fr)}
 .job-filter-grid{grid-template-columns:repeat(3,1fr)}.grid-cards{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:700px){.wrap{padding:18px 16px}.top{align-items:flex-start}.top .status{display:none}
@@ -566,9 +572,93 @@ function jobCard(job) {
   card.append(head,tags);
   const links = el('div',null,'row'); links.append(sourceLink(job.url),
     el('span',[job.location,job.remote].filter(Boolean).join(' · '),'small muted')); card.append(links);
+  card.append(jobAnnotationDetails(job,assessment));
   if (job.description) { const details = el('details'); details.append(el('summary','Описание вакансии',
     'small muted'),el('div',job.description,'job-description')); card.append(details); }
   return card;
+}
+const annotationKinds = {role:'Роль',responsibility:'Задачи',skill:'Навыки',
+  hiring_location:'Страны найма',work_mode:'Формат работы',working_language:'Рабочий язык',
+  employment:'Тип договора',timezone:'Часовой пояс',salary:'Оплата',status:'Статус вакансии',
+  work_authorization:'Право на работу'};
+const annotationStatuses = {SUPPORTED:'Есть подтверждение',WEAKLY_SUPPORTED:'Слабое подтверждение',
+  ANECDOTAL:'Косвенное свидетельство',CONFLICTING:'Противоречие',UNSUPPORTED:'Не подтверждено',
+  NEEDS_VERIFICATION:'Нужна проверка',UNREVIEWED:'Ещё не проверено'};
+function annotationFact(claim,conflicted = false) {
+  const fact = el('div',null,'annotation-fact');
+  fact.append(el('strong',(annotationKinds[claim.kind] || claim.kind) + ': '),
+    document.createTextNode(claim.value || ''));
+  const tags = el('div',null,'tags');
+  tags.append(badge(conflicted ? 'Исключено из подтверждённых: противоречие'
+    : (annotationStatuses[claim.review_status] || 'Ещё не проверено'),
+    conflicted ? 'red' : claim.review_status === 'SUPPORTED' ? 'green' : 'amber'));
+  if (claim.review_method === 'local') tags.append(badge('Проверено локально'));
+  else if (claim.review_method === 'model') tags.append(badge('Проверено второй моделью','blue'));
+  else if (['UNREVIEWED','NEEDS_VERIFICATION'].includes(claim.review_status))
+    tags.append(badge('Независимая проверка не завершена','amber'));
+  const requirements = {required:'Обязательно',preferred:'Предпочтительно',
+    not_required:'Не требуется',informational:'Указано в источнике'};
+  tags.append(badge(requirements[claim.requirement] || claim.requirement || 'Условие не указано'));
+  if (claim.polarity === 'negative') tags.append(badge('Отрицание / исключение','amber'));
+  if (claim.is_inference) tags.append(badge('Вывод требует проверки','amber'));
+  fact.append(tags,el('blockquote',claim.source_snippet || ''),
+    el('div','Источник: ' + (claim.source_field || 'не указан'),'tiny muted'));
+  if (claim.review_notes) fact.append(el('div',claim.review_notes,'tiny muted'));
+  return fact;
+}
+function renderJobAnnotation(job,assessment) {
+  const body = el('div',null,'annotation-body'); const annotation = job.annotation || {};
+  if (!annotation.version) {
+    body.append(el('p','Разметка ещё не выполнена.','muted'));
+    return body;
+  }
+  const twoPass = annotation.method === 'two_pass';
+  body.append(el('p',twoPass ? (annotation.status === 'partial'
+    ? 'Независимая проверка выполнена частично. Непроверенные условия остаются неизвестными.'
+    : 'Факты извлечены из текста и проверены второй моделью.')
+    : 'Прямые поля источника и явные фразы. Проверка моделями не выполнялась.','muted'));
+  if (twoPass) body.append(el('p',annotation.extract_model + ' → ' + annotation.review_model,'tiny muted'));
+  if (annotation.description_complete === false)
+    body.append(el('p','Источник содержит неполное описание: другие ограничения могут быть пропущены.',
+      'small status error'));
+  if (assessment) {
+    if (assessment.fit_reason) body.append(el('p',assessment.fit_reason,'small'));
+    const risks = [...(assessment.risks || []),...(assessment.blocker_signals || [])];
+    if (risks.length) body.append(el('p','Условия для проверки: ' + risks.join('; '),'small status error'));
+  }
+  const summary = annotation.summary || {}; const knowns = summary.knowns || [];
+  const knownIds = new Set(knowns.map((claim) => claim.claim_id));
+  const conflictedIds = new Set((summary.contradictions || []).flatMap((item) => item.claim_ids || []));
+  if ((summary.contradictions || []).length) {
+    body.append(el('h4','Противоречия в источнике'));
+    summary.contradictions.forEach((item) => body.append(el('p',
+      (annotationKinds[item.kind] || item.kind) + ': ' + (item.values || [item.value]).join(' ↔ '),
+      'status error')));
+  }
+  body.append(el('h4','Факты с цитатами из источника'));
+  if (!knowns.length) body.append(el('p','Подтверждённых фактов пока нет.','muted'));
+  knowns.forEach((claim) => body.append(annotationFact(claim)));
+  if ((summary.unknowns || []).length) {
+    body.append(el('h4','Не подтверждено источником'));
+    const tags = el('div',null,'tags'); summary.unknowns.forEach((kind) =>
+      tags.append(badge(annotationKinds[kind] || kind,'amber'))); body.append(tags);
+  }
+  const uncertain = (annotation.claims || []).filter((claim) => !knownIds.has(claim.claim_id));
+  if (uncertain.length) {
+    body.append(el('h4','Спорные и непроверенные утверждения'));
+    uncertain.forEach((claim) => body.append(annotationFact(claim,conflictedIds.has(claim.claim_id))));
+  }
+  if ((annotation.issues || []).length)
+    body.append(el('p','Пробелы проверки: ' + annotation.issues.join('; '),'small status error'));
+  return body;
+}
+function jobAnnotationDetails(job,assessment) {
+  const details = el('details',null,'job-annotation');
+  details.append(el('summary','Разметка и подтверждения')); let loaded = false;
+  details.addEventListener('toggle',() => {
+    if (details.open && !loaded) { details.append(renderJobAnnotation(job,assessment)); loaded = true; }
+  });
+  return details;
 }
 function companyCard(company) {
   const card = el('article',null,'card'); const head = el('div',null,'card-head');

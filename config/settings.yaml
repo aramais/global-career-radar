@@ -9,6 +9,22 @@ crm:
   team_interview_goal: 4
   weekly_time_budget_hours: 10
 
+# Source-grounded extraction and independent review, shared across all role profiles.
+# AI is opt-in; deterministic parsing and evidence inspection work without a key.
+annotation:
+  enabled: true
+  ai_enabled: false
+  provider: gemini
+  extract_model: gemini-2.5-flash-lite
+  review_model: gemini-2.5-pro
+  api_key_env: GEMINI_API_KEY
+  cache_dir: data/local/annotations
+  chunk_chars: 6000
+  max_output_tokens: 4096
+  request_timeout: 60
+  max_retries: 2
+  retry_backoff: 1
+
 telegram:
   enabled: false
   bot_token_env: TELEGRAM_BOT_TOKEN

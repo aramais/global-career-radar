@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from job_intake.annotation.text import asserted_phrase_hits, scoped_description_text
 from job_intake.models.job import FilterDecision, JobEvaluation, JobTier
 from job_intake.utils.text import contains_any, matches_phrase, normalize_text
 
@@ -55,7 +56,7 @@ class DeterministicScorer:
 
         score = 0.0
         title_text = normalize_text(title)
-        description_text = normalize_text(description)
+        description_text = scoped_description_text(description)
 
         for phrase, weight in self.profiles.title_weights.items():
             if matches_phrase(title_text, phrase):
@@ -63,7 +64,7 @@ class DeterministicScorer:
                 evaluation.matched_signals.append(f"title_weight:{phrase}")
 
         for phrase, weight in self.profiles.description_weights.items():
-            if matches_phrase(description_text, phrase):
+            if asserted_phrase_hits(description_text, [phrase]):
                 score += float(weight)
                 evaluation.matched_signals.append(f"description_weight:{phrase}")
 
@@ -77,9 +78,9 @@ class DeterministicScorer:
 
         if contains_any(title_text, self.profiles.bucket_c_signals):
             score -= 8.0
-        if contains_any(description_text, self.profiles.bucket_a_signals):
+        if asserted_phrase_hits(description_text, self.profiles.bucket_a_signals):
             score += 3.0
-        if contains_any(description_text, self.profiles.bucket_b_signals):
+        if asserted_phrase_hits(description_text, self.profiles.bucket_b_signals):
             score += 1.5
 
         if evaluation.decision == FilterDecision.REVIEW:

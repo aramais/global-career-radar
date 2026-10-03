@@ -42,6 +42,7 @@ class JobRecord:
     description_clean: str = ""
     status: JobStatus = JobStatus.OPEN
     source_metadata: dict[str, Any] = field(default_factory=dict)
+    annotation: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

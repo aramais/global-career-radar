@@ -255,6 +255,11 @@ class CRMService:
                         "location": job.location_text,
                         "remote": job.remote_text,
                         "description": job.description_clean or job.description_raw,
+                        "annotation": {
+                            key: value for key, value in (job.annotation or {}).items()
+                            if key in {"version", "status", "method", "summary", "claims", "issues",
+                                "extract_model", "review_model", "coverage", "description_complete"}
+                        },
                         "fit_score": best.fit_score if best else None,
                         "tier": best.tier if best else None,
                         "decision": best.decision if best else None,
@@ -265,6 +270,9 @@ class CRMService:
                                 "score": p.fit_score,
                                 "tier": p.tier,
                                 "decision": p.decision,
+                                "fit_reason": p.fit_reason,
+                                "risks": p.risks,
+                                "blocker_signals": p.blocker_signals,
                             }
                             for p in evaluations
                         ],

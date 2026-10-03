@@ -50,6 +50,7 @@ class JobORM(Base):
     last_alerted_tier: Mapped[str | None] = mapped_column(String(4), nullable=True)
     last_alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     source_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    annotation: Mapped[dict] = mapped_column(JSON, default=dict)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

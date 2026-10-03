@@ -40,6 +40,7 @@ class Database:
         "best_profile_id": "VARCHAR(100)",
         "best_profile_name": "VARCHAR(255)",
         "alert_pending": "BOOLEAN NOT NULL DEFAULT 0",
+        "annotation": "JSON NOT NULL DEFAULT '{}'",
     }
 
     def _apply_lightweight_migrations(self) -> None:
