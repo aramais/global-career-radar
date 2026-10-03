@@ -139,6 +139,14 @@ def test_period_uses_sao_paulo_day_and_separates_unknown_historical_dates(servic
     assert state["metrics"]["by_channel"]["unknown"]["team_from_applied_rate"] is None
 
 
+def test_state_exposes_actual_profile_thresholds_for_grading_help(service):
+    service.streams[0].scoring.threshold_a = 17.5
+    service.streams[0].scoring.threshold_b = 6.5
+    assert service.state({})["profiles"] == [
+        {"id": "product", "name": "Product", "threshold_a": 17.5, "threshold_b": 6.5}
+    ]
+
+
 def test_saved_job_idempotence_does_not_assign_disabled_profile(service):
     with service.database.session() as session:
         item = EvaluatedJob(

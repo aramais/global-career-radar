@@ -288,7 +288,15 @@ class CRMService:
                 "contacts": [_contact(c) for c in repo.list_contacts()],
                 "companies": [_company(c) for c in repo.list_companies()],
                 "jobs": jobs,
-                "profiles": [{"id": s.id, "name": s.name} for s in self.streams],
+                "profiles": [
+                    {
+                        "id": s.id,
+                        "name": s.name,
+                        "threshold_a": s.scoring.threshold_a,
+                        "threshold_b": s.scoring.threshold_b,
+                    }
+                    for s in self.streams
+                ],
                 "metrics": metrics,
                 "actions": [
                     serialize_application(a)

@@ -38,6 +38,11 @@ border-bottom:1px solid #edf1f5}.channel-panel th{color:var(--muted);font-weight
 .tab.active{background:var(--light);color:var(--blue)}.filters{padding:16px;display:grid;
 grid-template-columns:1.6fr 1fr 1fr 1fr 1fr auto;gap:10px;align-items:end;margin-bottom:15px}
 .view-toolbar{display:flex;gap:12px;align-items:center;justify-content:space-between;margin:18px 0 12px}
+.job-controls{padding:16px;margin-bottom:15px}.job-filter-grid{display:grid;
+grid-template-columns:1fr 1fr 1fr 1.5fr auto;gap:10px;align-items:end}
+.grading-help{font-size:.82rem;margin-top:12px;line-height:1.5}.grading-help summary{cursor:pointer;
+color:var(--blue);font-weight:600}.grading-help ul{margin:.5rem 0;padding-left:20px}
+.filter-error{color:var(--danger);font-size:.84rem;margin-top:10px}
 .list{display:grid;gap:11px}.card{padding:17px 19px}.card-head{display:flex;align-items:flex-start;
 gap:14px;justify-content:space-between}.card-title{font-size:1rem;font-weight:700;line-height:1.45}
 .card-company{font-size:.83rem;color:var(--muted);margin:.15rem 0 .5rem}.tags{display:flex;gap:7px;
@@ -72,11 +77,14 @@ white-space:pre-wrap;margin-top:.25rem}.contact-row{background:#f7f9fc;border:1p
 border-radius:8px;padding:10px;margin:9px 0}.contact-row p{font-size:.8rem}.contact-select{display:grid;
 grid-template-columns:1fr 1fr;gap:10px}.help{font-size:.76rem;color:var(--muted);line-height:1.5;margin:.5rem 0}
 footer{margin:28px 0 0;padding:18px 0 0;border-top:1px solid var(--line);font-size:.76rem;color:var(--muted)}
-@media(max-width:1050px){.filters{grid-template-columns:repeat(3,1fr)}.grid-cards{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:1050px){.filters{grid-template-columns:repeat(3,1fr)}
+.job-filter-grid{grid-template-columns:repeat(3,1fr)}.grid-cards{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:700px){.wrap{padding:18px 16px}.top{align-items:flex-start}.top .status{display:none}
 h1{font-size:1.5rem}.metrics{grid-template-columns:repeat(2,1fr);gap:9px}.metric{padding:13px}
 .metric-value{font-size:1.5rem}.filters{grid-template-columns:repeat(2,1fr);padding:12px}.filters .search{
 grid-column:1/-1}.filters button{width:100%}.detail-grid,.grid-cards{grid-template-columns:1fr}
+.job-controls{padding:12px}.job-filter-grid{grid-template-columns:repeat(2,1fr)}
+.job-filter-grid button{grid-column:1/-1}
 .card{padding:14px}.card-head{gap:8px}.modal-shade{padding:12px 8px}.modal-header,.modal-body{
 padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-select{grid-template-columns:1fr}}
 </style>
@@ -122,6 +130,31 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
       <option value="undated">Без даты</option></select></div>
     <button class="primary" id="createButton" type="button" disabled>Добавить отклик</button></div>
   <p class="view-note" id="viewNote"></p>
+  <section class="panel job-controls" id="jobControls" aria-label="Фильтры оценки вакансий" hidden>
+    <div class="job-filter-grid">
+      <label><span>Категория</span><select id="tierFilter">
+        <option value="">Все категории</option><option value="A">A</option>
+        <option value="B">B</option><option value="C">C</option>
+        <option value="unrated">Без актуальной оценки</option></select></label>
+      <label><span>Баллы от</span><input id="scoreMinFilter" type="number" step="any" placeholder="Любое"></label>
+      <label><span>Баллы до</span><input id="scoreMaxFilter" type="number" step="any" placeholder="Любое"></label>
+      <label><span>Сортировка</span><select id="jobSort">
+        <option value="tier-asc">Категория: A → C</option><option value="tier-desc">Категория: C → A</option>
+        <option value="score-desc">Баллы: больше сначала</option>
+        <option value="score-asc">Баллы: меньше сначала</option></select></label>
+      <button id="resetJobFilters" type="button">Сбросить фильтры</button>
+    </div>
+    <p class="help" id="jobFilterScope"></p>
+    <p class="filter-error" id="jobFilterError" role="status" hidden></p>
+    <details class="grading-help"><summary>Как считаются баллы и категории A / B / C?</summary>
+      <p>Баллы — сумма весов совпавших признаков в названии и описании, бонусов за источник
+        и приоритетную компанию. Это не шкала 0–15: балл может быть выше 15 или дробным.</p>
+      <div id="gradingThresholds"></div>
+      <p>Если условия работы требуют проверки, из оценки вычитаются 3 балла (до нуля).
+        Исключающее ограничение даёт 0 баллов и C. Оценка рассчитывается отдельно для каждого профиля;
+        низкий балл может означать неполное описание и не мешает откликнуться.</p>
+    </details>
+  </section>
   <section id="content" class="list" aria-live="polite"></section>
   <footer>Изменения сохраняются в локальной базе проекта. Даты из истории не заполняются автоматически.
     Сообщения контактам отправляете вы. Импорт JobCRM сохраняет исходную таблицу без изменений.</footer>
@@ -343,6 +376,90 @@ function matchesQuery(record) {
     ...(record.contacts || []).map((item) => item.name)]
     .join(' ').toLocaleLowerCase('ru').includes(query);
 }
+function scoreNumber(value) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+function assessmentScore(assessment) {
+  return assessment ? scoreNumber(assessment.score ?? assessment.fit_score) : null;
+}
+function compareScores(a, b, direction) {
+  if (a === null || b === null) return a === b ? 0 : a === null ? 1 : -1;
+  return (a - b) * direction;
+}
+function compareTiers(a, b, direction) {
+  const ranks = {A:0,B:1,C:2};
+  const left = ranks[a?.tier] ?? null, right = ranks[b?.tier] ?? null;
+  if (left === null || right === null) return left === right ? 0 : left === null ? 1 : -1;
+  return (left - right) * direction;
+}
+function jobAssessment(job, profileId) {
+  const profiles = job.profiles || [];
+  if (profileId) return profiles.find((item) => (item.id || item.profile_id) === profileId) || null;
+  // Match the API's best-profile order, regardless of the selected server-side filter.
+  const decisions = {pass:0,review:1,reject:2};
+  return [...profiles].sort((a,b) => compareTiers(a,b,1)
+    || (decisions[a.decision] ?? 3) - (decisions[b.decision] ?? 3)
+    || compareScores(assessmentScore(a),assessmentScore(b),-1)
+    || String(a.id || a.profile_id || '').localeCompare(String(b.id || b.profile_id || '')))[0] || null;
+}
+function filterAndSortJobs(jobs, options = {}) {
+  const min = scoreNumber(options.minScore), max = scoreNumber(options.maxScore);
+  if (min !== null && max !== null && min > max) return [];
+  const sort = options.sort || 'tier-asc';
+  return jobs.map((job) => ({job,assessment:jobAssessment(job,options.profileId)}))
+    .filter(({assessment}) => {
+      if (options.profileId && !assessment) return false;
+      const tier = ['A','B','C'].includes(assessment?.tier) ? assessment.tier : 'unrated';
+      const score = assessmentScore(assessment);
+      return (!options.tier || options.tier === tier)
+        && (min === null || (score !== null && score >= min))
+        && (max === null || (score !== null && score <= max));
+    }).sort((a,b) => {
+      const scoreOrder = compareScores(assessmentScore(a.assessment),assessmentScore(b.assessment),
+        sort === 'score-asc' ? 1 : -1);
+      const tierOrder = compareTiers(a.assessment,b.assessment,sort === 'tier-desc' ? -1 : 1);
+      return (sort.startsWith('score-') ? scoreOrder || tierOrder : tierOrder || scoreOrder)
+        || String(a.job.job_uid || '').localeCompare(String(b.job.job_uid || ''));
+    }).map(({job}) => job);
+}
+function renderJobFilters() {
+  const profileId = $('profileFilter').value;
+  $('jobFilterScope').textContent = (profileId ? 'Оценка для фильтров: ' + profileName(profileId) + '.'
+    : 'Все профили: используется лучшая категория вакансии; при равенстве — пройденные условия, затем баллы.')
+    + ' Эта оценка выделена в карточке. '
+    + ($('jobSort').value.startsWith('tier-') ? 'Внутри категории — сначала больший балл.'
+      : 'При равных баллах — категория A → C.') + ' Без оценки — в конце.';
+  const min = scoreNumber($('scoreMinFilter').value), max = scoreNumber($('scoreMaxFilter').value);
+  const badNumber = $('scoreMinFilter').validity?.badInput || $('scoreMaxFilter').validity?.badInput;
+  const invalidRange = min !== null && max !== null && min > max;
+  $('jobFilterError').hidden = !badNumber && !invalidRange;
+  $('jobFilterError').textContent = badNumber ? 'Введите числовые границы баллов.'
+    : invalidRange ? 'Минимальный балл должен быть не больше максимального.' : '';
+  const groups = new Map();
+  (state.profiles || []).filter((profile) => !profileId || (profile.id || profile.profile_id) === profileId)
+    .forEach((profile) => {
+      const a = scoreNumber(profile.threshold_a), b = scoreNumber(profile.threshold_b);
+      if (a === null || b === null) return;
+      const key = a + ':' + b;
+      if (!groups.has(key)) groups.set(key,{a,b,names:[]});
+      groups.get(key).names.push(profile.name || profileName(profile.id || profile.profile_id));
+    });
+  $('gradingThresholds').replaceChildren();
+  groups.forEach(({a,b,names}) => {
+    if (groups.size > 1) $('gradingThresholds').append(el('p',names.join(', '),'small'));
+    const rules = el('ul');
+    ['A — от ' + a + ' баллов, обязательные условия пройдены и есть признаки целевой роли.',
+      'B — от ' + b + ' баллов, если условия A не выполнены.',
+      'C — ниже ' + b + ' баллов или есть исключающее ограничение.']
+      .forEach((text) => rules.append(el('li',text)));
+    $('gradingThresholds').append(rules);
+  });
+  if (!groups.size) $('gradingThresholds').append(el('p',
+    'A требует прохождения обязательных условий и признаков целевой роли; пороги A и B задаются в профиле поиска.'));
+  return !badNumber && !invalidRange;
+}
 function currentApplications() {
   return (state.applications || []).filter(matchesQuery).filter((app) => !$('stageFilter').value
     || app.stage === $('stageFilter').value);
@@ -369,6 +486,7 @@ function render() {
   $('viewTitle').textContent = titles[view]; $('viewNote').textContent = notes[view];
   $('stageFilter').hidden = !['applications','actions'].includes(view);
   $('actionFilter').hidden = view !== 'actions';
+  $('jobControls').hidden = view !== 'jobs';
   $('createButton').hidden = view === 'actions' || view === 'jobs';
   $('createButton').textContent = view === 'companies' ? 'Добавить компанию'
     : view === 'contacts' ? 'Добавить контакт' : 'Добавить отклик';
@@ -388,8 +506,9 @@ function render() {
     }
     records.forEach((app) => $('content').append(applicationCard(app)));
   } else if (view === 'jobs') {
-    records = (state.jobs || []).filter(matchesQuery).filter((job) => !$('profileFilter').value
-      || (job.profiles || []).some((item) => (item.id || item.profile_id) === $('profileFilter').value));
+    records = renderJobFilters() ? filterAndSortJobs((state.jobs || []).filter(matchesQuery),
+      {profileId:$('profileFilter').value,tier:$('tierFilter').value,minScore:$('scoreMinFilter').value,
+        maxScore:$('scoreMaxFilter').value,sort:$('jobSort').value}) : [];
     records.forEach((job) => $('content').append(jobCard(job)));
   } else if (view === 'companies') {
     records = (state.companies || []).filter(matchesQuery);
@@ -437,10 +556,13 @@ function jobCard(job) {
   head.append(title,button(existing ? 'Открыть отклик' : 'Добавить в CRM',() => existing
     ? openApplication(existing.id) : addJob(job),'inline-button'));
   const tags = el('div',null,'tags');
+  const assessment = jobAssessment(job,$('profileFilter').value);
   (job.profiles || []).forEach((profile) => tags.append(badge((profile.name || profileName(profile.id
-    || profile.profile_id)) + ' · ' + (profile.tier || '—') + ' · ' + (profile.score ?? profile.fit_score ?? 0)
+    || profile.profile_id)) + ' · ' + (profile.tier || '—') + ' · '
+    + (assessmentScore(profile) === null ? 'Без оценки' : assessmentScore(profile) + ' баллов')
     + (profile.decision ? ' · ' + ({pass:'Подходит',review:'Проверить условия',reject:'Есть ограничение'}[profile.decision]
-      || profile.decision) : ''))));
+      || profile.decision) : ''),profile === assessment ? 'blue' : '')));
+  if (!assessment) tags.append(badge('Без актуальной оценки'));
   card.append(head,tags);
   const links = el('div',null,'row'); links.append(sourceLink(job.url),
     el('span',[job.location,job.remote].filter(Boolean).join(' · '),'small muted')); card.append(links);
@@ -711,6 +833,13 @@ document.querySelectorAll('.tab').forEach((tab) => tab.addEventListener('click',
 $('filters').addEventListener('submit',(event) => { event.preventDefault(); refresh(false); });
 $('query').addEventListener('input',render); $('stageFilter').addEventListener('change',render);
 $('actionFilter').addEventListener('change',render);
+$('profileFilter').addEventListener('change',() => { if (view === 'jobs') render(); });
+['tierFilter','jobSort'].forEach((id) => $(id).addEventListener('change',render));
+['scoreMinFilter','scoreMaxFilter'].forEach((id) => $(id).addEventListener('input',render));
+$('resetJobFilters').addEventListener('click',() => {
+  ['tierFilter','scoreMinFilter','scoreMaxFilter'].forEach((id) => $(id).value = '');
+  $('jobSort').value = 'tier-asc'; render();
+});
 $('createButton').addEventListener('click',() => view === 'companies' ? openCompany(null)
   : view === 'contacts' ? openContact(null) : createApplication());
 $('importButton').addEventListener('click',openImport);

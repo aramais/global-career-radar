@@ -94,3 +94,139 @@ def test_ui_enumerations_do_not_infer_referral_from_recruiter_contact() -> None:
         "Реферальный отклик",
         ["unknown", "cold", "referral", "recruiter"],
     ]
+
+
+@pytest.fixture
+def graded_jobs() -> list[dict]:
+    return [
+        {
+            "job_uid": "b-high",
+            "profiles": [{"id": "product", "tier": "B", "score": 21, "decision": "review"}],
+        },
+        {
+            "job_uid": "unrated",
+            "tier": "A",
+            "fit_score": 99,  # Stale top-level values must not become current assessments.
+            "profiles": [],
+        },
+        {
+            "job_uid": "c-zero",
+            "profiles": [{"id": "product", "tier": "C", "score": 0, "decision": "reject"}],
+        },
+        {
+            "job_uid": "a-high",
+            "profiles": [{"id": "product", "tier": "A", "score": 20.5, "decision": "pass"}],
+        },
+        {
+            "job_uid": "b-low",
+            "profiles": [{"id": "product", "tier": "B", "score": 6, "decision": "pass"}],
+        },
+        {
+            "job_uid": "a-low",
+            "profiles": [{"id": "product", "tier": "A", "score": 14, "decision": "pass"}],
+        },
+    ]
+
+
+def _filtered_job_ids(jobs: list[dict], **options: object) -> object:
+    return _run_javascript(
+        f"filterAndSortJobs({json.dumps(jobs)}, {json.dumps(options)}).map(job=>job.job_uid)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("sort", "expected"),
+    [
+        ("tier-asc", ["a-high", "a-low", "b-high", "b-low", "c-zero", "unrated"]),
+        ("tier-desc", ["c-zero", "b-high", "b-low", "a-high", "a-low", "unrated"]),
+        ("score-desc", ["b-high", "a-high", "a-low", "b-low", "c-zero", "unrated"]),
+        ("score-asc", ["c-zero", "b-low", "a-low", "a-high", "b-high", "unrated"]),
+    ],
+)
+def test_job_sort_uses_numeric_scores_and_keeps_unrated_jobs_last(graded_jobs, sort, expected):
+    assert _filtered_job_ids(graded_jobs, sort=sort) == expected
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({"tier": "A"}, ["a-high", "a-low"]),
+        ({"tier": "B", "minScore": 14}, ["b-high"]),
+        ({"tier": "C"}, ["c-zero"]),
+        ({"tier": "unrated"}, ["unrated"]),
+        ({"minScore": "6", "maxScore": "20.5"}, ["a-high", "a-low", "b-low"]),
+        ({"minScore": "20.5", "maxScore": "20.5"}, ["a-high"]),
+        ({"minScore": "0", "maxScore": "0"}, ["c-zero"]),
+        ({"minScore": "0", "maxScore": ""}, ["a-high", "a-low", "b-high", "b-low", "c-zero"]),
+        ({"minScore": "22", "maxScore": "6"}, []),
+    ],
+)
+def test_job_filters_combine_stored_tier_and_inclusive_uncapped_score_range(
+    graded_jobs, options, expected
+):
+    assert _filtered_job_ids(graded_jobs, **options) == expected
+
+
+def test_job_filters_and_card_assessment_use_the_selected_profile_not_the_api_best():
+    jobs = [
+        {
+            "job_uid": "product-fit",
+            "tier": "A",
+            "fit_score": 25,
+            "profiles": [
+                {"id": "product", "tier": "A", "score": 25, "decision": "pass"},
+                {"id": "analytics", "tier": "C", "score": 0, "decision": "reject"},
+            ],
+        },
+        {
+            "job_uid": "analytics-fit",
+            "profiles": [
+                {"id": "product", "tier": "C", "score": 2, "decision": "review"},
+                {"id": "analytics", "tier": "B", "score": 9, "decision": "review"},
+            ],
+        },
+        {"job_uid": "no-analytics", "profiles": [{"id": "product", "tier": "A", "score": 50}]},
+    ]
+    assert _filtered_job_ids(jobs, profileId="analytics", tier="B", minScore=6) == [
+        "analytics-fit"
+    ]
+    assert _filtered_job_ids(jobs, profileId="analytics", sort="score-asc") == [
+        "product-fit",
+        "analytics-fit",
+    ]
+    assert _run_javascript(
+        f"jobAssessment({json.dumps(jobs[0])}, 'analytics')"
+    ) == jobs[0]["profiles"][1]
+    assert _filtered_job_ids(jobs, tier="A") == ["no-analytics", "product-fit"]
+
+
+def test_best_profile_prioritizes_tier_then_eligibility_then_score_and_has_stable_ties():
+    profiles = [
+        {"id": "high-score-review", "tier": "B", "score": 30, "decision": "review"},
+        {"id": "c", "tier": "B", "score": 12, "decision": "pass"},
+        {"id": "b", "tier": "B", "score": 12, "decision": "pass"},
+        {"id": "a", "tier": "A", "score": 14, "decision": "pass"},
+    ]
+    assert _run_javascript(
+        f"jobAssessment({json.dumps({'profiles': profiles})}, '').id"
+    ) == "a"
+    assert _run_javascript(
+        f"jobAssessment({json.dumps({'profiles': profiles[:-1]})}, '').id"
+    ) == "b"
+    tied_jobs = [
+        {"job_uid": "z", "profiles": [profiles[-1]]},
+        {"job_uid": "a", "profiles": [profiles[-1]]},
+    ]
+    assert _filtered_job_ids(tied_jobs) == ["a", "z"]
+
+
+@pytest.mark.parametrize("missing_score", [None, "", "not-a-number"])
+def test_missing_profile_scores_are_not_coerced_to_zero_or_included_in_numeric_ranges(
+    missing_score,
+):
+    jobs = [
+        {"job_uid": "missing", "profiles": [{"id": "p", "tier": "C", "score": missing_score}]},
+        {"job_uid": "zero", "profiles": [{"id": "p", "tier": "C", "score": 0}]},
+    ]
+    assert _filtered_job_ids(jobs, sort="score-asc") == ["zero", "missing"]
+    assert _filtered_job_ids(jobs, minScore=0, maxScore=0) == ["zero"]
