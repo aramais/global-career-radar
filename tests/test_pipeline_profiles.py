@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 import yaml
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from job_intake.config.settings import AppConfig, LLMConfig, SourceDefinition, TelegramConfig
 from job_intake.models.job import JobRecord
@@ -267,6 +267,83 @@ def test_batch_commits_deterministic_data_before_waiting(tmp_path, monkeypatch):
         assert session.scalar(select(JobORM)).fit_score == 10
 
 
+def test_saved_ai_reevaluation_finishes_batch_without_alerts_or_seen_date_changes(tmp_path):
+    config = _config(tmp_path, llm=True)
+    config.llm = replace(config.llm, batch_enabled=True)
+    pipeline = JobIntakePipeline(config)
+    record = _record()
+    items, keys, _ = pipeline._evaluate_record(record, pipeline._stats(), use_llm=False)
+    pipeline._save(items, keys, observed=True, queue_alert=False)
+    with pipeline.database.session() as session:
+        old_dates = session.scalar(select(JobORM)).first_seen_at, \
+            session.scalar(select(JobORM)).last_seen_at
+    calls = []
+
+    def finish_batch(items):
+        calls.append([item.profile_id for item in items])
+        for item in items:
+            item.evaluation.semantic_score = 3
+            item.evaluation.fit_score += 3
+        return items
+
+    pipeline.batch_reranker.rerank_many = finish_batch
+    pipeline.telegram.send = lambda *_: pytest.fail("Reevaluation sent an alert")
+    stats = pipeline.reevaluate_saved(use_ai=True)
+    assert calls == [["product", "analytics"]]
+    assert stats["llm_batched"] == 2
+    assert stats["record_errors"] == stats["alerts"] == 0
+    with pipeline.database.session() as session:
+        job = session.scalar(select(JobORM))
+        assert (job.first_seen_at, job.last_seen_at) == old_dates
+        assert {p.semantic_score for p in job.profile_evaluations} == {3}
+        assert session.scalar(select(func.count()).select_from(AlertOutboxORM)) == 0
+
+
+def test_profile_cache_is_fetched_once_per_record(tmp_path):
+    config = _config(tmp_path, llm=True)
+    pipeline = JobIntakePipeline(config)
+    record = _record()
+    items, keys, _ = pipeline._evaluate_record(record, pipeline._stats(), use_llm=False)
+    pipeline._save(items, keys, observed=True, queue_alert=False)
+    queries = []
+    event.listen(pipeline.database.engine, "before_cursor_execute", lambda c, u, sql, p, x, m:
+                 queries.append(sql) if sql.lstrip().upper().startswith("SELECT") else None)
+    pipeline.reranker.rerank = lambda item: item
+    pipeline._evaluate_record(record, pipeline._stats(), use_llm=True)
+    assert len(queries) == 2
+
+
+def test_pending_saved_batch_is_reported_and_resumed_instead_of_cached(tmp_path):
+    config = _config(tmp_path, llm=True)
+    config.llm = replace(config.llm, batch_enabled=True)
+    pipeline = JobIntakePipeline(config)
+    items, keys, _ = pipeline._evaluate_record(_record(), pipeline._stats(), use_llm=False)
+    pipeline._save(items, keys, observed=True, queue_alert=False)
+    calls = []
+
+    def finish_batch(items):
+        calls.append([item.profile_id for item in items])
+        pipeline.batch_reranker.last_stats = {"pending": int(len(calls) == 1), "errors": 0}
+        if len(calls) == 2:
+            for item in items:
+                item.evaluation.semantic_score = 3
+                item.evaluation.fit_score += 3
+        return items
+
+    pipeline.batch_reranker.rerank_many = finish_batch
+    first = pipeline.reevaluate_saved(use_ai=True)
+    assert first["llm_batch_pending"] == 1
+    assert first["llm_batch_errors"] == first["llm_cache_hits"] == 0
+    with pipeline.database.session() as session:
+        scores = {p.semantic_score for p in session.scalars(select(JobProfileEvaluationORM))}
+        assert scores == {None}
+    second = pipeline.reevaluate_saved(use_ai=True)
+    assert calls == [["product", "analytics"], ["product", "analytics"]]
+    assert second["llm_batch_pending"] == second["llm_batch_errors"] == 0
+    with pipeline.database.session() as session:
+        assert {p.semantic_score for p in session.scalars(select(JobProfileEvaluationORM))} == {3}
+
+
 def test_profile_queries_follow_enabled_streams(tmp_path):
     pipeline = JobIntakePipeline(_config(tmp_path))
     source = SourceDefinition("remote", "dailyremote", params={"use_profile_queries": True})
@@ -274,6 +351,18 @@ def test_profile_queries_follow_enabled_streams(tmp_path):
     assert len(urls) == 2
     assert any("Product+Manager" in url for url in urls)
     assert "search_urls" not in source.params
+
+
+def test_parser_policy_upgrade_invalidates_old_profile_verdicts(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    current = JobIntakePipeline(config)
+    monkeypatch.setattr("job_intake.profiles.TEXT_VERSION", "source-units-previous")
+    previous = JobIntakePipeline(config)
+    assert current.profile_versions.keys() == previous.profile_versions.keys()
+    assert all(
+        version != previous.profile_versions[profile]
+        for profile, version in current.profile_versions.items()
+    )
 
 
 def test_digest_excludes_disabled_or_outdated_profile_evaluations(tmp_path, monkeypatch):

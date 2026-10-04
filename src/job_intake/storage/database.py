@@ -32,6 +32,13 @@ class Database:
     @staticmethod
     def _enable_foreign_keys(connection, _record) -> None:
         connection.execute("PRAGMA foreign_keys=ON")
+        # SQLite's built-in lower() only folds ASCII. Server-side vacancy search
+        # must keep the previous browser search's Unicode case-insensitivity.
+        connection.create_function(
+            "hr_unicode_lower", 1,
+            lambda value: value.lower() if isinstance(value, str) else value,
+            deterministic=True,
+        )
 
     # Additive columns that ``create_all`` cannot add to a pre-existing ``jobs`` table.
     _JOBS_ADDITIVE_COLUMNS = {
@@ -53,13 +60,21 @@ class Database:
         additive migration until Alembic is introduced.
         """
         inspector = inspect(self.engine)
-        if "jobs" not in inspector.get_table_names():
-            return
-        columns = {col["name"] for col in inspector.get_columns("jobs")}
-        for name, ddl_type in self._JOBS_ADDITIVE_COLUMNS.items():
-            if name not in columns:
-                with self.engine.begin() as connection:
-                    connection.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {ddl_type}"))
+        migrations = {
+            "jobs": self._JOBS_ADDITIVE_COLUMNS,
+            "crm_companies": {"version": "INTEGER NOT NULL DEFAULT 1"},
+        }
+        tables = set(inspector.get_table_names())
+        for table, additions in migrations.items():
+            if table not in tables:
+                continue
+            columns = {col["name"] for col in inspector.get_columns(table)}
+            for name, ddl_type in additions.items():
+                if name not in columns:
+                    with self.engine.begin() as connection:
+                        connection.execute(text(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {ddl_type}"
+                        ))
 
     def vacuum(self) -> None:
         with self.engine.begin() as connection:

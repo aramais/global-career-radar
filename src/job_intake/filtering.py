@@ -7,6 +7,7 @@ from typing import Any
 
 from job_intake.annotation.text import (
     asserted_phrase_hits,
+    assertion_clauses,
     eligibility_description,
     role_description,
 )
@@ -50,6 +51,10 @@ _CANDIDATE_EXCLUSIONS = (
         r"(?:candidates?|applicants?|applications?)\s+(?:in|from|based in)\s+"
         r"(?P<location>[^.;!?\n|]+)", re.I,
     ),
+)
+_REGION_EXCLUSION = re.compile(
+    r"\b(?:except(?:\s+for)?|excluding|other than|with the exception of|"
+    r"not including|but not)\s+(?P<location>[^.;!?\n|]+)", re.I,
 )
 
 
@@ -234,7 +239,7 @@ class RuleEngine:
 
     def _build_text_blob(self, job: JobRecord) -> str:
         return " | ".join(
-            compact_text(value)
+            value.strip()
             for value in [
                 job.title,
                 job.location_text,
@@ -250,14 +255,20 @@ class RuleEngine:
     def _geo_text(value: str) -> str:
         # City names must match with and without accents (São Paulo / Sao Paulo).
         ascii_text = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
-        return compact_text(ascii_text.casefold())
+        return "\n".join(compact_text(line) for line in ascii_text.casefold().splitlines())
 
     def _target_location(self, text: str) -> bool:
-        return bool(contains_any(
+        # A broad positive region cannot override an explicit target exclusion.
+        if any(
+            self._target_residency(match["location"])
+            for match in _REGION_EXCLUSION.finditer(text)
+        ):
+            return False
+        return bool(asserted_phrase_hits(
             self._geo_text(text), [
                 self._geo_text(place)
                 for place in self.rules.target_geographies + (self.rules.onsite_locations or [])
-            ]
+            ], required=True,
         ))
 
     def _target_residency(self, text: str) -> bool:
@@ -274,8 +285,49 @@ class RuleEngine:
         return bool(contains_any(self._geo_text(text), places))
 
     def _onsite(self, job: JobRecord) -> bool:
-        text = self._geo_text(" ".join(filter(None, [job.remote_text, job.location_text])))
-        return bool(re.search(r"\b(?:on[ -]?site|hybrid|in[ -]office|office[ -]based)\b", text))
+        text = self._geo_text(" | ".join(filter(None, [job.remote_text, job.location_text])))
+        return any(self._asserted_office_modes(clause) for clause in assertion_clauses(text))
+
+    @staticmethod
+    def _asserted_office_modes(clause: str) -> list[str]:
+        office = r"(?:on[ -]?site|hybrid|in[ -]office|office[ -]based)"
+        # An employer offering a remote alternative does not require an office.
+        if re.search(
+            rf"\b(?:remote|remotely)\b[^.;!?]{{0,30}}(?:\bor\b|/)[^.;!?]{{0,30}}"
+            rf"\b{office}\b|\b{office}\b[^.;!?]{{0,30}}(?:\bor\b|/)"
+            rf"[^.;!?]{{0,30}}\b(?:remote|remotely)\b", clause,
+        ):
+            return []
+        modes = [match[0] for match in re.finditer(rf"\b{office}\b", clause)]
+        return asserted_phrase_hits(clause, modes, required=True)
+
+    def _mandatory_office_locations(self, job: JobRecord) -> list[str | None]:
+        """Read explicit office obligations from actual vacancy prose, not footprint."""
+        locations = []
+        office = r"(?:on[ -]?site|hybrid|in[ -]office|office[ -]based)"
+        obligation = (
+            rf"\b(?:requires?|required|mandatory|must(?:\s+(?:work|be|come))?)\s+"
+            rf"(?:a\s+|an\s+|regular\s+)?{office}\b|"
+            rf"\b{office}\b(?:\s+(?:work|working|attendance|schedule|arrangement|"
+            rf"presence|model|role|position|setup|office|days))?\s+"
+            rf"(?:(?:is|will be)\s+)?(?:required|mandatory)\b"
+        )
+        for clause in assertion_clauses(self._geo_text(eligibility_description(job))):
+            if not re.search(obligation, clause) or not self._asserted_office_modes(clause):
+                continue
+            # General employee policy is not direct evidence of where this vacancy
+            # requires its successful applicant to work.
+            if re.search(
+                r"\b(?:our|the company s) (?:employees|staff|offices|teams)\b", clause,
+            ) and not re.search(
+                r"\b(?:this role|this position|this job|you|candidates|applicants)\b", clause,
+            ):
+                continue
+            location = re.search(
+                r"\b(?:from|at|in|based in)\s+(?:(?:our|the|an?)\s+)?([^.;!?|]+)", clause,
+            )
+            locations.append(location[1].strip() if location else job.location_text)
+        return locations
 
     def _allowed_onsite(self, job: JobRecord) -> bool:
         location = self._geo_text(job.location_text or "")
@@ -347,9 +399,21 @@ class RuleEngine:
             text,
         ):
             if self._target_residency(match[1]):
-                blockers.append(match[0].strip())
+                if asserted_phrase_hits(text, [match[0]], required=True):
+                    blockers.append(match[0].strip())
+                else:
+                    risks.append("geography:candidate_exclusion_unconfirmed")
 
-        for clause in re.split(r"[.;!\n|]+", text):
+        for clause in assertion_clauses(text):
+            for match in _REGION_EXCLUSION.finditer(clause):
+                if self._target_residency(match["location"]):
+                    if re.search(
+                        r"\?|\b(?:if|unless|might|may|could|possibly|sponsorship|"
+                        r"citizenship|passport|visa|work (?:authorization|permit))\b", clause,
+                    ):
+                        risks.append("geography:candidate_exclusion_unconfirmed")
+                    else:
+                        blockers.append(match[0].rstrip(".;!? "))
             for match in _candidate_exclusion_matches(clause):
                 if not self._target_residency(match["location"]):
                     continue
@@ -380,6 +444,16 @@ class RuleEngine:
             elif not self._allowed_onsite(job):
                 blockers.append(f"onsite:{job.location_text}")
 
+        if self.rules.onsite_locations:
+            for location in self._mandatory_office_locations(job):
+                if self._onsite_location_unknown(location or ""):
+                    risks.append("geography:onsite_location_unknown")
+                elif not contains_any(
+                    self._geo_text(location or ""),
+                    [self._geo_text(city) for city in self.rules.onsite_locations],
+                ):
+                    blockers.append(f"onsite:{location}")
+
         if self.rules.recall_first and not blockers:
             location_info = " ".join(filter(None, [job.location_text, job.remote_text]))
             permitted = structured_eligibility or self._target_location(location_info) or any(
@@ -393,8 +467,13 @@ class RuleEngine:
         return sorted(set(blockers)), risks
 
     def _description_confirms_eligibility(self, job: JobRecord) -> bool:
-        for clause in re.split(r"[.;!\n|]+", eligibility_description(job)):
+        for clause in assertion_clauses(eligibility_description(job)):
             if _candidate_exclusion_matches(clause):
+                continue
+            if any(
+                self._target_residency(match["location"])
+                for match in _REGION_EXCLUSION.finditer(clause)
+            ):
                 continue
             if re.search(
                 r"\b(?:citizenship|citizens?|nationality|passport|visa|sponsorship|"
@@ -436,23 +515,26 @@ class RuleEngine:
             if asserted_phrase_hits(working_language, languages, required=True):
                 return [], []
             if contains_any(working_language, languages) or contains_any(
-                working_language, ["no", "not", "unspecified", "unknown", "tbd", "optional"]
-            ):
+                working_language, ["no", "not", "unspecified", "unknown", "tbd", "optional",
+                                   "unconfirmed", "uncertain", "might", "may", "could",
+                                   "possibly", "whether"]
+            ) or "?" in working_language:
                 return [], ["language:working_language_unconfirmed"]
             return [f"language:working_language:{working_language}"], []
         text = self._geo_text(text_blob)
-        explicit_work_language = re.search(
-            r"\bworking language\s*(?:(?:is|will be)\s*|:\s*)([^.;|]+)", text
-        )
-        if explicit_work_language and not contains_any(
-            explicit_work_language[1], languages + [
-                "no", "not", "optional", "preferred", "unspecified", "unknown", "tbd",
-            ]
-        ):
-            return [f"language:working_language:{explicit_work_language[1].strip()}"], []
+        clauses = assertion_clauses(text)
+        for clause in clauses:
+            explicit_work_language = re.search(
+                r"\bworking language\s*(?:(?:is|will be)\s*|:\s*)([^.;!?|]+)", clause
+            )
+            if explicit_work_language and not contains_any(
+                explicit_work_language[1], languages + [
+                    "no", "not", "optional", "preferred", "unspecified", "unknown", "tbd",
+                ]
+            ) and asserted_phrase_hits(clause, [explicit_work_language[1]], required=True):
+                return [f"language:working_language:{explicit_work_language[1].strip()}"], []
         for language in languages:
             token = re.escape(self._geo_text(language))
-            clauses = re.split(r"[.;!\n|]+", text)
             if any(re.search(
                 rf"\b(?:fluen\w*|proficien\w*|working language|business|native|"
                 rf"professional|spoken|written)\b[^.;|]{{0,30}}\b{token}\b|"

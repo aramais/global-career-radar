@@ -79,6 +79,8 @@ class JobIntakePipeline:
             "llm_cache_hits": 0,
             "llm_skipped": 0,
             "llm_batched": 0,
+            "llm_batch_pending": 0,
+            "llm_batch_errors": 0,
             "annotation_extraction_calls": 0,
             "annotation_review_calls": 0,
             "annotation_cache_hits": 0,
@@ -129,22 +131,35 @@ class JobIntakePipeline:
                         pending_groups.pop(job_uid, None)
                 except Exception as exc:
                     self._error(stats, "record_errors", record.original_url or record.title, exc)
+        self._finish_batches(pending_groups, stats, queue_alert=True)
+        self._dispatch_alerts(stats)
+        LOGGER.info("run_complete %s", json.dumps(stats, ensure_ascii=False))
+        return stats
+
+    def _finish_batches(
+        self,
+        pending_groups: dict[str, tuple[list[EvaluatedJob], dict[str, str], list[EvaluatedJob]]],
+        stats: dict[str, Any],
+        *,
+        queue_alert: bool,
+    ) -> None:
+        """Resolve pending evaluations identically for intake and saved-data runs."""
         pending_llm = [item for _, _, pending in pending_groups.values() for item in pending]
         if pending_llm:
             try:
                 self.batch_reranker.rerank_many(pending_llm)
                 stats["llm_batched"] += len(pending_llm)
+                batch_stats = getattr(self.batch_reranker, "last_stats", {})
+                stats["llm_batch_pending"] += batch_stats.get("pending", 0)
+                stats["llm_batch_errors"] += batch_stats.get("errors", 0)
             except Exception as exc:
                 self._error(stats, "record_errors", "batch reranking", exc)
             for items, keys, _ in pending_groups.values():
                 try:
                     self._finalize(items)
-                    self._save(items, keys, observed=False, queue_alert=True)
+                    self._save(items, keys, observed=False, queue_alert=queue_alert)
                 except Exception as exc:
                     self._error(stats, "record_errors", items[0].record.title, exc)
-        self._dispatch_alerts(stats)
-        LOGGER.info("run_complete %s", json.dumps(stats, ensure_ascii=False))
-        return stats
 
     def _cache_key(self, record: JobRecord, stream: SearchStream) -> str:
         prompt = self.reranker.prompt_template
@@ -171,6 +186,10 @@ class JobIntakePipeline:
         with self.database.session() as session:
             repository = JobRepository(session)
             saved = repository.find_by_record(record)
+            cached_evaluations = (
+                repository.profile_evaluations_for_job(saved.job_uid)
+                if saved is not None and use_llm and self.config.llm.enabled else {}
+            )
             if saved is not None and not record.annotation:
                 record.annotation = saved.annotation or {}
             before = dict(self.annotator.stats)
@@ -198,7 +217,7 @@ class JobIntakePipeline:
                 ):
                     key = self._cache_key(record, stream)
                     keys[stream.id] = key
-                    cached = repository.find_profile_evaluation(record, stream.id)
+                    cached = cached_evaluations.get(stream.id)
                     if (
                         cached is not None
                         and cached.semantic_score is not None
@@ -310,6 +329,7 @@ class JobIntakePipeline:
     def reevaluate_saved(self, *, use_ai: bool = False, limit: int | None = None) -> dict[str, Any]:
         """Apply profiles to saved data; AI is explicit opt-in, notifications stay disabled."""
         stats = self._stats()
+        pending_groups = {}
         with self.database.session() as session:
             jobs = JobRepository(session).list_jobs(limit=limit, archived=False)
             records = [
@@ -336,12 +356,16 @@ class JobIntakePipeline:
             ]
         for record in records:
             try:
-                items, keys, _ = self._evaluate_record(record, stats, use_llm=use_ai)
+                items, keys, pending = self._evaluate_record(record, stats, use_llm=use_ai)
                 self._save(items, keys, observed=False, queue_alert=False)
                 stats["persisted"] += 1
                 stats["evaluations"] += len(items)
+                if pending:
+                    job_uid = self.deduplicator.build_identity(record).job_uid
+                    pending_groups[job_uid] = (items, keys, pending)
             except Exception as exc:
                 self._error(stats, "record_errors", record.title, exc)
+        self._finish_batches(pending_groups, stats, queue_alert=False)
         return stats
 
     def send_daily_digest(self, hours: int = 24) -> str:

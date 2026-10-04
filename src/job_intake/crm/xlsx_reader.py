@@ -22,11 +22,27 @@ MAX_XML_BYTES = 8 * 1024 * 1024
 MAX_MEMBERS = 512
 MAX_CELLS = 100_000
 MAX_ROWS = 10_000
+MAX_SHEETS = 64
+MAX_CELL_WORK = 3 * MAX_CELLS
 CELL_RE = re.compile(r"^([A-Z]{1,3})([1-9][0-9]{0,6})$")
 
 
 class WorkbookError(ValueError):
     """A workbook cannot be safely read or does not match supported OOXML."""
+
+
+@dataclass
+class _ReadBudget:
+    cells: int = 0
+    work: int = 0
+
+    def reserve(self, *, cells: int = 0, work: int = 0) -> None:
+        if self.cells + cells > MAX_CELLS:
+            raise WorkbookError("Workbook contains too many materialized cells")
+        if self.work + work > MAX_CELL_WORK:
+            raise WorkbookError("Workbook exceeds the cell processing budget")
+        self.cells += cells
+        self.work += work
 
 
 @dataclass(frozen=True)
@@ -141,18 +157,16 @@ def _cell_coordinates(reference: str) -> tuple[str, int]:
 
 
 def _read_sheet(
-    archive: ZipFile, name: str, path: str, shared_strings: list[str], warnings: list[str]
+    archive: ZipFile, name: str, path: str, shared_strings: list[str], warnings: list[str],
+    budget: _ReadBudget,
 ) -> Sheet:
     doc = _xml(archive, path)
     if doc.tag != _tag("worksheet"):
         raise WorkbookError(f"Unsupported worksheet format: {name}")
     rows: dict[int, dict[str, Cell]] = {}
-    count = 0
     for row in doc.findall(f"{_tag('sheetData')}/{_tag('row')}"):
         for item in row.findall(_tag("c")):
-            count += 1
-            if count > MAX_CELLS:
-                raise WorkbookError(f"Worksheet contains too many cells: {name}")
+            budget.reserve(cells=1, work=1)
             column, number = _cell_coordinates(item.get("r", ""))
             if number > MAX_ROWS:
                 raise WorkbookError(f"Worksheet row limit exceeded: {name}")
@@ -181,6 +195,13 @@ def _read_sheet(
         last_column, last = _cell_coordinates(end or start)
         if column != last_column or last < first or last > MAX_ROWS:
             raise WorkbookError(f"Unsupported hyperlink range: {name}")
+        # Bound both passes before iterating the range. Overlapping links still
+        # consume work, even when they add no new cells.
+        budget.reserve(work=2 * (last - first + 1))
+        missing = sum(
+            column not in rows.get(number, {}) for number in range(first, last + 1)
+        )
+        budget.reserve(cells=missing)
         for number in range(first, last + 1):
             cells = rows.setdefault(number, {})
             cell = cells.get(column, Cell(""))
@@ -234,7 +255,12 @@ def read_workbook(path: Path | str) -> Workbook:
             warnings: list[str] = []
             sheets: list[Sheet] = []
             sheet_names: set[str] = set()
-            for item in workbook.findall(f"{_tag('sheets')}/{_tag('sheet')}"):
+            sheet_parts: set[str] = set()
+            budget = _ReadBudget()
+            sheet_nodes = workbook.findall(f"{_tag('sheets')}/{_tag('sheet')}")
+            if len(sheet_nodes) > MAX_SHEETS:
+                raise WorkbookError("Workbook contains too many worksheets")
+            for item in sheet_nodes:
                 name = item.get("name", "")
                 if not name or name in sheet_names:
                     raise WorkbookError("Duplicate or missing worksheet name")
@@ -245,13 +271,18 @@ def read_workbook(path: Path | str) -> Workbook:
                 target, mode, kind = relation
                 if mode != "Internal" or not kind.endswith("/worksheet"):
                     raise WorkbookError(f"Unsupported worksheet relationship: {name}")
+                sheet_path = _part_target("xl/workbook.xml", target)
+                if sheet_path in sheet_parts:
+                    raise WorkbookError("Duplicate worksheet relationship target")
+                sheet_parts.add(sheet_path)
                 sheets.append(
                     _read_sheet(
                         archive,
                         name,
-                        _part_target("xl/workbook.xml", target),
+                        sheet_path,
                         shared_strings,
                         warnings,
+                        budget,
                     )
                 )
             return Workbook(sheets=tuple(sheets), warnings=tuple(warnings))

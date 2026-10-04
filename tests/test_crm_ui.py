@@ -15,7 +15,8 @@ def test_crm_page_is_self_contained_and_uses_persistent_api() -> None:
     assert '<html lang="ru">' in page
     assert 'src="http' not in page
     assert 'href="http' not in page
-    assert "'/api/state'" in page
+    assert "'/api/state?include_jobs=false'" in page
+    assert "return '/api/state?' + query.toString()" in page
     assert "'/api/applications/'" in page
     assert "headers['X-CSRF-Token']" in page
     assert "payload.expected_version = app.version" in page
@@ -34,7 +35,7 @@ def test_import_ui_requires_preview_of_the_same_file() -> None:
     assert "Исходный файл останется без изменений" in page
 
 
-def _run_javascript(expression: str) -> object:
+def _run_javascript(expression: str, *, await_result: bool = False) -> object:
     node = shutil.which("node")
     bundled = Path(
         "/Users/admin/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node"
@@ -53,8 +54,16 @@ def _run_javascript(expression: str) -> object:
         "const context=vm.createContext({URL,URLSearchParams,document:{"
         "getElementById:()=>({value:''})}});"
         f"vm.runInContext({json.dumps(helpers)},context);"
-        f"process.stdout.write(JSON.stringify(vm.runInContext({json.dumps(expression)},context)));"
     )
+    evaluation = f"vm.runInContext({json.dumps(expression)},context)"
+    if await_result:
+        harness += (
+            f"Promise.resolve({evaluation}).then(result=>"
+            "process.stdout.write(JSON.stringify(result))).catch(error=>"
+            "{console.error(error);process.exitCode=1;});"
+        )
+    else:
+        harness += f"process.stdout.write(JSON.stringify({evaluation}));"
     result = subprocess.run([node, "-e", harness], check=True, capture_output=True, text=True)
     return json.loads(result.stdout)
 

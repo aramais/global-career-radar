@@ -467,3 +467,160 @@ def test_conditional_or_benefit_exclusion_is_reviewed_instead_of_blanket_country
     assert result.decision == FilterDecision.REVIEW
     assert result.blocker_signals == []
     assert "geography:candidate_exclusion_unconfirmed" in result.risks
+
+
+@pytest.mark.parametrize("boundary", ["\n", "\r\n", "; ", ". "])
+def test_unrelated_negation_cannot_cross_source_clause_boundary(boundary: str) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Brazil", remote_text="Remote",
+        source_metadata={"working_language": "English"},
+        description_clean=f"No sponsorship provided{boundary}US work authorization required",
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REJECT
+    assert result.blocker_signals == ["phrase_blocker:us work authorization required"]
+
+
+@pytest.mark.parametrize("statement", [
+    "Must be authorized to work in the U.S.",
+    "You must be authorized to work in the U.S. before joining.",
+    "Applicants must be authorized to work in the U.K. for this role.",
+])
+def test_dotted_country_abbreviation_does_not_hide_work_authorization(statement: str) -> None:
+    rules = replace(broad_rules(), blocker_phrases=[
+        "authorized to work in the u.s.", "authorized to work in the u.k.",
+    ])
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Brazil", remote_text="Remote",
+        source_metadata={"working_language": "English"}, description_clean=statement,
+    )
+    assert RuleEngine(rules).evaluate(job).decision == FilterDecision.REJECT
+
+
+@pytest.mark.parametrize("statement", [
+    "The working language is Portuguese?",
+    "Is the working language: Portuguese?",
+    "It is not confirmed that the working language is Portuguese.",
+    "The working language is possibly Portuguese.",
+])
+def test_question_or_uncertain_other_language_remains_reviewable(statement: str) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Brazil", remote_text="Remote",
+        description_clean=statement,
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.blocker_signals == []
+    assert "language:working_language_unconfirmed" in result.risks
+
+
+@pytest.mark.parametrize("remote", [
+    "Remote or hybrid", "Hybrid or remote", "Remote / On-site", "On-site / remote",
+    "Remote; no on-site work required", "Remote; hybrid is optional",
+    "Remote; optional in-office work", "Remote; office-based work is not required",
+])
+def test_optional_or_negated_office_does_not_require_unapproved_office(remote: str) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Rio de Janeiro, Brazil",
+        remote_text=remote, source_metadata={"working_language": "English"},
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.PASS
+    assert result.blocker_signals == []
+
+
+@pytest.mark.parametrize("location", [
+    "Worldwide except Brazil", "LATAM excluding Brazil", "Worldwide but not Brazil",
+    "Anywhere other than Brazil", "Worldwide with the exception of Brazil",
+    "Worldwide, not including Brazil",
+])
+@pytest.mark.parametrize("field", ["location_text", "description_clean"])
+def test_explicit_region_exception_overrides_broad_remote_eligibility(
+    location: str, field: str,
+) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", remote_text="Remote",
+        source_metadata={"working_language": "English"}, **{field: location},
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REJECT
+    assert any(signal.startswith("geo_blocker:") for signal in result.blocker_signals)
+
+
+def test_non_target_exception_does_not_exclude_brazil() -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Worldwide except Germany",
+        remote_text="Remote", source_metadata={"working_language": "English"},
+    )
+    assert RuleEngine(broad_rules()).evaluate(job).decision == FilterDecision.PASS
+
+
+@pytest.mark.parametrize("description", [
+    "This role requires hybrid work from our London office.",
+    "Candidates must work on-site in Berlin.",
+    "Hybrid work is required at our Lisbon office for this role.",
+])
+def test_direct_office_requirement_overrides_generic_remote_metadata(description: str) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Worldwide", remote_text="Remote",
+        source_metadata={"working_language": "English"}, description_clean=description,
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REJECT
+    assert any(signal.startswith("geo_blocker:onsite:") for signal in result.blocker_signals)
+
+
+def test_direct_office_requirement_without_office_location_is_reviewed() -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Worldwide", remote_text="Remote",
+        source_metadata={"working_language": "English"},
+        description_clean="This role requires hybrid work.",
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.blocker_signals == []
+    assert "geography:onsite_location_unknown" in result.risks
+
+
+@pytest.mark.parametrize("description", [
+    "About us\nOur employees must work hybrid from our London office.",
+    "Our employees must work hybrid from our London office.",
+    "This role does not require hybrid work from our London office.",
+    "This role requires remote or hybrid work from our London office.",
+])
+def test_background_or_optional_prose_office_policy_cannot_reject_remote_role(
+    description: str,
+) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Brazil", remote_text="Remote",
+        source_metadata={"working_language": "English"}, description_clean=description,
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.PASS
+    assert result.blocker_signals == []
+
+
+@pytest.mark.parametrize("description", [
+    "We cannot hire in Brazil?",
+    "It is not confirmed that we cannot hire in Brazil.",
+    "Worldwide except Brazil?",
+])
+def test_unconfirmed_country_exclusion_cannot_be_a_hard_blocker(description: str) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Brazil", remote_text="Remote",
+        source_metadata={"working_language": "English"}, description_clean=description,
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.blocker_signals == []
+    assert "geography:candidate_exclusion_unconfirmed" in result.risks

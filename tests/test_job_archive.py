@@ -80,7 +80,7 @@ def test_bulk_archive_and_restore_only_selected_jobs(service):
     assert [row["job_uid"] for row in result["jobs"]] == selected
     assert all(row["archived"] and row["archive_version"] == 2 for row in result["jobs"])
     assert [row["job_uid"] for row in service.state({})["jobs"]] == [remaining]
-    assert service.state({})["applications"] == [before]
+    assert service.application(before["id"]) == before
     with service.database.session() as session:
         assert all(row.status == "cancelled" for row in session.scalars(select(AlertOutboxORM)))
         assert len(list(session.scalars(select(JobEventORM).where(
@@ -165,7 +165,7 @@ def test_archive_restore_filters_and_preserves_evidence_scores_and_crm(service):
     assert service.state({"job_archive": "active"})["jobs"] == []
     assert [job["job_uid"] for job in service.state({"job_archive": "archived"})["jobs"]] == [uid]
     assert [job["job_uid"] for job in service.state({"job_archive": "all"})["jobs"]] == [uid]
-    assert service.state({})["applications"] == [saved_app]
+    assert service.application(saved_app["id"]) == saved_app
     with service.database.session() as session:
         job = session.scalar(select(JobORM).where(JobORM.job_uid == uid))
         assert (job.content_hash, job.status, job.fit_score, job.tier,

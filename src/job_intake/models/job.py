@@ -43,6 +43,11 @@ class JobRecord:
     status: JobStatus = JobStatus.OPEN
     source_metadata: dict[str, Any] = field(default_factory=dict)
     annotation: dict[str, Any] = field(default_factory=dict)
+    # Derived text units are local to this record, never persisted or hashed as source.
+    # The parser validates its immutable input key before reusing this cache.
+    _text_units_cache: tuple[Any, ...] | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
 
 
 @dataclass(slots=True)

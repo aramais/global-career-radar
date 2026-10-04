@@ -9,7 +9,7 @@ from datetime import UTC, date, datetime, time
 from typing import Any
 
 from sqlalchemy import or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.orm.exc import StaleDataError
 
 from job_intake.crm.models import (
@@ -37,6 +37,8 @@ from job_intake.crm.schemas import (
 )
 from job_intake.storage.models import JobORM, utcnow
 
+_UNSET = object()
+
 
 def _iso(value: datetime | date | None) -> str | None:
     if isinstance(value, datetime) and value.tzinfo is None:
@@ -62,7 +64,9 @@ def _optional_text(value: object, field: str, maximum: int = 500) -> str | None:
     return None if value is None else text_value(value, field, maximum=maximum) or None
 
 
-def _check_version(item: ApplicationORM | ContactORM, expected_version: int | None) -> None:
+def _check_version(
+    item: ApplicationORM | ContactORM | CompanyORM, expected_version: int | None
+) -> None:
     if expected_version is not None:
         if isinstance(expected_version, bool) or not isinstance(expected_version, int):
             raise CRMValidationError("expected_version must be an integer")
@@ -92,6 +96,7 @@ def serialize_company(company: CompanyORM) -> dict[str, Any]:
         "name": company.name,
         "url": company.url,
         "notes": company.notes,
+        "version": company.version,
         "source_key": company.source_key,
         "source_metadata": company.source_metadata,
         "created_at": _iso(company.created_at),
@@ -350,17 +355,47 @@ class CRMRepository:
         application_id: int,
         stage: str,
         *,
-        occurred_at: object = None,
-        note: str = "",
+        occurred_at: object = _UNSET,
+        note: object = _UNSET,
         expected_version: int | None = None,
     ) -> ApplicationORM:
         item = self._application(application_id)
         _check_version(item, expected_version)
         stage = enum_value(stage, "stage", STAGES)
-        occurred_at = datetime_value(occurred_at, "occurred_at")
-        note = text_value(note, "note")
+        if occurred_at is not _UNSET:
+            occurred_at = datetime_value(occurred_at, "occurred_at")
+        if note is not _UNSET:
+            note = text_value(note, "note")
         if item.stage == stage:
+            # Correct the most recent occurrence, without inventing a transition.
+            event = next(
+                (event for event in reversed(item.history) if event.to_stage == stage), None,
+            )
+            if occurred_at is _UNSET and note is _UNSET:
+                return item
+            previous_date = datetime_value(event.occurred_at, "occurred_at") if event else None
+            occurred_at = previous_date if occurred_at is _UNSET else occurred_at
+            note = (event.note if event else "") if note is _UNSET else note
+            if event is None:
+                item.history.append(StageEventORM(
+                    from_stage=None, to_stage=stage, occurred_at=occurred_at, note=note,
+                ))
+            elif previous_date == occurred_at and event.note == note:
+                return item
+            else:
+                event.occurred_at = occurred_at
+                event.note = note
+            # Keep the application date consistent when it came from this event.
+            if stage == "applied" and (
+                item.applied_at is None
+                or datetime_value(item.applied_at, "applied_at") == previous_date
+            ):
+                item.applied_at = occurred_at
+            item.version += 1
+            self._flush()
             return item
+        occurred_at = None if occurred_at is _UNSET else occurred_at
+        note = "" if note is _UNSET else note
         item.history.append(
             StageEventORM(
                 from_stage=item.stage,
@@ -384,7 +419,10 @@ class CRMRepository:
         query: str | None = None,
         due_before: object = None,
     ) -> list[ApplicationORM]:
-        statement = select(ApplicationORM)
+        statement = select(ApplicationORM).options(
+            selectinload(ApplicationORM.history),
+            selectinload(ApplicationORM.contact_links).selectinload(ApplicationContactORM.contact),
+        )
         if stage:
             statement = statement.where(ApplicationORM.stage == enum_value(stage, "stage", STAGES))
         if channel:
@@ -646,10 +684,13 @@ class CRMRepository:
         self._flush()
         return item
 
-    def update_company(self, company_id: int, **fields: Any) -> CompanyORM:
+    def update_company(
+        self, company_id: int, *, expected_version: int | None = None, **fields: Any
+    ) -> CompanyORM:
         item = self.session.get(CompanyORM, company_id)
         if item is None:
             raise CRMValidationError("Company not found")
+        _check_version(item, expected_version)
         if set(fields) - {"name", "url", "notes"}:
             raise CRMValidationError("Unknown company fields")
         for name, value in fields.items():
@@ -683,6 +724,11 @@ class CRMRepository:
         return list(
             self.session.scalars(
                 select(ApplicationORM)
+                .options(
+                    selectinload(ApplicationORM.history),
+                    selectinload(ApplicationORM.contact_links)
+                    .selectinload(ApplicationContactORM.contact),
+                )
                 .where(
                     ApplicationORM.next_action_due <= deadline,
                     ApplicationORM.next_action != "",

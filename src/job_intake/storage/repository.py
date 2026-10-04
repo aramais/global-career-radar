@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, case, delete, func, literal, or_, select, update
+from sqlalchemy.orm import aliased, selectinload
 
 from job_intake.alerts.digest import DigestJob
 from job_intake.models.job import EvaluatedJob, JobRecord, JobTier
@@ -18,6 +19,8 @@ from job_intake.storage.models import (
     JobORM,
     JobProfileEvaluationORM,
 )
+from job_intake.storage.queries import ranked_profile_evaluations
+from job_intake.utils.csv import spreadsheet_safe_value
 
 
 @dataclass(slots=True)
@@ -262,6 +265,13 @@ class JobRepository:
             )
         )
 
+    def profile_evaluations_for_job(self, job_uid: str) -> dict[str, JobProfileEvaluationORM]:
+        return {
+            row.profile_id: row for row in self.session.scalars(
+                select(JobProfileEvaluationORM).where(JobProfileEvaluationORM.job_uid == job_uid)
+            )
+        }
+
     def _dedup_window_elapsed(self, last_alerted_at: datetime | None, now: datetime) -> bool:
         """True when enough time has passed since the last alert to alert again."""
         if self.alert_dedup_hours <= 0 or last_alerted_at is None:
@@ -302,7 +312,7 @@ class JobRepository:
         if active_profile_versions is None:
             return list(self.session.scalars(stmt.where(JobORM.tier.in_(["A", "B"]))))
         jobs = []
-        for job in self.session.scalars(stmt):
+        for job in self.session.scalars(stmt.options(selectinload(JobORM.profile_evaluations))):
             profiles = [
                 p
                 for p in job.profile_evaluations
@@ -343,7 +353,9 @@ class JobRepository:
     def list_jobs(
         self, limit: int | None = 100, tier: str | None = None, *, archived: bool | None = None,
     ) -> list[JobORM]:
-        stmt = select(JobORM).order_by(JobORM.updated_at.desc(), JobORM.job_uid)
+        stmt = select(JobORM).options(selectinload(JobORM.profile_evaluations)).order_by(
+            JobORM.updated_at.desc(), JobORM.job_uid
+        )
         if archived is not None:
             stmt = stmt.where(
                 JobORM.archived_at.is_not(None) if archived else JobORM.archived_at.is_(None)
@@ -402,19 +414,30 @@ class JobRepository:
     def prune_low_tier(self, older_than_days: int, tiers: tuple[str, ...] = ("C",)) -> int:
         """Delete low-tier jobs not seen for ``older_than_days`` days.
 
-        Uses ORM ``session.delete`` so the events/feedback cascade fires. Returns the
-        number of job rows removed.
+        Delete dependencies in batches. Database SET NULL keeps CRM applications
+        and their history; no source relationship is traversed for each job.
         """
+        # Sessions disable autoflush. Preserve pending CRM edits before refreshing
+        # objects affected by database-level SET NULL and bulk deletes.
+        self.session.flush()
         cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
-        stmt = select(JobORM).where(
+        conditions = (
             JobORM.last_seen_at < cutoff,
             JobORM.tier.in_(list(tiers)),
             JobORM.archived_at.is_(None),
         )
-        rows = list(self.session.scalars(stmt))
-        for row in rows:
-            self.session.delete(row)
-        return len(rows)
+        targets = select(JobORM.job_uid).where(*conditions)
+        for model in (JobEventORM, FeedbackORM, JobProfileEvaluationORM, AlertOutboxORM):
+            self.session.execute(
+                delete(model).where(model.job_uid.in_(targets))
+                .execution_options(synchronize_session="fetch")
+            )
+        result = self.session.execute(
+            delete(JobORM).where(*conditions).execution_options(synchronize_session="fetch")
+        )
+        # Loaded applications may still hold the source UID that the database unlinked.
+        self.session.expire_all()
+        return result.rowcount
 
     def export_shortlisted_csv(
         self,
@@ -428,8 +451,40 @@ class JobRepository:
     ) -> Path:
         # Resolve active evaluations before filtering/limiting: the saved aggregate
         # may belong to a disabled profile or criteria that have since changed.
+        if type(limit) is not int or limit < 0:
+            raise ValueError("limit must be a nonnegative integer")
+        ranked = ranked_profile_evaluations(active_profile_versions, profile_id)
+        selected_evaluation = aliased(JobProfileEvaluationORM, ranked)
+        current_sql = (
+            selected_evaluation.id.is_not(None)
+            if active_profile_versions is not None else literal(True)
+        )
+        tier_sql = func.coalesce(selected_evaluation.tier, JobORM.tier)
+        score_sql = func.coalesce(selected_evaluation.fit_score, JobORM.fit_score)
+        decision_sql = func.coalesce(selected_evaluation.decision, JobORM.filter_decision)
+        query = (
+            select(JobORM, selected_evaluation)
+            .outerjoin(ranked, and_(
+                ranked.c.job_uid == JobORM.job_uid, ranked.c.evaluation_rank == 1,
+            ))
+            .where(JobORM.archived_at.is_(None))
+            .options(selectinload(JobORM.profile_evaluations))
+        )
+        if profile_id:
+            query = query.where(selected_evaluation.id.is_not(None))
+        if not include_rejected:
+            query = query.where(or_(~current_sql, decision_sql != "reject"))
+        if not wide:
+            query = query.where(current_sql, tier_sql.in_(("A", "B")))
+        query = query.order_by(
+            case((~current_sql, 3), else_=case(
+                {"A": 0, "B": 1, "C": 2}, value=tier_sql, else_=3,
+            )),
+            case((current_sql, score_sql), else_=0).desc(),
+            JobORM.last_seen_at.desc(), JobORM.job_uid,
+        ).limit(limit)
         entries = []
-        for row in self.list_jobs(limit=None, archived=False):
+        for row, selected in self.session.execute(query):
             profiles = [
                 p
                 for p in row.profile_evaluations
@@ -449,29 +504,9 @@ class JobRepository:
                     p.profile_id,
                 )
             )
-            selected = (
-                next((p for p in profiles if p.profile_id == profile_id), None)
-                if profile_id
-                else next(iter(profiles), None)
-            )
-            if profile_id and selected is None:
-                continue
             current = selected is not None or active_profile_versions is None
             evaluation = selected or row
-            decision = selected.decision if selected else row.filter_decision
-            if current and decision == "reject" and not include_rejected:
-                continue
-            if not wide and (not current or evaluation.tier not in ("A", "B")):
-                continue
             entries.append((row, profiles, selected, evaluation, current))
-        entries.sort(
-            key=lambda entry: (
-                {"A": 0, "B": 1, "C": 2}[entry[3].tier] if entry[4] else 3,
-                -entry[3].fit_score if entry[4] else 0,
-                -entry[0].last_seen_at.timestamp(),
-                entry[0].job_uid,
-            )
-        )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
@@ -501,9 +536,8 @@ class JobRepository:
                 ],
             )
             writer.writeheader()
-            for row, profiles, selected, evaluation, current in entries[:limit]:
-                writer.writerow(
-                    {
+            for row, profiles, selected, evaluation, current in entries:
+                values = {
                         "job_uid": row.job_uid,
                         "company": row.company,
                         "title": row.title,
@@ -548,5 +582,7 @@ class JobRepository:
                         "description": row.description_clean or row.description_raw,
                         "evaluation_state": "current" if current else "needs_reevaluation",
                     }
-                )
+                writer.writerow({
+                    key: spreadsheet_safe_value(value) for key, value in values.items()
+                })
         return output_path

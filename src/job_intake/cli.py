@@ -51,11 +51,18 @@ def run(config: str = typer.Option("config/settings.yaml", help="Path to app con
     typer.echo(
         f"Run completed: ingested={result['ingested']} persisted={result['persisted']} "
         f"evaluations={result['evaluations']} alerts={result['alerts']} "
-        f"source_errors={result['source_errors']} record_errors={result['record_errors']}"
+        f"source_errors={result['source_errors']} record_errors={result['record_errors']} "
+        f"annotation_errors={result['annotation_errors']} "
+        f"llm_batch_pending={result.get('llm_batch_pending', 0)} "
+        f"llm_batch_errors={result.get('llm_batch_errors', 0)}"
     )
     for error in result["errors"]:
         typer.echo(error, err=True)
-    if result["source_errors"] or result["record_errors"] or result["alert_errors"]:
+    if (
+        result["source_errors"] or result["record_errors"] or result["alert_errors"]
+        or result["annotation_errors"]
+        or result.get("llm_batch_pending") or result.get("llm_batch_errors")
+    ):
         raise typer.Exit(code=1)
 
 
@@ -136,11 +143,13 @@ def reevaluate(config: str = typer.Option("config/settings.yaml", help="App conf
     """Re-score saved vacancies offline without fetching, AI calls or notifications."""
     result = build_pipeline(config).reevaluate_saved()
     typer.echo(
-        f"Reevaluated {result['persisted']} jobs, {result['evaluations']} profile evaluations"
+        f"Reevaluated {result['persisted']} jobs, {result['evaluations']} profile evaluations. "
+        f"llm_batch_pending={result.get('llm_batch_pending', 0)} "
+        f"llm_batch_errors={result.get('llm_batch_errors', 0)}"
     )
     for error in result["errors"]:
         typer.echo(error, err=True)
-    if result["record_errors"]:
+    if result["record_errors"] or result.get("llm_batch_pending") or result.get("llm_batch_errors"):
         raise typer.Exit(code=1)
 
 
@@ -246,11 +255,16 @@ def annotate(
         f"Annotated {result['persisted']} jobs, {result['evaluations']} profile evaluations. "
         f"Extraction calls={result['annotation_extraction_calls']}, "
         f"review calls={result['annotation_review_calls']}, "
-        f"cache hits={result['annotation_cache_hits']}, errors={result['annotation_errors']}"
+        f"cache hits={result['annotation_cache_hits']}, errors={result['annotation_errors']}. "
+        f"llm_batch_pending={result.get('llm_batch_pending', 0)}, "
+        f"llm_batch_errors={result.get('llm_batch_errors', 0)}"
     )
     for error in result["errors"]:
         typer.echo(error, err=True)
-    if result["record_errors"] or result["annotation_errors"]:
+    if (
+        result["record_errors"] or result["annotation_errors"]
+        or result.get("llm_batch_pending") or result.get("llm_batch_errors")
+    ):
         raise typer.Exit(code=1)
 
 

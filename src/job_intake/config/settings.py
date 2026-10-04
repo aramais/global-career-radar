@@ -51,6 +51,7 @@ class LLMConfig:
     batch_completion_window: str = "24h"
     batch_poll_interval: float = 30.0
     batch_max_wait: float = 86400.0
+    batch_state_dir: str = "data/local/llm-batches"
 
 
 @dataclass(slots=True)
@@ -370,6 +371,12 @@ def load_app_config(path: str | Path) -> AppConfig:
             "prompt_path": str(
                 (
                     config_path.parent.parent / llm_raw.get("prompt_path", "config/llm_prompt.txt")
+                ).resolve()
+            ),
+            "batch_state_dir": str(
+                (
+                    config_path.parent.parent
+                    / llm_raw.get("batch_state_dir", "data/local/llm-batches")
                 ).resolve()
             ),
         }

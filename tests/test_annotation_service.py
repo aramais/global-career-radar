@@ -148,6 +148,47 @@ def write_cache(annotator, job, stages, **changes):
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
+def test_interrupted_review_resumes_extraction_from_small_chunk_checkpoint(config):
+    first, fake = annotator_with_fake(config)
+    job = record()
+    original = fake.generate
+
+    def interrupted(model, prompt):
+        if model == config.review_model:
+            raise KeyboardInterrupt("simulated process interruption")
+        return original(model, prompt)
+
+    fake.generate = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        first.annotate(job, use_ai=True)
+    assert not cache_path(first, job).exists()
+    second, retried = annotator_with_fake(config)
+    result = second.annotate(record(), use_ai=True)
+    assert result["status"] == "reviewed"
+    assert [stage for stage, _ in retried.calls] == ["review"]
+    assert {row["stage"] for row in result["usage"]} == {"extract", "review"}
+
+
+def test_checkpoint_write_volume_is_bounded_by_source_size(config, monkeypatch):
+    annotator, _ = annotator_with_fake(config, extractor=lambda _: [])
+    sizes = []
+    full_writes = []
+
+    def capture(path, payload):
+        sizes.append(len(json.dumps(payload).encode()))
+        if "units" in payload:
+            full_writes.append(path)
+
+    monkeypatch.setattr(annotator, "_write", capture)
+    description = "Requirements:\n" + "An explicit source sentence.\n" * 1500
+    result = annotator.annotate(record(description_clean=description), use_ai=True)
+    assert result["coverage"]["chunks"] > 20
+    assert result["status"] == "reviewed"
+    assert len(full_writes) == 1
+    # Complete annotation plus small chunk checkpoints, not N copies of the source.
+    assert sum(sizes) < len(json.dumps(result).encode()) * 4
+
+
 def test_default_annotation_never_calls_ai_even_when_key_and_ai_setting_are_present(config):
     annotator = VacancyAnnotator(config)
     job = record()

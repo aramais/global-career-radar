@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -225,9 +226,54 @@ class VacancyAnnotator:
     @staticmethod
     def _write(path: Path, annotation: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(annotation, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        # Separate temporary names also make independent workers' checkpoints atomic.
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".",
+                suffix=".tmp", delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                json.dump(annotation, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _checkpoint_stage(self, path: Path, annotation: dict, chunk_id: str) -> None:
+        """Save only this chunk between API calls; write the full result once at the end."""
+        self._write(path.parent / (path.stem + ".stages") / (chunk_id + ".json"), {
+            "cache_key": annotation["cache_key"], "source_hash": annotation["source_hash"],
+            "chunk_id": chunk_id, "stage": annotation["stages"][chunk_id],
+            "usage": [row for row in annotation["usage"] if row.get("chunk_id") == chunk_id],
+        })
+
+    @staticmethod
+    def _load_stage_checkpoint(path: Path, annotation: dict, chunk_id: str) -> None:
+        checkpoint = path.parent / (path.stem + ".stages") / (chunk_id + ".json")
+        if not checkpoint.is_file():
+            return
+        try:
+            cached = json.loads(checkpoint.read_text(encoding="utf-8"))
+            if (
+                not isinstance(cached, dict)
+                or cached.get("cache_key") != annotation["cache_key"]
+                or cached.get("source_hash") != annotation["source_hash"]
+                or cached.get("chunk_id") != chunk_id
+                or not isinstance(cached.get("stage"), dict)
+                or not isinstance(cached.get("usage"), list)
+                or not all(isinstance(row, dict) for row in cached["usage"])
+            ):
+                raise ValueError("Invalid chunk checkpoint")
+            # Stage envelopes are validated against this source/draft in the normal loop.
+            annotation["stages"][chunk_id] = cached["stage"]
+            annotation["usage"] = [
+                row for row in annotation["usage"] if row.get("chunk_id") != chunk_id
+            ] + cached["usage"]
+        except (OSError, TypeError, ValueError):
+            annotation["issues"].append(chunk_id + ": invalid checkpoint ignored")
 
     @staticmethod
     def _matches(annotation: object, record: JobRecord) -> bool:
@@ -450,6 +496,7 @@ class VacancyAnnotator:
         completed = 0
         for chunk in chunks:
             chunk_id = chunk["chunk_id"]
+            self._load_stage_checkpoint(path, annotation, chunk_id)
             chunk_units = [unit for unit in chunk["units"] if unit["text"].strip()]
             stage = annotation["stages"].setdefault(chunk_id, {})
             extraction_key = self._extraction_key(record, chunk)
@@ -507,7 +554,7 @@ class VacancyAnnotator:
                             **usage,
                         }
                     )
-                    self._write(path, annotation)
+                    self._checkpoint_stage(path, annotation, chunk_id)
                 else:
                     self.stats["cache_hits"] += 1
                 draft, bad = _drafts(stage["extraction"], source_id, chunk_units, chunk_id)
@@ -548,7 +595,7 @@ class VacancyAnnotator:
                             }
                     stage["review_key"] = review_key
                     stage["review_provenance"] = self._provenance("review")
-                    self._write(path, annotation)
+                    self._checkpoint_stage(path, annotation, chunk_id)
                 reviewed, bad = _reviewed(
                     draft, stage["review"], review_spec.provider, jev_options
                 )
@@ -575,7 +622,7 @@ class VacancyAnnotator:
                         rejected.extend(bad)
                     except (TypeError, ValueError):
                         stage.clear()
-                self._write(path, annotation)
+                self._checkpoint_stage(path, annotation, chunk_id)
         # A local field cannot bypass the independent reviewer in the AI path.
         by_id = {claim["claim_id"]: claim for claim in claims}
         annotation["claims"] = list(by_id.values())

@@ -18,12 +18,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.exc import StaleDataError
 
 from job_intake.config.settings import AppConfig, load_yaml_mapping
+from job_intake.crm.jobs import JOB_QUERY_FIELDS, job_detail, list_job_page
 from job_intake.crm.repository import CRMRepository, serialize_application
 from job_intake.crm.schemas import CRMConflictError
 from job_intake.profiles import load_streams
 from job_intake.storage.database import Database
 from job_intake.storage.models import JobORM
 from job_intake.storage.repository import JobArchiveConflictError, JobRepository
+from job_intake.utils.csv import spreadsheet_safe_value
 
 LOGGER = logging.getLogger(__name__)
 LOCAL_ZONE = ZoneInfo("America/Sao_Paulo")
@@ -183,8 +185,24 @@ def _contact(row) -> dict:
 
 def _company(row) -> dict:
     return {
-        key: getattr(row, key, None) for key in ("id", "name", "url", "notes", "source_metadata")
+        key: getattr(row, key, None) for key in ("id", "name", "url", "notes", "version")
     }
+
+
+def _application_summary(row) -> dict:
+    """Fields used by list cards; history/provenance are fetched on opening a card."""
+    result = {key: getattr(row, key) for key in (
+        "id", "job_uid", "company", "title", "url", "profile_id", "channel", "stage",
+        "referral_state", "next_action", "notes", "cv_version", "version", "original_status",
+    )}
+    for key in ("applied_at", "next_action_due", "created_at", "updated_at"):
+        value = getattr(row, key)
+        if isinstance(value, datetime) and value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        result[key] = value.isoformat() if value else None
+    result["contacts"] = [{"id": link.contact_id, "name": link.contact.name,
+                           "relationship": link.relationship} for link in row.contact_links]
+    return result
 
 
 def csv_export(applications: list[dict]) -> bytes:
@@ -213,12 +231,7 @@ def csv_export(applications: list[dict]) -> bytes:
         row = {key: app.get(key) for key in fields}
         row["contacts"] = json.dumps(app.get("contacts", []), ensure_ascii=False)
         row["history"] = json.dumps(app.get("history", []), ensure_ascii=False)
-        for key, value in row.items():
-            if isinstance(value, str) and (
-                value.lstrip().startswith(("=", "+", "-", "@"))
-                or value.startswith(("\t", "\r", "\n"))
-            ):
-                row[key] = "'" + value
+        row = {key: spreadsheet_safe_value(value) for key, value in row.items()}
         writer.writerow(row)
     return ("\ufeff" + handle.getvalue()).encode("utf-8")
 
@@ -241,7 +254,8 @@ class CRMService:
         raise RequestError("Выберите активный профиль поиска")
 
     def state(self, query: dict[str, str]) -> dict:
-        _fields(query, {"profile_id", "channel", "since", "until", "job_archive"})
+        _fields(query, {"profile_id", "channel", "since", "until"} | JOB_QUERY_FIELDS
+                | {"include_jobs", "include_entities"})
         archive_filter = query.get("job_archive") or "active"
         if archive_filter not in {"active", "archived", "all"}:
             raise RequestError("Неизвестный фильтр архива вакансий")
@@ -258,76 +272,26 @@ class CRMService:
         if channel and channel not in {item["value"] for item in OPTIONS["channels"]}:
             raise RequestError("Неизвестный канал отклика")
         versions = {stream.id: stream.version for stream in self.streams}
+        include_entities = query.get("include_entities", "true") == "true"
+        if query.get("include_entities", "true") not in {"true", "false"}:
+            raise RequestError("include_entities must be true or false")
         with self.database.session() as session:
             repo = CRMRepository(session)
-            apps = repo.list_applications(profile_id=profile, channel=channel)
-            applications = [serialize_application(app) for app in apps]
+            apps = (
+                repo.list_applications(profile_id=profile, channel=channel)
+                if include_entities else []
+            )
+            applications = [_application_summary(app) for app in apps]
             metrics = repo.funnel_metrics(
                 profile_id=profile, channel=channel, since=since, until=until
             )
-            jobs = []
-            for job in JobRepository(session).list_jobs(
-                limit=1000,
-                archived={"active": False, "archived": True, "all": None}[archive_filter],
-            ):
-                evaluations = [
-                    p
-                    for p in job.profile_evaluations
-                    if (
-                        versions.get(p.profile_id) == p.profile_version
-                        and p.content_hash == job.content_hash
-                    )
-                ]
-                evaluations.sort(
-                    key=lambda p: (
-                        {"A": 0, "B": 1, "C": 2}[p.tier],
-                        {"pass": 0, "review": 1, "reject": 2}[p.decision],
-                        -p.fit_score,
-                        p.profile_id,
-                    )
-                )
-                selected = next((p for p in evaluations if p.profile_id == profile), None)
-                best = selected or next(iter(evaluations), None)
-                jobs.append(
-                    {
-                        "job_uid": job.job_uid,
-                        "company": job.company,
-                        "title": job.title,
-                        "archived": job.archived_at is not None,
-                        "archived_at": (
-                            job.archived_at.replace(tzinfo=UTC).isoformat()
-                            if job.archived_at else None
-                        ),
-                        "archive_version": job.archive_version,
-                        "url": job.apply_url or job.original_url,
-                        "location": job.location_text,
-                        "remote": job.remote_text,
-                        "description": job.description_clean or job.description_raw,
-                        "annotation": {
-                            key: value for key, value in (job.annotation or {}).items()
-                            if key in {"version", "status", "method", "summary", "claims", "issues",
-                                "extract_model", "review_model",
-                                "extract_provider", "review_provider",
-                                "coverage", "description_complete"}
-                        },
-                        "fit_score": best.fit_score if best else None,
-                        "tier": best.tier if best else None,
-                        "decision": best.decision if best else None,
-                        "profiles": [
-                            {
-                                "id": p.profile_id,
-                                "name": p.profile_name,
-                                "score": p.fit_score,
-                                "tier": p.tier,
-                                "decision": p.decision,
-                                "fit_reason": p.fit_reason,
-                                "risks": p.risks,
-                                "blocker_signals": p.blocker_signals,
-                            }
-                            for p in evaluations
-                        ],
-                    }
-                )
+            page = {"jobs": [], "total": 0, "offset": 0, "limit": 100, "has_more": False}
+            if query.get("include_jobs", "true") not in {"true", "false"}:
+                raise RequestError("include_jobs must be true or false")
+            if query.get("include_jobs", "true") == "true":
+                page = list_job_page(session, versions, {
+                    key: value for key, value in query.items() if key in JOB_QUERY_FIELDS
+                })
             raw = metrics
             metrics = {
                 **raw,
@@ -343,9 +307,12 @@ class CRMService:
             }
             return {
                 "applications": applications,
-                "contacts": [_contact(c) for c in repo.list_contacts()],
-                "companies": [_company(c) for c in repo.list_companies()],
-                "jobs": jobs,
+                "contacts": [_contact(c) for c in repo.list_contacts()] if include_entities else [],
+                "companies": (
+                    [_company(c) for c in repo.list_companies()] if include_entities else []
+                ),
+                "jobs": page["jobs"],
+                "job_page": {key: value for key, value in page.items() if key != "jobs"},
                 "profiles": [
                     {
                         "id": s.id,
@@ -357,7 +324,7 @@ class CRMService:
                 ],
                 "metrics": metrics,
                 "actions": [
-                    serialize_application(a)
+                    _application_summary(a)
                     for a in repo.due_actions(as_of=today)
                     if (not profile or a.profile_id == profile)
                     and (not channel or a.channel == channel)
@@ -367,6 +334,40 @@ class CRMService:
                 "options": OPTIONS,
                 "csrf_token": self.csrf_token,
             }
+
+    def jobs(self, query: dict[str, str]) -> dict:
+        _fields(query, JOB_QUERY_FIELDS)
+        if query.get("profile_id"):
+            self.validate_profile(query["profile_id"])
+        with self.database.session() as session:
+            return list_job_page(session, {s.id: s.version for s in self.streams}, query)
+
+    def metrics(self, query: dict[str, str]) -> dict:
+        _fields(query, {"profile_id", "channel", "since", "until"})
+        result = self.state({**query, "include_jobs": "false", "include_entities": "false"})
+        return {key: result[key] for key in ("metrics", "actions", "as_of", "period")}
+
+    def job(self, uid: str) -> dict:
+        with self.database.session() as session:
+            result = job_detail(session, {s.id: s.version for s in self.streams}, uid)
+            if result is None:
+                raise RequestError("Вакансия не найдена", 404)
+            return result
+
+    def application(self, application_id: int) -> dict:
+        with self.database.session() as session:
+            row = CRMRepository(session).get_application(application_id)
+            if row is None:
+                raise RequestError("Отклик не найден", 404)
+            return serialize_application(row)
+
+    def export_applications(self, query: dict[str, str]) -> list[dict]:
+        _fields(query, {"profile_id", "channel", "since", "until", "job_archive"})
+        profile = self.validate_profile(query.get("profile_id"))
+        with self.database.session() as session:
+            return [serialize_application(a) for a in CRMRepository(session).list_applications(
+                profile_id=profile, channel=query.get("channel") or None,
+            )]
 
     def mutate(self, method: str, path: str, payload: dict) -> dict:
         if not isinstance(payload, dict):
@@ -474,12 +475,13 @@ class CRMService:
                 elif method == "POST" and len(parts) == 4 and parts[3] == "stage":
                     version = _version(payload)
                     data = _fields(payload, {"stage", "occurred_at", "note"})
+                    if "occurred_at" in data:
+                        data["occurred_at"] = _datetime(data["occurred_at"])
                     row = repo.mark_stage(
                         application_id,
-                        data.get("stage"),
-                        occurred_at=_datetime(data.get("occurred_at")),
-                        note=data.get("note", ""),
+                        data.pop("stage", None),
                         expected_version=version,
+                        **data,
                     )
                 elif method in {"POST", "DELETE"} and len(parts) == 4 and parts[3] == "contacts":
                     data = _fields(payload, {"contact_id", "relationship", "expected_version"})
@@ -506,9 +508,11 @@ class CRMService:
             elif method == "POST" and path == "/api/companies":
                 result = _company(repo.upsert_company(**_fields(payload, {"name", "url", "notes"})))
             elif method == "PATCH" and len(parts) == 3 and parts[:2] == ["api", "companies"]:
-                result = _company(
-                    repo.update_company(int(parts[2]), **_fields(payload, {"name", "url", "notes"}))
-                )
+                version = _version(payload)
+                result = _company(repo.update_company(
+                    _identifier(parts[2]), expected_version=version,
+                    **_fields(payload, {"name", "url", "notes"}),
+                ))
             else:
                 raise RequestError("Маршрут не найден", 404)
             session.commit()
@@ -596,9 +600,25 @@ class CRMRequestHandler(BaseHTTPRequestHandler):
             if method == "GET" and parsed_url.path == "/api/state":
                 self._json(200, self.server.service.state(query))
                 return
+            if method == "GET" and parsed_url.path == "/api/metrics":
+                self._json(200, self.server.service.metrics(query))
+                return
+            if method == "GET" and parsed_url.path == "/api/jobs":
+                self._json(200, self.server.service.jobs(query))
+                return
+            get_parts = parsed_url.path.strip("/").split("/")
+            if method == "GET" and len(get_parts) == 3:
+                if get_parts[:2] == ["api", "jobs"]:
+                    _fields(query, set())
+                    self._json(200, self.server.service.job(unquote(get_parts[2])))
+                    return
+                if get_parts[:2] == ["api", "applications"]:
+                    _fields(query, set())
+                    self._json(200, self.server.service.application(_identifier(get_parts[2])))
+                    return
             if method == "GET" and parsed_url.path == "/api/export.csv":
-                state = self.server.service.state(query)
-                self._respond(200, csv_export(state["applications"]), "text/csv; charset=utf-8")
+                applications = self.server.service.export_applications(query)
+                self._respond(200, csv_export(applications), "text/csv; charset=utf-8")
                 return
             if method not in {"POST", "PATCH", "DELETE"}:
                 raise RequestError("Маршрут не найден", 404)

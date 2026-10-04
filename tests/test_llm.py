@@ -194,7 +194,7 @@ class _FakeFiles:
 
 
 class _FakeBatches:
-    def create(self, *, input_file_id, endpoint, completion_window):
+    def create(self, *, input_file_id, endpoint, completion_window, metadata):
         return type("B", (), {"id": "batch-1", "status": "validating"})()
 
     def retrieve(self, batch_id: str):
@@ -220,7 +220,7 @@ def _install_fake_batch_openai(monkeypatch: pytest.MonkeyPatch, output_lines: li
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
 
-def test_batch_reranker_applies_scores(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_batch_reranker_applies_scores(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     jobs = [_passing_job("Role one."), _passing_job("Role two.")]
     output_lines = [
         {
@@ -234,7 +234,8 @@ def test_batch_reranker_applies_scores(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
     _install_fake_batch_openai(monkeypatch, output_lines)
 
-    reranker = BatchReranker(LLMConfig(enabled=True, batch_enabled=True, prompt_path=PROMPT_PATH))
+    reranker = BatchReranker(LLMConfig(enabled=True, batch_enabled=True, prompt_path=PROMPT_PATH,
+                                    batch_state_dir=str(tmp_path)))
     result = reranker.rerank_many(jobs)
 
     assert result[0].evaluation.semantic_score == 3.0
@@ -242,11 +243,12 @@ def test_batch_reranker_applies_scores(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result[0].evaluation.fit_score == 13.0
 
 
-def test_batch_reranker_missing_key_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_batch_reranker_missing_key_falls_back(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     jobs = [_passing_job("Role one.")]
 
-    reranker = BatchReranker(LLMConfig(enabled=True, batch_enabled=True, prompt_path=PROMPT_PATH))
+    reranker = BatchReranker(LLMConfig(enabled=True, batch_enabled=True, prompt_path=PROMPT_PATH,
+                                    batch_state_dir=str(tmp_path)))
     result = reranker.rerank_many(jobs)
 
     assert result[0].evaluation.semantic_score is None
@@ -285,7 +287,9 @@ def test_invalid_semantic_payload_keeps_deterministic_evaluation(
     assert any("failed" in entry.lower() for entry in result.evaluation.audit_log)
 
 
-def test_batch_bad_payload_does_not_lose_other_scores(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_batch_bad_payload_does_not_lose_other_scores(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
     jobs = [_passing_job("Role one."), _passing_job("Role two.")]
     output_lines = [
         {
@@ -300,7 +304,8 @@ def test_batch_bad_payload_does_not_lose_other_scores(monkeypatch: pytest.Monkey
         },
     ]
     _install_fake_batch_openai(monkeypatch, output_lines)
-    reranker = BatchReranker(LLMConfig(enabled=True, batch_enabled=True, prompt_path=PROMPT_PATH))
+    reranker = BatchReranker(LLMConfig(enabled=True, batch_enabled=True, prompt_path=PROMPT_PATH,
+                                    batch_state_dir=str(tmp_path)))
 
     result = reranker.rerank_many(jobs)
 
@@ -351,8 +356,22 @@ def test_hard_rejected_job_cannot_be_reranked(monkeypatch: pytest.MonkeyPatch) -
     assert client.responses.last_prompt is None
 
 
+def test_provider_error_details_are_absent_from_saved_audit_and_logs(monkeypatch, caplog):
+    client = _install_fake_openai(monkeypatch, "{}")
+
+    def fail(**kwargs):
+        raise RuntimeError("Synthetic private-key and full vacancy request content")
+
+    monkeypatch.setattr(client.responses, "create", fail)
+    job = _passing_job("Public synthetic role")
+    _reranker().rerank(job)
+    assert "private-key" not in caplog.text
+    assert "private-key" not in " ".join(job.evaluation.audit_log)
+    assert "RuntimeError" in job.evaluation.audit_log[-1]
+
+
 def test_batch_review_rerank_does_not_change_filter_decision(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
 ) -> None:
     job = _passing_job("Role with uncertain language.")
     job.evaluation.decision = FilterDecision.REVIEW
@@ -360,7 +379,8 @@ def test_batch_review_rerank_does_not_change_filter_decision(
         "custom_id": "0",
         "response": {"body": {"output_text": json.dumps({"semantic_score": 4.0})}},
     }])
-    reranker = BatchReranker(LLMConfig(enabled=True, batch_enabled=True, prompt_path=PROMPT_PATH))
+    reranker = BatchReranker(LLMConfig(enabled=True, batch_enabled=True, prompt_path=PROMPT_PATH,
+                                    batch_state_dir=str(tmp_path)))
     result = reranker.rerank_many([job])
     assert result[0].evaluation.decision == FilterDecision.REVIEW
     assert result[0].evaluation.fit_score == 14.0

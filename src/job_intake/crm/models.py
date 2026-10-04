@@ -122,6 +122,8 @@ class CompanyORM(Base):
     notes: Mapped[str] = mapped_column(Text, default="")
     source_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
     source_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    __mapper_args__ = {"version_id_col": version}
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow

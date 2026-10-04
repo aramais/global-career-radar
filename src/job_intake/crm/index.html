@@ -180,6 +180,11 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
     <button id="clearJobSelection" type="button" disabled>Снять выбор</button>
     <p class="help">Выбор действует на текущий список после поиска и фильтров.</p>
   </section>
+  <div class="row" id="jobPagination" hidden>
+    <button type="button" id="previousJobs">Предыдущая страница</button>
+    <span id="jobPageStatus" class="small muted"></span>
+    <button type="button" id="nextJobs">Следующая страница</button>
+  </div>
   <section id="content" class="list" aria-live="polite"></section>
   <footer>Изменения сохраняются в локальной базе проекта. Даты из истории не заполняются автоматически.
     Сообщения контактам отправляете вы. Импорт JobCRM сохраняет исходную таблицу без изменений.</footer>
@@ -194,6 +199,10 @@ let activeId = null;
 let busy = false;
 let loading = false;
 let refreshSequence = 0;
+let jobSequence = 0;
+let jobOffset = 0;
+let jobFilterTimer = null;
+const jobDetails = new Map();
 let visibleJobs = [];
 let jobSelection = new Map();
 let priorFocus = null;
@@ -308,17 +317,19 @@ function stateQuery() {
   [['profile_id','profileFilter'],['channel','channelFilter'],['since','sinceFilter'],['until','untilFilter'],
     ['job_archive','jobArchiveFilter']]
     .forEach(([name,id]) => { if ($(id).value) query.set(name,$(id).value); });
-  return '/api/state' + (query.toString() ? '?' + query.toString() : '');
+  query.set('include_jobs','false');
+  return '/api/state?' + query.toString();
 }
 async function refresh(initial) {
   const request = ++refreshSequence;
   loading = true; renderJobSelection();
   clearError(); $('saveStatus').textContent = 'Загрузка…';
   try {
-    const latest = await api(initial ? '/api/state' : stateQuery());
+    const latest = await api(initial ? '/api/state?include_jobs=false' : stateQuery());
     if (request !== refreshSequence) return;
-    state = latest;
+    state = {...latest,jobs:state?.jobs || [],job_page:state?.job_page || latest.job_page};
     if (initial) setupFilters();
+    if (view === 'jobs') await refreshJobs(false);
     render(); $('saveStatus').textContent = 'Сохранено в локальной базе';
     $('createButton').disabled = false; $('importButton').disabled = false;
   } catch (error) { if (request === refreshSequence) showError(errorMessage(error)); }
@@ -331,14 +342,14 @@ async function write(path, method, payload, after) {
   renderJobSelection();
   try {
     const result = await api(path, method, payload);
-    await refresh(false);
+    await applyMutation(path,result);
     busy = false;
     if (after) await after(result);
   } catch (error) {
     if (error.status === 409) {
       await refresh(false);
       busy = false;
-      if (activeId !== null) openApplication(activeId);
+      if (activeId !== null) await openApplication(activeId);
       else closeModal();
       showError('Запись уже изменена. Загружена актуальная версия; проверьте её и повторите изменение.');
     } else { showError(errorMessage(error)); }
@@ -346,6 +357,71 @@ async function write(path, method, payload, after) {
     busy = false; document.querySelectorAll('button').forEach((node) => node.disabled = false);
     renderJobSelection();
   }
+}
+function metricsQuery() {
+  const query = new URLSearchParams();
+  [['profile_id','profileFilter'],['channel','channelFilter'],['since','sinceFilter'],['until','untilFilter']]
+    .forEach(([name,id]) => { if ($(id).value) query.set(name,$(id).value); });
+  return '/api/metrics?' + query.toString();
+}
+function jobQuery() {
+  const query = new URLSearchParams({offset:String(jobOffset),limit:'100'});
+  [['profile_id','profileFilter'],['job_archive','jobArchiveFilter'],['query','query'],
+    ['tier','tierFilter'],['score_min','scoreMinFilter'],['score_max','scoreMaxFilter'],['sort','jobSort']]
+    .forEach(([name,id]) => { if ($(id).value.trim()) query.set(name,$(id).value.trim()); });
+  return '/api/jobs?' + query.toString();
+}
+async function refreshJobs(reset = true) {
+  if (!state) return;
+  if (reset) jobOffset = 0;
+  const request = ++jobSequence;
+  if (!renderJobFilters()) { state.jobs = []; render(); return; }
+  loading = true; renderJobSelection(); clearError();
+  try {
+    const page = await api(jobQuery());
+    if (request !== jobSequence) return;
+    state.jobs = page.jobs;
+    state.job_page = {total:page.total,offset:page.offset,limit:page.limit,has_more:page.has_more};
+    jobDetails.clear(); render();
+  } catch (error) { if (request === jobSequence) showError(errorMessage(error)); }
+  finally { if (request === jobSequence) { loading = false; renderJobSelection(); } }
+}
+function queueJobRefresh() {
+  clearTimeout(jobFilterTimer);
+  if (view === 'jobs') { jobSelection.clear(); jobFilterTimer = setTimeout(() => refreshJobs(),200); }
+  else render();
+}
+function replaceRecord(key, result) {
+  const rows = state[key] || [];
+  const index = rows.findIndex((item) => String(item.id) === String(result.id));
+  if (index < 0) rows.unshift(result); else rows[index] = result;
+  state[key] = rows;
+}
+async function applyMutation(path,result) {
+  if (path.startsWith('/api/jobs/')) {
+    await refreshJobs(false);
+  } else if (path.startsWith('/api/applications')) {
+    replaceRecord('applications',result.application || result);
+    const profile = $('profileFilter').value, channel = $('channelFilter').value;
+    state.applications = state.applications.filter((app) => (!profile || app.profile_id === profile)
+      && (!channel || app.channel === channel));
+    Object.assign(state,await api(metricsQuery()));
+  } else if (path.startsWith('/api/contacts')) {
+    replaceRecord('contacts',result);
+    (state.applications || []).forEach((app) => (app.contacts || []).forEach((contact) => {
+      if (contact.id === result.id) contact.name = result.name;
+    }));
+  } else if (path.startsWith('/api/companies')) {
+    replaceRecord('companies',result);
+  }
+  render(); $('saveStatus').textContent = 'Сохранено в локальной базе';
+}
+async function loadJobDetail(job) {
+  if (!jobDetails.has(job.job_uid)) {
+    jobDetails.set(job.job_uid,api('/api/jobs/' + encodeURIComponent(job.job_uid))
+      .catch((error) => { jobDetails.delete(job.job_uid); throw error; }));
+  }
+  return jobDetails.get(job.job_uid);
 }
 function setupFilters() {
   const profiles = [{value:'',label:'Все профили'}, ...(state.profiles || []).map((item) =>
@@ -479,6 +555,12 @@ function jobArchivePayload(jobs, selection, archived) {
 }
 function renderJobSelection() {
   $('jobBulkActions').hidden = view !== 'jobs';
+  $('jobPagination').hidden = view !== 'jobs';
+  const page = state?.job_page || {};
+  $('previousJobs').disabled = busy || loading || !jobOffset;
+  $('nextJobs').disabled = busy || loading || !page.has_more;
+  $('jobPageStatus').textContent = 'Страница ' + (Math.floor((page.offset || 0) / (page.limit || 100)) + 1)
+    + ' · Всего: ' + (page.total || 0);
   const chosen = selectedJobs(visibleJobs,jobSelection);
   const active = chosen.filter((job) => !job.archived).length;
   const archived = chosen.length - active;
@@ -594,10 +676,7 @@ function render() {
     }
     records.forEach((app) => $('content').append(applicationCard(app)));
   } else if (view === 'jobs') {
-    records = renderJobFilters() ? filterAndSortJobs((state.jobs || []).filter(matchesQuery),
-      {profileId:$('profileFilter').value,tier:$('tierFilter').value,minScore:$('scoreMinFilter').value,
-        maxScore:$('scoreMaxFilter').value,sort:$('jobSort').value,
-        archive:$('jobArchiveFilter').value}) : [];
+    records = renderJobFilters() ? (state.jobs || []) : [];
     visibleJobs = records;
     jobSelection = retainedJobSelection(records,jobSelection);
     records.forEach((job) => $('content').append(jobCard(job)));
@@ -608,7 +687,8 @@ function render() {
     records = (state.contacts || []).filter(matchesQuery);
     records.forEach((contact) => $('content').append(contactCard(contact)));
   }
-  $('itemCount').textContent = records.length + ' записей';
+  $('itemCount').textContent = view === 'jobs' ? records.length + ' из ' + (state.job_page?.total || 0)
+    + ' вакансий' : records.length + ' записей';
   renderJobSelection();
   if (!records.length) {
     const empty = el('div',null,'empty full');
@@ -674,8 +754,18 @@ function jobCard(job) {
   const links = el('div',null,'row'); links.append(sourceLink(job.url),
     el('span',[job.location,job.remote].filter(Boolean).join(' · '),'small muted')); card.append(links);
   card.append(jobAnnotationDetails(job,assessment));
-  if (job.description) { const details = el('details'); details.append(el('summary','Описание вакансии',
-    'small muted'),el('div',job.description,'job-description')); card.append(details); }
+  const description = el('details'); description.append(el('summary','Описание вакансии','small muted'));
+  let descriptionLoaded = false, descriptionLoading = false;
+  description.addEventListener('toggle',async() => {
+    if (!description.open || descriptionLoaded || descriptionLoading) return;
+    descriptionLoading = true; const content = el('div','Загрузка…','job-description');
+    description.append(content);
+    try { const detail = await loadJobDetail(job);
+      content.textContent = detail.description || 'Описание не предоставлено источником.';
+      descriptionLoaded = true;
+    } catch(error) { content.remove(); showError(errorMessage(error)); }
+    finally { descriptionLoading = false; }
+  }); card.append(description);
   return card;
 }
 async function setJobArchived(job, archived) {
@@ -762,9 +852,16 @@ function renderJobAnnotation(job,assessment) {
 }
 function jobAnnotationDetails(job,assessment) {
   const details = el('details',null,'job-annotation');
-  details.append(el('summary','Разметка и подтверждения')); let loaded = false;
-  details.addEventListener('toggle',() => {
-    if (details.open && !loaded) { details.append(renderJobAnnotation(job,assessment)); loaded = true; }
+  details.append(el('summary','Разметка и подтверждения')); let loaded = false, pending = false;
+  details.addEventListener('toggle',async() => {
+    if (!details.open || loaded || pending) return;
+    pending = true; const loadingNote = el('p','Загрузка…','small muted'); details.append(loadingNote);
+    try {
+      const detail = await loadJobDetail(job);
+      const current = jobAssessment(detail,$('profileFilter').value);
+      loadingNote.replaceWith(renderJobAnnotation(detail,current || assessment)); loaded = true;
+    } catch(error) { loadingNote.remove(); showError(errorMessage(error)); }
+    finally { pending = false; }
   });
   return details;
 }
@@ -833,10 +930,14 @@ function normalizeAppPayload(payload) {
   ['profile_id','applied_at','next_action_due'].forEach((key) => { if (!payload[key]) payload[key] = null; });
   return payload;
 }
-function openApplication(id) {
-  const app = (state.applications || []).find((item) => String(item.id) === String(id));
-  if (!app) { closeModal(); showError('Отклик больше не доступен при выбранных фильтрах.'); return; }
-  activeId = app.id; const body = showModal(app.title || 'Отклик',app.company);
+async function openApplication(id) {
+  activeId = Number(id); const placeholder = showModal('Отклик');
+  placeholder.append(el('p','Загрузка карточки…','muted'));
+  let app;
+  try { app = await api('/api/applications/' + encodeURIComponent(id)); }
+  catch(error) { if (activeId === Number(id)) { closeModal(); showError(errorMessage(error)); } return; }
+  if (activeId !== Number(id) || $('modalShade').hidden) return;
+  const body = showModal(app.title || 'Отклик',app.company);
   const grid = el('div',null,'detail-grid'); const left = el('div'); const right = el('aside');
   const section = el('section',null,'detail-section'); section.append(el('h3','Детали отклика'));
   const form = el('form'); applicationFields(form,app); formButtons(form,'Сохранить детали');
@@ -847,10 +948,18 @@ function openApplication(id) {
   section.append(form); left.append(section);
   const transition = el('section',null,'detail-section'); transition.append(el('h3','Изменить этап'));
   const stageForm = el('form'); const stageGrid = el('div',null,'form-grid');
-  stageGrid.append(field('Новый этап',select(values('stages'),app.stage,'stage')),
-    field('Когда произошёл переход',input(state.as_of,'date','occurred_at')),
-    field('Комментарий к переходу',textArea('','note'),true)); stageForm.append(stageGrid,
-    el('p','Выбрана сегодняшняя дата São Paulo. Для старого события измените дату или очистите поле, если она неизвестна.','help'));
+  const currentEvent = [...(app.history || [])].reverse().find((event) => event.stage === app.stage);
+  const stageSelect = select(values('stages'),app.stage,'stage');
+  const stageDate = input(dateOnly(currentEvent?.occurred_at),'date','occurred_at');
+  const stageNote = textArea(currentEvent?.note || '','note');
+  stageSelect.addEventListener('change',() => {
+    stageDate.value = stageSelect.value === app.stage ? dateOnly(currentEvent?.occurred_at) : state.as_of;
+    stageNote.value = stageSelect.value === app.stage ? currentEvent?.note || '' : '';
+  });
+  stageGrid.append(field('Этап',stageSelect),field('Когда произошёл переход',stageDate),
+    field('Комментарий к этапу',stageNote,true)); stageForm.append(stageGrid,
+    el('p','Текущий этап: исправление его даты и комментария. Другой этап: новый переход в истории. '
+      + 'Пустая дата означает, что она неизвестна.','help'));
   formButtons(stageForm,'Зафиксировать этап'); stageForm.addEventListener('submit',(event) => {
     event.preventDefault(); const payload = formValues(stageForm); payload.expected_version = app.version;
     payload.occurred_at = payload.occurred_at || null;
@@ -956,7 +1065,7 @@ async function openCreatedApplication(id) {
   }
   view = 'applications';
   document.querySelectorAll('.tab').forEach((tab) => tab.classList.toggle('active',tab.dataset.view === view));
-  render(); openApplication(id);
+  render(); await openApplication(id);
 }
 async function importAPI(file, dryRun) {
   const response = await fetch('/api/import-xlsx' + (dryRun ? '?dry_run=true' : ''),{
@@ -1026,19 +1135,21 @@ function openImport() {
 }
 document.querySelectorAll('.tab').forEach((tab) => tab.addEventListener('click',() => {
   view = tab.dataset.view; document.querySelectorAll('.tab').forEach((other) => other.classList.toggle('active',other === tab));
-  render();
+  render(); if (view === 'jobs') refreshJobs();
 }));
 $('filters').addEventListener('submit',(event) => { event.preventDefault(); refresh(false); });
-$('query').addEventListener('input',render); $('stageFilter').addEventListener('change',render);
+$('query').addEventListener('input',queueJobRefresh); $('stageFilter').addEventListener('change',render);
 $('actionFilter').addEventListener('change',render);
-$('profileFilter').addEventListener('change',() => { if (view === 'jobs') render(); });
-['tierFilter','jobSort'].forEach((id) => $(id).addEventListener('change',render));
-$('jobArchiveFilter').addEventListener('change',() => { jobSelection.clear(); refresh(false); });
-['scoreMinFilter','scoreMaxFilter'].forEach((id) => $(id).addEventListener('input',render));
+$('profileFilter').addEventListener('change',() => { if (view === 'jobs') refreshJobs(); });
+['tierFilter','jobSort'].forEach((id) => $(id).addEventListener('change',() => refreshJobs()));
+$('jobArchiveFilter').addEventListener('change',() => { jobSelection.clear(); refreshJobs(); });
+['scoreMinFilter','scoreMaxFilter'].forEach((id) => $(id).addEventListener('input',queueJobRefresh));
 $('resetJobFilters').addEventListener('click',() => {
   ['tierFilter','scoreMinFilter','scoreMaxFilter'].forEach((id) => $(id).value = '');
-  $('jobSort').value = 'tier-asc'; $('jobArchiveFilter').value = 'active'; refresh(false);
+  $('jobSort').value = 'tier-asc'; $('jobArchiveFilter').value = 'active'; refreshJobs();
 });
+$('previousJobs').addEventListener('click',() => { jobOffset = Math.max(0,jobOffset - 100); jobSelection.clear(); refreshJobs(false); });
+$('nextJobs').addEventListener('click',() => { jobOffset += 100; jobSelection.clear(); refreshJobs(false); });
 $('selectAllJobs').addEventListener('change',() => {
   jobSelection = $('selectAllJobs').checked
     ? new Map(visibleJobs.map((job) => [job.job_uid,job.archive_version])) : new Map();

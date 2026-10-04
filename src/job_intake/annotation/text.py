@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 from job_intake.models.job import JobRecord
 from job_intake.utils.text import canonicalize_url, contains_any, normalize_text
 
-TEXT_VERSION = "source-units-v1"
+TEXT_VERSION = "source-units-v2"
 _FIELDS = (
     "title", "company", "location_text", "remote_text", "employment_type",
     "salary_text", "timezone_text",
@@ -80,6 +80,39 @@ _NAVIGATION = re.compile(
 )
 
 
+def _period_is_internal(text: str, index: int) -> bool:
+    """Keep decimal points and dotted initialisms inside their source clause."""
+    if index and index + 1 < len(text) and text[index - 1].isdigit() and text[index + 1].isdigit():
+        return True
+    if re.match(r"[A-Za-z]\.", text[index + 1:index + 3]):
+        return True
+    if re.search(r"\b(?:[A-Za-z]\.)+[A-Za-z]$", text[max(0, index - 16):index]):
+        following = re.compile(r"\s*(\S)").match(text, index + 1)
+        return bool(following and following[1].islower())
+    return False
+
+
+def assertion_clauses(text: str) -> list[str]:
+    """Split assertions without erasing question marks or periods inside U.S./U.K.
+
+    A newline is an assertion boundary even if the source omitted punctuation.
+    The delimiter stays with its clause so uncertainty checks can still see '?'.
+    """
+    clauses: list[str] = []
+    start = 0
+    boundaries = re.finditer(r"[.;!?\r\n|]|\b(?:but|however|although)\b", text, re.I)
+    for match in boundaries:
+        if match[0] == "." and _period_is_internal(text, match.start()):
+            continue
+        end = match.end() if len(match[0]) == 1 else match.start()
+        if text[start:end].strip():
+            clauses.append(text[start:end])
+        start = match.end() if len(match[0]) == 1 else match.start()
+    if text[start:].strip():
+        clauses.append(text[start:])
+    return clauses
+
+
 def normalize_quote(text: str) -> str:
     """Normalize layout only; retain letters, punctuation, case and accents."""
     return re.sub(r"\s+", " ", unicodedata.normalize("NFC", text)).strip()
@@ -133,7 +166,8 @@ def _description_units(
         if heading is not None:
             heading_positions[line_match.start()] = heading
         starts = sorted({
-            0, *[match.end() for match in re.finditer(r"[.!?](?=\s+\S)", line)],
+            0, *[match.end() for match in re.finditer(r"[.!?](?=\s+\S)", line)
+                 if match[0] != "." or not _period_is_internal(line, match.start())],
             *[position - line_match.start() for position in heading_positions
               if line_match.start() <= position < line_match.end()],
         })
@@ -162,6 +196,23 @@ def _description_units(
 
 def source_units(record: JobRecord) -> list[dict[str, Any]]:
     """Return source units with stable local IDs and exact, attributable text."""
+    metadata_items = []
+    for key in ("applicant_location_requirements", "working_language"):
+        value = record.source_metadata.get(key)
+        values = value if isinstance(value, list) else [value]
+        metadata_items.extend(
+            (key, index, text) for index, text in enumerate(values, start=1)
+            if isinstance(text, str) and text
+        )
+    metadata = tuple(metadata_items)
+    cache_key = (
+        TEXT_VERSION, *(getattr(record, field) for field in _FIELDS),
+        record.description_raw, record.description_clean, metadata,
+    )
+    cached = record._text_units_cache
+    if cached is not None and cached[0] == cache_key:
+        # Callers may attach data to units; never let that poison another profile.
+        return [dict(unit) for unit in cached[1]]
     units: list[dict[str, Any]] = []
     for field in _FIELDS:
         text = getattr(record, field)
@@ -178,17 +229,13 @@ def source_units(record: JobRecord) -> list[dict[str, Any]]:
     units.extend(_description_units(
         description, field, _raw_heading_positions(record, description)
     ))
-    for key in ("applicant_location_requirements", "working_language"):
-        value = record.source_metadata.get(key)
-        values = value if isinstance(value, list) else [value]
-        for index, text in enumerate(values, start=1):
-            if not isinstance(text, str) or not text:
-                continue
-            field = f"source_metadata.{key}"
-            units.append({
-                "unit_id": f"{field}:{index:06d}", "field": field, "text": text,
-                "section": "requirements", "offset_start": 0, "offset_end": len(text),
-            })
+    for key, index, text in metadata:
+        field = f"source_metadata.{key}"
+        units.append({
+            "unit_id": f"{field}:{index:06d}", "field": field, "text": text,
+            "section": "requirements", "offset_start": 0, "offset_end": len(text),
+        })
+    record._text_units_cache = (cache_key, tuple(tuple(unit.items()) for unit in units))
     return units
 
 
@@ -315,7 +362,7 @@ def asserted_phrase_hits(text: str, phrases: list[str], *, required: bool = Fals
     Ambiguity is left for manual review instead of becoming a false hard rejection.
     """
     found: set[str] = set()
-    for clause in re.split(r"[.;!\n|]+|\b(?:but|however|although)\b", text, flags=re.I):
+    for clause in assertion_clauses(text):
         normalized = normalize_text(clause)
         for phrase in contains_any(clause, phrases):
             normalized_phrase = normalize_text(phrase)
@@ -333,7 +380,7 @@ def asserted_phrase_hits(text: str, phrases: list[str], *, required: bool = Fals
                     r"(?:not|never|isn t|aren t)\b", suffix
                 ) or re.match(
                     r"\s*(?:(?:skills|proficiency|fluency|communication|experience|"
-                    r"language|knowledge|is|are|was|were|will|be)\s+){0,4}"
+                    r"language|knowledge|work|attendance|days|is|are|was|were|will|be)\s+){0,4}"
                     r"(?:not|isn t|aren t|wasn t|weren t)\s+"
                     r"(?:\w+\s+){0,2}(?:required|needed|necessary|mandatory|expected)\b",
                     suffix,
@@ -345,8 +392,12 @@ def asserted_phrase_hits(text: str, phrases: list[str], *, required: bool = Fals
                     r"(?:\s+\w+){0,4}\s*$", prefix,
                 ) or re.match(
                     r"\s*(?:(?:is|are|will be|experience is)\s+)?"
-                    r"(?:optional|preferred|nice to have|a plus)\b", suffix,
-                ) or "?" in clause)
+                    r"(?:optional|preferred|nice to have|a plus|an option|option)\b", suffix,
+                ) or "?" in clause or re.search(
+                    r"\b(?:unconfirmed|uncertain|unknown|unspecified|not confirmed|"
+                    r"not established|not specified|whether|might|may be|could be|"
+                    r"possibly|potentially)\b", normalized,
+                ))
                 if not negated and not optional:
                     found.add(phrase)
     return [phrase for phrase in phrases if phrase in found]

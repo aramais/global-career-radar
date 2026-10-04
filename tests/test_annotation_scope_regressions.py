@@ -71,6 +71,41 @@ def _grade(job):
     return finalize_tier(EvaluatedJob(record=job, evaluation=evaluation), 14, 6).evaluation
 
 
+@pytest.mark.parametrize("description", [
+    "No sponsorship provided\nUS work authorization required",
+    "Applicants must be authorized to work in the U.S.",
+])
+def test_hard_authorization_survives_annotation_and_tiering(tmp_path, description):
+    job = _job(description, language="English")
+    _annotate(job, tmp_path)
+    engine = _engine()
+    engine.rules.blocker_phrases.append("authorized to work in the U.S.")
+    evaluation = engine.evaluate(job)
+    apply_annotation_constraints(job, evaluation, engine)
+    final = finalize_tier(EvaluatedJob(record=job, evaluation=evaluation), 14, 6).evaluation
+    assert final.decision == FilterDecision.REJECT
+    assert final.tier == JobTier.C
+    assert final.fit_score == 0
+
+
+def test_question_language_cannot_become_hard_rejection_after_annotation(tmp_path):
+    job = _job("The working language is Portuguese?")
+    _annotate(job, tmp_path)
+    result = _grade(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.tier == JobTier.B
+    assert result.blocker_signals == []
+
+
+def test_target_exception_cannot_be_promoted_by_broad_annotated_location(tmp_path):
+    job = _job("Own the roadmap.", language="English")
+    job.location_text = "Worldwide except Brazil"
+    _annotate(job, tmp_path)
+    result = _grade(job)
+    assert result.decision == FilterDecision.REJECT
+    assert result.tier == JobTier.C
+
+
 @pytest.mark.parametrize(
     "company_clause",
     [

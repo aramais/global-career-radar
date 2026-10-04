@@ -259,3 +259,58 @@ def test_deterministic_scoring_uses_role_context_and_ignores_negated_role_signal
     ), evaluation)
     assert evaluation.deterministic_score == 2
     assert evaluation.matched_signals == ["description_weight:roadmap"]
+
+
+def test_source_units_keep_dotted_abbreviations_with_their_requirement() -> None:
+    job = _job(description_clean=(
+        "Requirements\nMust be authorized to work in the U.S. before joining. "
+        "English is required."
+    ))
+    units = source_units(job)
+    constraint = next(unit for unit in units if "authorized" in unit["text"])
+    assert "U.S. before joining." in constraint["text"]
+    assert asserted_phrase_hits(
+        constraint["text"], ["authorized to work in the u.s."], required=True,
+    ) == ["authorized to work in the u.s."]
+
+
+def test_source_units_cache_is_reused_and_invalidates_all_original_inputs(monkeypatch) -> None:
+    import job_intake.annotation.text as module
+
+    calls = 0
+    original = module.BeautifulSoup
+
+    def count(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "BeautifulSoup", count)
+    job = _job(description_raw="<h2>Responsibilities</h2><p>Own the roadmap.</p>")
+    first = source_units(job)
+    for _ in range(6):
+        assert source_units(job) == first
+        role_description(job)
+    assert calls == 1
+
+    job.title = "Different title"
+    assert source_units(job)[0]["text"] == "Different title"
+    job.description_clean = "Requirements: English required."
+    assert any(unit["field"] == "description_clean" for unit in source_units(job))
+    job.description_raw = "<h2>Company</h2><p>Different raw source.</p>"
+    source_units(job)
+    job.source_metadata["working_language"] = ["English"]
+    assert source_units(job)[-1]["text"] == "English"
+    job.source_metadata["working_language"].append("Portuguese")
+    assert source_units(job)[-1]["text"] == "Portuguese"
+    assert calls == 6
+
+
+def test_mutating_returned_source_units_cannot_poison_shared_cache() -> None:
+    job = _job()
+    expected = source_units(job)
+    units = source_units(job)
+    units[0]["text"] = "Invented source"
+    units[-1]["section"] = "company"
+    units.append({"field": "invented"})
+    assert source_units(job) == expected

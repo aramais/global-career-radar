@@ -14,12 +14,20 @@ from job_intake.storage.repository import JobRepository
 DOM_SETUP = """
 class FakeElement {
   constructor(tag) { this.tag = tag; this.children = []; this.ownText = ''; this.className = '';
-    this.listeners = {}; this.open = false; }
-  set textContent(value) { this.ownText = String(value); this.children = []; }
+    this.listeners = {}; this.open = false; this.parentNode = null; }
+  set textContent(value) { this.ownText = String(value);
+    this.children.forEach(child=>child.parentNode=null); this.children = []; }
   get textContent() { return this.ownText + this.children.map(child=>child.textContent).join(''); }
   set innerHTML(_value) { throw new Error('Unsafe HTML insertion attempted'); }
   insertAdjacentHTML() { throw new Error('Unsafe HTML insertion attempted'); }
-  append(...children) { this.children.push(...children); }
+  append(...children) { children.forEach(child=> { child.remove();
+    child.parentNode = this; this.children.push(child); }); }
+  remove() { if (this.parentNode) { this.parentNode.children =
+    this.parentNode.children.filter(child=>child !== this); this.parentNode = null; } }
+  replaceWith(...children) { const parent = this.parentNode; if (!parent) return;
+    const index = parent.children.indexOf(this); this.remove();
+    children.forEach(child=> { child.remove(); child.parentNode = parent; });
+    parent.children.splice(index,0,...children); }
   addEventListener(event, listener) { this.listeners[event] = listener; }
 }
 document.createElement = tag => new FakeElement(tag);
@@ -233,16 +241,28 @@ def test_absent_annotation_says_it_has_not_run():
 
 
 def test_annotation_details_lazy_load_once_without_duplicate_evidence():
-    job = {"annotation": annotation()}
+    job = {"job_uid": "fixture:job1"}
+    detail = {**job, "annotation": annotation(), "profiles": []}
     result = _run_javascript(
-        DOM_SETUP + f"const details = jobAnnotationDetails({json.dumps(job)},null);"
-        "const before = tree(details); details.open=true; details.listeners.toggle();"
-        "const afterFirst = tree(details); details.listeners.toggle();"
-        "[before,afterFirst,tree(details)]"
+        DOM_SETUP + "(async()=> { const requests=[]; globalThis.fetch=async(path,options)=> {"
+        "requests.push({path,method:options.method,credentials:options.credentials});"
+        f"return {{ok:true,json:async()=>({json.dumps(detail)})}}; }};"
+        f"const details=jobAnnotationDetails({json.dumps(job)},null);"
+        "const before=tree(details), beforeRequests=requests.length; details.open=true;"
+        "const first=details.listeners.toggle(); await details.listeners.toggle(); await first;"
+        "const afterFirst=tree(details); await details.listeners.toggle();"
+        "return {before,beforeRequests,afterFirst,afterSecond:tree(details),requests}; })()",
+        await_result=True,
     )
-    assert result[0]["allText"] == "Разметка и подтверждения"
-    assert result[1] == result[2]
-    assert len(facts(result[1])) == 1
+    assert result["before"]["allText"] == "Разметка и подтверждения"
+    assert result["beforeRequests"] == 0
+    assert result["requests"] == [{
+        "path": "/api/jobs/fixture%3Ajob1", "method": "GET", "credentials": "same-origin",
+    }]
+    assert result["afterFirst"] == result["afterSecond"]
+    assert len(facts(result["afterFirst"])) == 1
+    assert "The working language is English." in result["afterFirst"]["allText"]
+    assert "Загрузка…" not in result["afterFirst"]["allText"]
 
 
 @pytest.fixture
@@ -278,7 +298,7 @@ def save_job(service, job_annotation):
         session.commit()
 
 
-def test_state_api_exposes_facts_quotes_and_profile_evidence_but_omits_raw_stages(service):
+def test_state_is_compact_and_job_detail_exposes_only_public_annotation_evidence(service):
     data = annotation()
     public = deepcopy(data)
     data.update({
@@ -289,7 +309,12 @@ def test_state_api_exposes_facts_quotes_and_profile_evidence_but_omits_raw_stage
         "unrecognized_field": "must not be included",
     })
     save_job(service, data)
-    job = service.state({})["jobs"][0]
+    compact = service.state({})["jobs"][0]
+    assert "annotation" not in compact
+    assert "description" not in compact
+    assert "fit_reason" not in compact["profiles"][0]
+    assert "risks" not in compact["profiles"][0]
+    job = service.job(compact["job_uid"])
     assert job["annotation"] == public
     assert job["annotation"]["summary"]["knowns"][0]["source_snippet"] == (
         "The working language is English."
@@ -297,16 +322,19 @@ def test_state_api_exposes_facts_quotes_and_profile_evidence_but_omits_raw_stage
     assert job["annotation"]["summary"]["knowns"][0]["review_method"] == "model"
     assert job["profiles"][0]["fit_reason"] == "Verify hiring location"
     assert job["profiles"][0]["risks"] == ["geography:eligibility_unconfirmed"]
-    serialized = json.dumps(job["annotation"])
+    serialized = json.dumps(job)
     for private in (
-        "raw draft not for CRM", "/private/example-cache", "cache-hash", "content-hash"
+        "raw draft not for CRM", "raw review", "full source units duplicated privately",
+        "/private/example-cache", "cache-hash", "content-hash", "must not be included",
     ):
         assert private not in serialized
 
 
-def test_state_without_annotation_uses_empty_object_instead_of_fabricating_support(service):
+def test_compact_state_omits_annotation_and_empty_detail_does_not_fabricate_support(service):
     save_job(service, {})
-    assert service.state({})["jobs"][0]["annotation"] == {}
+    compact = service.state({})["jobs"][0]
+    assert "annotation" not in compact
+    assert service.job(compact["job_uid"])["annotation"] == {}
 
 
 def test_api_preserves_quote_and_notes_markup_as_data_for_text_only_ui(service):
@@ -318,7 +346,9 @@ def test_api_preserves_quote_and_notes_markup_as_data_for_text_only_ui(service):
         "knowns": [bad], "unknowns": [], "contradictions": [],
     })
     save_job(service, data)
-    returned = service.state({})["jobs"][0]["annotation"]
+    compact = service.state({})["jobs"][0]
+    assert "annotation" not in compact
+    returned = service.job(compact["job_uid"])["annotation"]
     assert returned["claims"][0] == bad
     rendered = render_annotation(returned)
     assert bad["source_snippet"] in rendered["allText"]
