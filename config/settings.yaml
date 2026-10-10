@@ -15,12 +15,19 @@ annotation:
   enabled: true
   ai_enabled: false
   provider: gemini
-  extract_model: gemini-2.5-flash-lite
-  review_model: gemini-2.5-pro
+  # Quality-focused Flash choice, verified against Google docs on 2026-10-10.
+  extract_model: gemini-3.8-flash
+  extract_reasoning_effort: medium
+  review_model: gemini-3.6-flash
+  review_reasoning_effort: medium
   api_key_env: GEMINI_API_KEY
   cache_dir: data/local/annotations
   chunk_chars: 6000
-  max_output_tokens: 4096
+  # Gemini's output budget includes thinking tokens as well as the resulting JSON.
+  max_output_tokens: 8192
+  # Independent review: fewer claims per call, room for thinking + complete JSON.
+  review_batch_size: 8
+  review_max_output_tokens: 16384
   request_timeout: 60
   max_retries: 2
   retry_backoff: 1
@@ -43,6 +50,23 @@ annotation:
   # extract_base_url: https://gateway.example.com/v1
   # extract_api_key_env: CUSTOM_LLM_API_KEY
   # Never put API key values in this YAML.
+
+# Paid routing runs only with annotation AI explicitly enabled (--ai).
+# Unknown cases receive full review; only independently confirmed mismatches skip it.
+prefilter:
+  enabled: true
+  provider: gemini
+  screen_model: gemini-3.5-flash-lite
+  verify_model: gemini-3.8-flash
+  api_key_env: GEMINI_API_KEY
+  cache_dir: data/local/prefilter
+  screen_reasoning_effort: minimal
+  verify_reasoning_effort: low
+  max_source_chars: 60000
+  max_output_tokens: 1536
+  request_timeout: 60
+  max_retries: 2
+  retry_backoff: 1
 
 telegram:
   enabled: false

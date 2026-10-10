@@ -27,6 +27,7 @@ def loaded_config(tmp_path, monkeypatch):
     for name in (
         "ANNOTATION_CLI_SHARED_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "TYPESAFE_API_KEY",
         "ANNOTATION_CLI_EXTRACT_KEY", "ANNOTATION_CLI_REVIEW_KEY", "LLM_API_KEY",
+        "ANNOTATION_CLI_PREFILTER_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
     return config
@@ -108,6 +109,44 @@ def test_budget_jev_preset_resolves_independent_routes(loaded_config, pipeline_s
     assert pipeline_spy[0].telegram.enabled is False
 
 
+@pytest.mark.parametrize("verbose", [False, True])
+def test_annotate_forwards_exact_repeatable_uids(loaded_config, pipeline_spy, verbose):
+    frozen = [f"job-{index}" for index in range(250)]
+    arguments = [argument for uid in frozen for argument in ("--job-uid", uid)]
+    if verbose:
+        arguments.append("--verbose")
+    result = invoke(*arguments)
+    assert result.exit_code == 0, result.output
+    assert pipeline_spy[1]["job_uids"] == frozen
+    assert pipeline_spy[1]["limit"] is None
+    assert pipeline_spy[1]["use_ai"] is False
+
+
+@pytest.mark.parametrize("arguments", [
+    ("--job-uid", "job-1", "--limit", "1"),
+    ("--job-uid", "job-1", "--job-uid", "job-1"),
+    ("--job-uid", " "),
+])
+def test_invalid_cli_selection_stops_before_pipeline(loaded_config, pipeline_spy, arguments):
+    result = invoke(*arguments)
+    assert result.exit_code == 2, result.output
+    assert not pipeline_spy
+
+
+def test_cli_missing_selection_returns_clear_error(loaded_config, monkeypatch):
+    class Pipeline:
+        def __init__(self, settings):
+            pass
+
+        def reevaluate_saved(self, **kwargs):
+            raise ValueError("Requested jobs were not selected; check IDs and archive state")
+
+    monkeypatch.setattr(cli, "JobIntakePipeline", Pipeline)
+    result = invoke("--job-uid", "missing")
+    assert result.exit_code == 2, result.output
+    assert "Requested jobs were not selected" in result.output
+
+
 def test_balanced_preset_remains_offline_without_ai(loaded_config, pipeline_spy):
     result = invoke("--preset", "balanced")
     assert result.exit_code == 0, result.output
@@ -171,7 +210,8 @@ def test_legacy_provider_switch_clears_prior_stage_routes(loaded_config, pipelin
     assert result.exit_code == 0, result.output
     annotation = pipeline_spy[0].annotation
     assert annotation.resolved_stage("review").provider == "gemini"
-    assert annotation.review_model == "gemini-2.5-pro"
+    assert annotation.review_model == "gemini-3.6-flash"
+    assert annotation.resolved_stage("review").reasoning_effort == "medium"
     assert annotation.resolved_stage("review").api_key_env == "GEMINI_API_KEY"
 
 
@@ -180,7 +220,7 @@ def test_legacy_provider_switch_clears_prior_stage_routes(loaded_config, pipelin
     ("--review-provider", "unknown"), ("--review-provider", "openai_compatible"),
     ("--review-base-url", "https://user:secret@api.example/v1"),
     ("--extract-provider", "jev", "--extract-model", "jev-1.13.0"),
-    ("--review-model", "gemini-2.5-flash-lite"),
+    ("--review-model", "gemini-3.8-flash"),
 ])
 def test_invalid_cli_model_configuration_fails_before_pipeline(loaded_config, pipeline_spy, args):
     result = invoke(*args)
@@ -198,3 +238,89 @@ def test_shared_compatible_provider_requires_explicit_models_and_stage_endpoints
     )
     assert result.exit_code == 0, result.output
     assert pipeline_spy[0].annotation.resolved_stage("review").api_key_env == "LLM_API_KEY"
+
+
+def test_ai_missing_prefilter_key_fails_before_database(
+    loaded_config, pipeline_spy, monkeypatch,
+):
+    loaded_config.prefilter = replace(
+        loaded_config.prefilter, enabled=True, api_key_env="ANNOTATION_CLI_PREFILTER_KEY",
+    )
+    monkeypatch.setenv("ANNOTATION_CLI_SHARED_KEY", "private-annotation-key")
+    result = invoke("--ai", "--verbose")
+    assert result.exit_code == 1, result.output
+    assert result.output.count("Set ANNOTATION_CLI_PREFILTER_KEY locally") == 1
+    assert "private-annotation-key" not in result.output
+    assert "Starting annotation" not in result.output
+    assert pipeline_spy == []
+    assert not loaded_config.rules_path.with_name("never-opened.db").exists()
+
+
+@pytest.mark.parametrize("ai", [False, True])
+def test_no_prefilter_overrides_enabled_configuration(
+    loaded_config, pipeline_spy, monkeypatch, ai,
+):
+    loaded_config.prefilter = replace(
+        loaded_config.prefilter, enabled=True, api_key_env="ANNOTATION_CLI_PREFILTER_KEY",
+    )
+    if ai:
+        monkeypatch.setenv("ANNOTATION_CLI_SHARED_KEY", "private-annotation-key")
+    result = invoke(*(["--ai"] if ai else []), "--no-prefilter")
+    assert result.exit_code == 0, result.output
+    assert pipeline_spy[0].prefilter.enabled is False
+    assert loaded_config.prefilter.enabled is True
+
+
+def test_prefilter_opt_in_checks_key_and_preserves_configuration(
+    loaded_config, pipeline_spy, monkeypatch,
+):
+    monkeypatch.setenv("ANNOTATION_CLI_SHARED_KEY", "private-annotation-key")
+    assert loaded_config.prefilter.enabled is False
+    missing = invoke("--ai", "--prefilter")
+    assert missing.exit_code == 1, missing.output
+    assert "Set GEMINI_API_KEY locally" in missing.output
+    assert pipeline_spy == []
+    monkeypatch.setenv("GEMINI_API_KEY", "private-prefilter-key")
+    result = invoke("--ai", "--prefilter", "--verbose")
+    assert result.exit_code == 0, result.output
+    assert pipeline_spy[0].prefilter.enabled is True
+    assert loaded_config.prefilter.enabled is False
+    assert "Prefilter screen: gemini/gemini-3.5-flash-lite" in result.stderr
+    assert "verify exclusions: gemini/gemini-3.8-flash" in result.stderr
+    assert "private-prefilter-key" not in result.output
+
+
+def test_prefilter_configuration_does_not_require_keys_in_offline_mode(
+    loaded_config, pipeline_spy,
+):
+    loaded_config.prefilter = replace(loaded_config.prefilter, enabled=True)
+    result = invoke("--verbose")
+    assert result.exit_code == 0, result.output
+    assert pipeline_spy[0].prefilter.enabled is True
+    assert pipeline_spy[1]["use_ai"] is False
+    assert "Prefilter screen" not in result.stderr
+
+
+def test_cli_reports_prefilter_totals_and_fails_on_fallback_error(
+    loaded_config, monkeypatch,
+):
+    class Pipeline:
+        def __init__(self, settings):
+            pass
+
+        def reevaluate_saved(self, **kwargs):
+            return {
+                "persisted": 2, "evaluations": 8, "annotation_extraction_calls": 1,
+                "annotation_review_calls": 1, "annotation_cache_hits": 0,
+                "annotation_errors": 0, "record_errors": 0, "errors": [],
+                "prefilter_screen_calls": 2, "prefilter_verify_calls": 1,
+                "prefilter_cache_hits": 1, "prefilter_suppressed": 1,
+                "prefilter_full_review": 1, "prefilter_local_skipped": 0,
+                "prefilter_errors": 1,
+            }
+
+    monkeypatch.setattr(cli, "JobIntakePipeline", Pipeline)
+    result = invoke()
+    assert result.exit_code == 1, result.output
+    assert "Prefilter screen calls=2, verify calls=1, cache hits=1" in result.stdout
+    assert "suppressed=1, full review=1, local skipped=0, errors=1" in result.stdout

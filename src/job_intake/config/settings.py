@@ -147,12 +147,14 @@ class AnnotationConfig:
     enabled: bool = True
     ai_enabled: bool = False
     provider: str = "gemini"
-    extract_model: str = "gemini-2.5-flash-lite"
-    review_model: str = "gemini-2.5-pro"
+    extract_model: str = "gemini-3.8-flash"
+    review_model: str = "gemini-3.6-flash"
     api_key_env: str = "GEMINI_API_KEY"
     cache_dir: str = "data/local/annotations"
     chunk_chars: int = 6000
     max_output_tokens: int = 4096
+    review_max_output_tokens: int | None = None
+    review_batch_size: int = 8
     request_timeout: float = 60.0
     max_retries: int = 2
     retry_backoff: float = 1.0
@@ -225,6 +227,12 @@ class AnnotationConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 256:
                 raise ValueError(f"annotation.{name} must be an integer >= 256")
+        if self.review_max_output_tokens is not None and (
+            type(self.review_max_output_tokens) is not int or self.review_max_output_tokens < 256
+        ):
+            raise ValueError("annotation.review_max_output_tokens must be an integer >= 256")
+        if type(self.review_batch_size) is not int or not 1 <= self.review_batch_size <= 64:
+            raise ValueError("annotation.review_batch_size must be an integer from 1 to 64")
         if (
             isinstance(self.max_retries, bool)
             or not isinstance(self.max_retries, int)
@@ -275,12 +283,72 @@ class AnnotationConfig:
             base_url=base_url,
             reasoning_effort=getattr(self, f"{stage}_reasoning_effort") or self.reasoning_effort,
             request_timeout=self.request_timeout,
-            max_output_tokens=self.max_output_tokens,
+            max_output_tokens=(
+                self.review_max_output_tokens
+                if stage == "review" and self.review_max_output_tokens is not None
+                else self.max_output_tokens
+            ),
             max_retries=self.max_retries,
             retry_backoff=self.retry_backoff,
             jev_min_probability=self.jev_min_probability,
             jev_min_confidence=self.jev_min_confidence,
             jev_batch_size=self.jev_batch_size,
+        )
+
+
+@dataclass(slots=True)
+class PrefilterConfig:
+    """Optional paid routing, separate from final evidence review and role scores."""
+
+    enabled: bool = False
+    provider: str = "gemini"
+    screen_model: str = "gemini-3.5-flash-lite"
+    verify_model: str = "gemini-3.8-flash"
+    api_key_env: str = "GEMINI_API_KEY"
+    base_url: str | None = None
+    cache_dir: str = "data/local/prefilter"
+    max_source_chars: int = 60000
+    max_output_tokens: int = 1536
+    request_timeout: float = 60.0
+    max_retries: int = 2
+    retry_backoff: float = 1.0
+    screen_reasoning_effort: str = "minimal"
+    verify_reasoning_effort: str = "low"
+
+    def __post_init__(self) -> None:
+        if self.provider != "gemini":
+            raise ValueError("prefilter.provider must be gemini")
+        if (
+            type(self.max_source_chars) is not int
+            or self.max_source_chars < 256
+        ):
+            raise ValueError("prefilter.max_source_chars must be an integer >= 256")
+        if not isinstance(self.cache_dir, str) or not self.cache_dir.strip():
+            raise ValueError("prefilter.cache_dir must be a nonempty path")
+        self._model_config()
+
+    def _model_config(self) -> AnnotationConfig:
+        # Reuse endpoint/model/key/limit validation and the existing API adapter.
+        try:
+            return AnnotationConfig(
+                enabled=self.enabled, provider=self.provider,
+                extract_model=self.screen_model, review_model=self.verify_model,
+                api_key_env=self.api_key_env,
+                extract_base_url=self.base_url, review_base_url=self.base_url,
+                extract_reasoning_effort=self.screen_reasoning_effort,
+                review_reasoning_effort=self.verify_reasoning_effort,
+                max_output_tokens=self.max_output_tokens,
+                request_timeout=self.request_timeout, max_retries=self.max_retries,
+                retry_backoff=self.retry_backoff,
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc).replace("annotation", "prefilter")) from None
+
+    def resolved_stage(self, stage: str) -> AnnotationStageSpec:
+        if stage not in {"screen", "verify"}:
+            raise ValueError("prefilter stage must be screen or verify")
+        return self._model_config().resolved_stage(
+            "extract" if stage == "screen" else "review"
         )
 
 
@@ -297,6 +365,7 @@ class AppConfig:
     llm: LLMConfig
     crm: CRMConfig = field(default_factory=CRMConfig)
     annotation: AnnotationConfig = field(default_factory=AnnotationConfig)
+    prefilter: PrefilterConfig = field(default_factory=PrefilterConfig)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -393,6 +462,18 @@ def load_app_config(path: str | Path) -> AppConfig:
             ),
         }
     )
+    prefilter_raw = raw.get("prefilter", {})
+    prefilter = PrefilterConfig(
+        **{
+            **prefilter_raw,
+            "cache_dir": str(
+                (
+                    config_path.parent.parent
+                    / prefilter_raw.get("cache_dir", "data/local/prefilter")
+                ).resolve()
+            ),
+        }
+    )
     return AppConfig(
         database_url=raw.get("database_url", "sqlite:///data/local/job_intake.db"),
         log_level=raw.get("log_level", "INFO"),
@@ -409,6 +490,7 @@ def load_app_config(path: str | Path) -> AppConfig:
         llm=llm,
         crm=CRMConfig(**raw.get("crm", {})),
         annotation=annotation,
+        prefilter=prefilter,
     )
 
 

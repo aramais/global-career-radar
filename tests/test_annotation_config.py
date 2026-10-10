@@ -7,6 +7,26 @@ import pytest
 from job_intake.config.settings import ANNOTATION_PROVIDER_DEFAULTS, AnnotationConfig
 
 
+def test_review_budget_and_batching_do_not_change_extraction_spec():
+    original = AnnotationConfig(max_output_tokens=8192)
+    batched = AnnotationConfig(
+        max_output_tokens=8192, review_batch_size=8, review_max_output_tokens=16384,
+    )
+    assert original.resolved_stage("extract") == batched.resolved_stage("extract")
+    assert batched.resolved_stage("review").max_output_tokens == 16384
+    assert original.resolved_stage("review").max_output_tokens == 8192
+
+
+@pytest.mark.parametrize("field,value", [
+    ("review_batch_size", 0), ("review_batch_size", 65), ("review_batch_size", True),
+    ("review_batch_size", 1.5), ("review_max_output_tokens", True),
+    ("review_max_output_tokens", 255), ("review_max_output_tokens", 8192.5),
+])
+def test_review_budget_and_batch_validation(field, value):
+    with pytest.raises(ValueError, match=field):
+        AnnotationConfig(**{field: value})
+
+
 def test_annotation_defaults_are_offline_with_distinct_extraction_and_review_models():
     config = AnnotationConfig()
     assert config.enabled is True

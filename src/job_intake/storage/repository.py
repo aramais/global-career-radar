@@ -36,6 +36,20 @@ class JobArchiveConflictError(ValueError):
     """The archive state changed after the caller loaded the vacancy."""
 
 
+def validate_job_uids(job_uids: list[str] | None) -> list[str] | None:
+    """An explicit selection must never become an unrestricted query."""
+    if job_uids is None:
+        return None
+    if (
+        not isinstance(job_uids, list) or not job_uids
+        or not all(isinstance(uid, str) and uid.strip() for uid in job_uids)
+    ):
+        raise ValueError("Selected job UIDs must be a nonempty list of nonblank IDs")
+    if len(set(job_uids)) != len(job_uids):
+        raise ValueError("Selected job UIDs must be unique")
+    return list(job_uids)
+
+
 class JobRepository:
     def __init__(
         self,
@@ -352,10 +366,14 @@ class JobRepository:
 
     def list_jobs(
         self, limit: int | None = 100, tier: str | None = None, *, archived: bool | None = None,
+        job_uids: list[str] | None = None,
     ) -> list[JobORM]:
+        selection = validate_job_uids(job_uids)
         stmt = select(JobORM).options(selectinload(JobORM.profile_evaluations)).order_by(
             JobORM.updated_at.desc(), JobORM.job_uid
         )
+        if selection is not None:
+            stmt = stmt.where(JobORM.job_uid.in_(selection))
         if archived is not None:
             stmt = stmt.where(
                 JobORM.archived_at.is_not(None) if archived else JobORM.archived_at.is_(None)

@@ -2,6 +2,7 @@ from dataclasses import replace
 
 import pytest
 
+from job_intake.annotation.service import apply_annotation_constraints
 from job_intake.filtering import FilterRules, RuleEngine
 from job_intake.models.job import FilterDecision, JobRecord
 
@@ -138,6 +139,38 @@ def test_mandatory_brazil_residence_is_allowed() -> None:
     result = RuleEngine(broad_rules()).evaluate(job)
     assert result.decision == FilterDecision.PASS
     assert result.blocker_signals == []
+
+
+@pytest.mark.parametrize("country", ["U.S.", "U.K."])
+def test_dotted_country_residence_preserves_allowed_alternative(country: str) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", remote_text="Remote",
+        description_clean=(
+            f"Candidates must be based in the {country} or Brazil. Fluent English required."
+        ),
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.PASS
+    assert result.blocker_signals == []
+    assert result.risks == []
+
+
+@pytest.mark.parametrize("country", ["U.S.", "U.K."])
+def test_dotted_country_residence_remains_a_real_foreign_requirement(country: str) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", remote_text="Remote",
+        description_clean=(
+            f"Candidates must be based in the {country} Brazil is a customer market. "
+            "Fluent English required."
+        ),
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REJECT
+    assert result.blocker_signals == [
+        f"geo_blocker:candidates must be based in the {country.casefold().rstrip('.')}"
+    ]
 
 
 @pytest.mark.parametrize("location", ["São Paulo, Brazil", "Sao Paulo, Brazil"])
@@ -591,6 +624,56 @@ def test_direct_office_requirement_without_office_location_is_reviewed() -> None
 
 
 @pytest.mark.parametrize("description", [
+    "This role requires onsite work at a later date.",
+    "This role requires hybrid work at our office for team meetings.",
+    "Candidates must work on-site at our headquarters.",
+    "Hybrid work is required at the designated office for this role.",
+])
+def test_temporal_or_generic_office_prose_cannot_be_a_foreign_location(
+    description: str,
+) -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Worldwide", remote_text="Remote",
+        source_metadata={"working_language": "English"}, description_clean=description,
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.blocker_signals == []
+    assert "geography:onsite_location_unknown" in result.risks
+
+
+def test_healthequity_later_date_onboarding_is_not_a_foreign_office() -> None:
+    job = JobRecord(
+        source="test", company="HealthEquity", title="Senior Manager, Analytics",
+        original_url="https://example.com/job", location_text="United States", remote_text="Remote",
+        description_clean=(
+            "role may begin with a virtual, self-paced onboarding experience, followed by a "
+            "mandatory onsite Trailhead session at a later date. HealthEquity is committed "
+            "to providing reasonable accommodations to team members with qualifying "
+            "disabilities. Should you be selected for this role and require an accommodation, "
+        ),
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.blocker_signals == []
+    assert "geography:onsite_location_unknown" in result.risks
+    assert "geography:eligibility_unconfirmed" in result.risks
+
+
+def test_office_location_is_read_after_obligation_not_candidate_location() -> None:
+    job = JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.com/job", location_text="Worldwide", remote_text="Remote",
+        source_metadata={"working_language": "English"},
+        description_clean="Candidates in Brazil must work onsite in London.",
+    )
+    result = RuleEngine(broad_rules()).evaluate(job)
+    assert result.decision == FilterDecision.REJECT
+    assert result.blocker_signals == ["geo_blocker:onsite:london"]
+
+
+@pytest.mark.parametrize("description", [
     "About us\nOur employees must work hybrid from our London office.",
     "Our employees must work hybrid from our London office.",
     "This role does not require hybrid work from our London office.",
@@ -624,3 +707,97 @@ def test_unconfirmed_country_exclusion_cannot_be_a_hard_blocker(description: str
     assert result.decision == FilterDecision.REVIEW
     assert result.blocker_signals == []
     assert "geography:candidate_exclusion_unconfirmed" in result.risks
+
+
+@pytest.mark.parametrize("recall_first", [False, True])
+@pytest.mark.parametrize(("title", "description", "confirmed"), [
+    ("Analytics Manager", "Own experimentation.", True),
+    ("Product Analytics Lead", "Own experimentation.", True),
+    ("Product Analyst", "You will lead projects and own experimentation.", True),
+    ("Product Analyst", "Lead experimentation and pricing analyses.", False),
+    ("Product Analyst", "You will not lead projects. Own experimentation.", False),
+    ("Not a Manager", "Own experimentation.", False),
+    (
+        "Product Analyst", "About us\nOur team provides project leadership.\n"
+        "Responsibilities\nOwn experimentation.", False,
+    ),
+    (
+        "Product Analyst", "Responsibilities\nOwn experimentation.\n"
+        "Benefits\nProject leadership training is provided.", False,
+    ),
+    (
+        "Product Analyst", "Benefits\nProject leadership training is provided.\n"
+        "Responsibilities\nYou will lead projects and own experimentation.", True,
+    ),
+    ("Product Analyst", "Will you lead projects? Own experimentation.", False),
+])
+def test_required_role_scope_accepts_title_or_responsibility_evidence(
+    recall_first, title, description, confirmed,
+) -> None:
+    rules = replace(
+        broad_rules(), recall_first=recall_first,
+        required_scope_title_signals=["manager", "lead"],
+        required_scope_description_signals=["lead projects", "project leadership"],
+    )
+    job = JobRecord(
+        source="test", company="Example", title=title,
+        original_url="https://example.com/job", location_text="Brazil", remote_text="Remote",
+        source_metadata={"working_language": "English"}, description_clean=description,
+    )
+    result = RuleEngine(rules).evaluate(job)
+    assert result.decision == (FilterDecision.PASS if confirmed else FilterDecision.REVIEW)
+    assert result.blocker_signals == []
+    assert ("role:required_scope_unconfirmed" in result.risks) is not confirmed
+    assert result.risks == ([] if confirmed else ["role:required_scope_unconfirmed"])
+
+
+@pytest.mark.parametrize("scope_field", [
+    "required_scope_title_signals", "required_scope_description_signals",
+])
+def test_scope_can_be_required_by_either_configured_field(scope_field) -> None:
+    rules = FilterRules.from_mapping({
+        "positive_description_signals": ["experimentation"],
+        scope_field: ["project leadership"],
+    })
+    job = JobRecord(
+        source="test", company="Example", title="Analyst", original_url="https://example.com/job",
+        description_clean="Own experimentation.",
+    )
+    result = RuleEngine(rules).evaluate(job)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.risks == ["role:required_scope_unconfirmed"]
+
+
+def test_grounded_role_annotation_cannot_erase_unconfirmed_required_scope() -> None:
+    rules = replace(
+        broad_rules(), recall_first=False,
+        required_scope_description_signals=["lead projects"],
+    )
+    job = JobRecord(
+        source="test", company="Example", title="Product Analyst",
+        original_url="https://example.com/job", location_text="Brazil",
+        source_metadata={"working_language": "English"},
+        description_clean="Own experimentation and pricing analyses.",
+        annotation={"status": "local", "method": "deterministic", "summary": {"knowns": [{
+            "kind": "responsibility", "value": "Own experimentation and pricing analyses.",
+            "requirement": "informational", "polarity": "affirmative",
+        }]}},
+    )
+    engine = RuleEngine(rules)
+    result = engine.evaluate(job)
+    apply_annotation_constraints(job, result, engine)
+    assert result.decision == FilterDecision.REVIEW
+    assert result.bridge_role is True
+    assert result.risks == ["role:required_scope_unconfirmed"]
+    assert result.blocker_signals == []
+
+
+def test_unconfigured_scope_keeps_existing_role_match_behavior() -> None:
+    rules = FilterRules.from_mapping({"positive_description_signals": ["experimentation"]})
+    job = JobRecord(
+        source="test", company="Example", title="Analyst", original_url="https://example.com/job",
+        description_clean="Own experimentation.",
+    )
+    result = RuleEngine(rules).evaluate(job)
+    assert result.decision == FilterDecision.PASS
+    assert result.risks == []

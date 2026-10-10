@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from job_intake.annotation.prefilter import prompts_version as prefilter_prompts_version
 from job_intake.annotation.text import TEXT_VERSION
 from job_intake.filtering import FilterRules, RuleEngine
 from job_intake.scoring.pre_score import DeterministicScorer, SearchProfiles
@@ -72,7 +73,8 @@ def load_streams(rules: dict[str, Any], config: dict[str, Any]) -> list[SearchSt
                     "rules": resolved_rules,
                     "scoring": resolved_scoring,
                     "text_processing_version": TEXT_VERSION,
-                    "eligibility_policy_version": "eligibility-v2",
+                    "eligibility_policy_version": "eligibility-v3",
+                    "prefilter_policy_version": prefilter_prompts_version(),
                 },
                 sort_keys=True,
                 ensure_ascii=False,

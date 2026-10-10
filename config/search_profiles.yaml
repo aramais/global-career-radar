@@ -1,4 +1,8 @@
-# Edit each stream independently; changing criteria makes saved evaluations stale.
+# Synced 2026-10-10 with career-orientation/codex/areas/job-search-vector.md.
+# Canon: ../aramais-vault/codex/projects/career-orientation/codex/00_INDEX.md
+# Stable IDs retain evaluation/CRM links. Changes invalidate saved profile versions.
+# Weights are operational ranking heuristics, not estimates of user skill or hiring odds.
+# Reuse the existing 3-point content weight and A/B thresholds; title alone is insufficient.
 defaults:
   company_priority: []
   source_weights:
@@ -7,74 +11,122 @@ defaults:
   bucket_c_signals: []
   threshold_a: 14
   threshold_b: 6
+  description_weights: &decision_weights
+    pricing: 3
+    monetization: 3
+    experimentation: 3
+    causal inference: 3
+    causal impact: 3
+    decision science: 3
+    decision support: 3
+    strategic decisions: 3
+    business decisions: 3
+    unit economics: 3
+    p&l: 3
+    profit and loss: 3
+    general manager: 3
+    finance business partner: 3
+    budget planning: 3
+    commercial strategy: 3
+    marketplace economics: 2
+    two-sided marketplace: 2
+    classifieds: 2
+  bucket_a_signals: [pricing, monetization, experimentation, causal inference, decision science, decision support, strategic decisions, business decisions, unit economics, p&l, profit and loss, general manager]
+  bucket_b_signals: [marketplace, classifieds, stakeholder management, business impact]
 
 streams:
   - id: product-management
     name: Product Management
     enabled: true
     context: >
-      Product Manager or Product Lead with product strategy, discovery, roadmap ownership,
-      experimentation and business impact. Adjacent product roles are worth manual review.
-      English working language. Remote hiring from Brazil or local work in Sao Paulo.
-    keywords: [Product Manager, Product Lead, Head of Product, Product Owner]
+      Analytics-heavy product roles where working with data influences product and economic
+      decisions. Prefer pricing, monetization, experimentation and marketplace economics;
+      discovery and roadmap ownership alone are insufficient. Partnership with the unit's
+      general manager or Finance and P&L analysis are preferences. Causal inference is a
+      desired area of applied development, not an already established user skill.
+      Search internationally from Sao Paulo; verify hiring from Brazil, working language,
+      contract, work mode and readiness. English working language is required. The role
+      must involve managing projects and interacting with people; direct reports are optional.
+    keywords: [Product Manager, Monetization Product Manager, Pricing Product Manager, Analytics Product Manager, Data Product Manager]
     rules:
       positive_title_signals: [product manager, product lead, head of product, product owner]
-      positive_description_signals: [product discovery, product strategy, roadmap, user research]
     scoring:
-      title_weights: {product manager: 8, product lead: 8, head of product: 7, product owner: 5}
-      description_weights: {product discovery: 3, roadmap: 3, user research: 3, experimentation: 3}
-      bucket_a_signals: [product discovery, product strategy, roadmap]
-      bucket_b_signals: [stakeholder management, growth, pricing]
+      title_weights: {product manager: 4, product lead: 3, head of product: 3, product owner: 1}
+      description_weights:
+        <<: *decision_weights
+        product discovery: 1
+        roadmap: 1
+        user research: 1
 
   - id: analytics-leadership
     name: Analytics Leadership
     enabled: true
     context: >
-      Head of Analytics, Analytics Manager, Product Analytics Lead, or adjacent analytics
-      leadership. Product-facing analytics, experimentation, pricing and monetization.
-      English working language. Remote hiring from Brazil or local work in Sao Paulo.
-    keywords: [Head of Analytics, Analytics Manager, Head of Data, Product Analytics Lead]
+      Analytics leadership and product/business analytics project leadership with influence
+      on unit decisions. Prefer pricing, monetization, experimentation, unit economics,
+      partnership with the general manager or Finance and P&L analysis. Look for causal
+      questions and room to develop applied causal inference; verify actual research scope
+      and personal hands-on expectations. Reporting alone is insufficient.
+      Search internationally from Sao Paulo; verify hiring from Brazil, working language,
+      contract, work mode and readiness. English working language is required. Project
+      management and people interaction are required; direct reports are optional.
+      Prolonged individual analysis without people interaction is outside the search.
+    keywords: [Head of Analytics, Analytics Manager, Product Analytics Lead, Lead Product Analyst, Analytics Project Manager, Monetization Analytics Manager, Pricing Analytics Manager]
     rules:
-      positive_title_signals: [head of analytics, head of data, analytics manager, product analytics, lead product analyst]
-      positive_description_signals: [experimentation, pricing, monetization, analytics leadership]
+      positive_title_signals: [head of analytics, head of data, analytics manager, product analytics, lead product analyst, analytics project manager]
     scoring:
-      title_weights: {head of analytics: 8, head of data: 7, analytics manager: 8, product analytics lead: 8, product analytics: 5}
-      description_weights: {experimentation: 3, pricing: 3, monetization: 3, unit economics: 3, kpi governance: 3}
-      bucket_a_signals: [experimentation, pricing, monetization, marketplace]
-      bucket_b_signals: [product strategy, growth analytics, strategic analytics]
+      title_weights: {head of analytics: 8, head of data: 4, analytics manager: 8, product analytics lead: 8, product analytics: 2, lead product analyst: 8, analytics project manager: 8}
+      description_weights:
+        <<: *decision_weights
+        kpi governance: 2
+        product analytics: 2
 
   - id: business-analytics
     name: Business Analytics
     enabled: true
     context: >
-      Business Analyst Manager, Business Analytics Manager, Head of Business Analytics,
-      or adjacent business operations and decision support leadership.
-      English working language. Remote hiring from Brazil or local work in Sao Paulo.
-    keywords: [Business Analytics Manager, Business Analyst Manager, Head of Business Analytics]
+      Business/strategic analytics and decision support with measurable influence on unit
+      actions, economics, budgets and planning. Prefer unit economics, general manager or
+      Finance partnership and P&L analysis; routine reporting and requirements gathering
+      alone are insufficient. Forecasting is useful when connected to business decisions.
+      Causal inference is a development preference, not a mandatory proven user competency.
+      Search internationally from Sao Paulo; verify hiring from Brazil, working language,
+      contract, work mode and readiness. English working language and project management
+      with people interaction are required; direct reports are optional. Prolonged solo
+      analyst work is outside the search regardless of its title.
+    keywords: [Business Analytics Manager, Business Analytics Lead, Head of Business Analytics, Strategic Analytics, Decision Science Lead, Unit Economics, Strategic Finance]
     rules:
-      positive_title_signals: [business analytics, business analyst manager, business analysis manager, business operations]
-      positive_description_signals: [business strategy, decision support, forecasting, stakeholder management]
+      positive_title_signals: [business analytics, business analyst manager, business analysis manager, strategic analytics, decision science, strategic finance]
     scoring:
-      title_weights: {business analytics manager: 8, business analyst manager: 8, head of business analytics: 8, business analytics: 5, business operations: 4}
-      description_weights: {business strategy: 3, decision support: 3, forecasting: 3, stakeholder management: 2, business requirements: 2}
-      bucket_a_signals: [business strategy, decision support, forecasting]
-      bucket_b_signals: [strategic analytics, business requirements, revenue]
+      title_weights: {business analytics manager: 8, business analyst manager: 8, head of business analytics: 8, business analytics lead: 8, business analytics: 2, strategic analytics: 7, strategic finance: 7, decision science lead: 8, business operations: 2}
+      description_weights:
+        <<: *decision_weights
+        business strategy: 3
+        forecasting: 2
+        business requirements: 1
 
   - id: data-science-management
     name: Data Science Management
     enabled: true
     context: >
-      Data Science Manager or Product Data Science Manager with team leadership and
-      product/business ownership. Technical and adjacent data science roles remain reviewable.
-      English working language. Remote hiring from Brazil or local work in Sao Paulo.
-    keywords: [Data Science Manager, Product Data Science Manager, Head of Data Science, Data Science Lead]
+      Product/business Data Science and Decision Science roles where data, experiments
+      and causal research influence business or economic decisions. Team leadership may
+      be relevant, but title and management alone are insufficient. Prefer pricing,
+      monetization, unit economics, general manager or Finance partnership and P&L analysis.
+      Generic model development or infrastructure alone does not establish this mandate.
+      Causal inference is a desired specialization; verify current personal research
+      readiness and hands-on requirements. Search internationally from Sao Paulo; verify
+      hiring from Brazil, working language, contract and work mode. English working language
+      and project management with people interaction are required; direct reports are
+      optional. Prolonged solo analysis is outside the search regardless of its title.
+    keywords: [Data Science Manager, Product Data Science Manager, Head of Data Science, Data Science Lead, Decision Science Manager, Decision Science Lead, Causal Inference Lead]
     rules:
-      positive_title_signals: [data science manager, head of data science, data scientist, data science lead]
-      positive_description_signals: [team leadership, experimentation, product analytics, decision science]
-      negative_title_signals: []
-      negative_description_signals: []
+      positive_title_signals: [data science manager, head of data science, data scientist, data science lead, decision science]
     scoring:
-      title_weights: {data science manager: 8, product data science manager: 8, head of data science: 8, data science lead: 7, data scientist: 4}
-      description_weights: {team leadership: 3, experimentation: 3, product analytics: 3, decision science: 3, people management: 3}
-      bucket_a_signals: [team leadership, experimentation, product analytics]
-      bucket_b_signals: [forecasting, stakeholder management, business impact]
+      title_weights: {data science manager: 8, head of data science: 8, data science lead: 7, decision science manager: 8, decision science lead: 8, staff data scientist: 6, principal data scientist: 6, data scientist: 2}
+      description_weights:
+        <<: *decision_weights
+        product analytics: 2
+        team leadership: 1
+        people management: 1
+      bucket_b_signals: [forecasting, stakeholder management, business impact, team leadership, people management, marketplace, classifieds]

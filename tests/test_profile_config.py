@@ -32,7 +32,7 @@ def _job(**changes) -> JobRecord:
         "original_url": "https://example.com/job",
         "location_text": "Brazil",
         "remote_text": "Remote",
-        "description_clean": "Own product discovery and roadmap.",
+        "description_clean": "Own pricing, monetization and experimentation with business teams.",
         "source_metadata": {"working_language": "English"},
     }
     return JobRecord(**{**fields, **changes})
@@ -59,6 +59,9 @@ def test_all_four_real_streams_share_broad_personal_constraints(streams) -> None
     for stream in streams:
         assert stream.rules.recall_first is True
         assert stream.rules.required_languages == ["English"]
+        assert stream.rules.required_annotation_focus == [
+            "project_management", "people_interaction", "decision_influence", "working_english",
+        ]
         assert stream.rules.onsite_locations
         assert stream.context and stream.keywords
 
@@ -66,12 +69,21 @@ def test_all_four_real_streams_share_broad_personal_constraints(streams) -> None
 @pytest.mark.parametrize(
     ("profile_id", "title", "description"),
     [
-        ("product-management", "Product Manager", "Own product discovery and roadmap."),
-        ("analytics-leadership", "Head of Analytics", "Own pricing and monetization."),
-        ("business-analytics", "Business Analyst Manager", "Own decision support and forecasting."),
+        (
+            "product-management", "Product Manager",
+            "Lead pricing, monetization and experimentation projects with business teams.",
+        ),
+        (
+            "analytics-leadership", "Head of Analytics",
+            "Lead pricing and monetization projects with the general manager and Finance.",
+        ),
+        (
+            "business-analytics", "Business Analyst Manager",
+            "Lead decision support, budget planning and forecasting with Finance.",
+        ),
         (
             "data-science-management", "Data Science Manager",
-            "Own team leadership and experimentation.",
+            "Lead experimentation and unit economics projects for business decisions.",
         ),
     ],
 )
@@ -86,6 +98,138 @@ def test_target_roles_are_ranked_in_their_own_stream(
     assert target.evaluation.bridge_role is True
     assert target.evaluation.tier == JobTier.A
     assert target.evaluation.fit_score == max(item.evaluation.fit_score for item in items)
+
+
+def test_economic_product_decisions_outrank_generic_product_management(streams) -> None:
+    product = next(stream for stream in streams if stream.id == "product-management")
+    generic = _evaluate(
+        product, _job(description_clean="Own product discovery, user research and roadmap."),
+    )
+    economic = _evaluate(
+        product,
+        _job(description_clean=(
+            "Lead pricing and monetization projects. Work with the general manager and "
+            "Finance on P&L and business decisions."
+        )),
+    )
+    assert economic.evaluation.tier == JobTier.A
+    assert generic.evaluation.tier != JobTier.A
+    assert economic.evaluation.fit_score > generic.evaluation.fit_score
+
+
+def test_decision_science_outranks_technical_model_development(streams) -> None:
+    science = next(stream for stream in streams if stream.id == "data-science-management")
+    technical = _evaluate(
+        science,
+        _job(
+            title="Data Science Manager",
+            description_clean="Lead model development, infrastructure and model deployment.",
+        ),
+    )
+    decision = _evaluate(
+        science,
+        _job(
+            title="Data Science Manager",
+            description_clean=(
+                "Lead causal inference and experimentation projects with Finance to "
+                "inform pricing and business decisions."
+            ),
+        ),
+    )
+    assert decision.evaluation.tier == JobTier.A
+    assert technical.evaluation.tier != JobTier.A
+    assert decision.evaluation.fit_score > technical.evaluation.fit_score
+
+
+def test_reports_only_role_remains_reviewable_below_a(streams) -> None:
+    record = _job(
+        title="Head of Analytics",
+        description_clean=(
+            "Reporting only. Produce reports on pricing, monetization and experimentation."
+        ),
+    )
+    for stream in streams:
+        item = _evaluate(stream, record)
+        assert item.evaluation.decision == FilterDecision.REVIEW
+        assert "desc_blocker:reporting only" in item.evaluation.risks
+        assert item.evaluation.tier != JobTier.A
+        assert item.evaluation.blocker_signals == []
+
+
+def test_project_leadership_without_direct_reports_remains_a_target(streams) -> None:
+    analytics = next(stream for stream in streams if stream.id == "analytics-leadership")
+    record = _job(
+        title="Product Analytics Lead",
+        description_clean=(
+            "Lead pricing and monetization projects with the general manager and Finance. "
+            "Manage cross-functional stakeholders to inform business decisions. "
+            "This role has no direct reports."
+        ),
+    )
+    item = _evaluate(analytics, record)
+    assert item.evaluation.decision == FilterDecision.PASS
+    assert item.evaluation.tier == JobTier.A
+    assert item.evaluation.blocker_signals == []
+    assert item.evaluation.risks == []
+
+
+def test_individual_analyst_needs_evidence_of_project_leadership(streams) -> None:
+    description = (
+        "Apply causal inference and experimentation to pricing, monetization and unit "
+        "economics to inform business decisions."
+    )
+    individual = _job(title="Staff Data Scientist", description_clean=description)
+    for stream in streams:
+        item = _evaluate(stream, individual)
+        assert item.evaluation.decision == FilterDecision.REVIEW
+        assert "role:required_scope_unconfirmed" in item.evaluation.risks
+        assert item.evaluation.tier != JobTier.A
+
+    science = next(stream for stream in streams if stream.id == "data-science-management")
+    project_lead = _evaluate(
+        science,
+        _job(
+            title="Staff Data Scientist",
+            description_clean=(
+                f"{description} Lead cross-functional projects and manage stakeholders. "
+                "This role has no direct reports."
+            ),
+        ),
+    )
+    assert project_lead.evaluation.decision == FilterDecision.PASS
+    assert project_lead.evaluation.tier == JobTier.A
+    assert "role:required_scope_unconfirmed" not in project_lead.evaluation.risks
+
+
+@pytest.mark.parametrize(
+    "solo_scope",
+    ["solo analysis only", "individual analysis only", "without stakeholder interaction"],
+)
+def test_prolonged_solo_analysis_cannot_be_a_target_despite_manager_title(
+    streams, solo_scope,
+) -> None:
+    record = _job(
+        title="Analytics Manager",
+        description_clean=(
+            f"The role requires {solo_scope}. Analyze pricing, monetization and "
+            "experimentation to inform business decisions."
+        ),
+    )
+    for stream in streams:
+        item = _evaluate(stream, record)
+        assert item.evaluation.decision == FilterDecision.REVIEW
+        assert f"desc_blocker:{solo_scope}" in item.evaluation.risks
+        assert item.evaluation.tier != JobTier.A
+
+
+def test_confirmed_other_working_language_rejects_in_every_stream(streams) -> None:
+    record = _job(source_metadata={"working_language": "Portuguese"})
+    for stream in streams:
+        item = _evaluate(stream, record)
+        assert item.evaluation.decision == FilterDecision.REJECT
+        assert "language:working_language:Portuguese" in item.evaluation.blocker_signals
+        assert item.evaluation.tier == JobTier.C
+        assert item.evaluation.fit_score == 0
 
 
 def test_unknown_english_language_stays_reviewable_with_real_rules(streams) -> None:

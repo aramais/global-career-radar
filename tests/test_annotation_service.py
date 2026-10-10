@@ -169,6 +169,62 @@ def test_interrupted_review_resumes_extraction_from_small_chunk_checkpoint(confi
     assert {row["stage"] for row in result["usage"]} == {"extract", "review"}
 
 
+def test_failed_review_saves_safe_diagnostics_and_tokens_then_retries(config):
+    annotator, fake = annotator_with_fake(config)
+    job = record()
+    original = fake.generate
+
+    def truncated(model, prompt):
+        if model == config.review_model:
+            raise ai.AnnotationModelError(
+                "Annotation provider returned an incomplete result.", code="output_truncated",
+                finish_reason="MAX_TOKENS",
+                usage={"input_tokens": 100, "output_tokens": 4096, "total_tokens": 4196},
+            )
+        return original(model, prompt)
+
+    fake.generate = truncated
+    result = annotator.annotate(job, use_ai=True)
+    assert result["status"] == "partial"
+    assert len(result["errors"]) == 1
+    diagnostic = result["errors"][0]
+    assert diagnostic["stage"] == "review"
+    assert diagnostic["code"] == "output_truncated"
+    assert diagnostic["finish_reason"] == "MAX_TOKENS"
+    assert diagnostic["chunk_id"] in result["stages"]
+    assert diagnostic["usage"]["output_tokens"] == 4096
+    failed = [row for row in result["usage"] if row.get("failed")]
+    assert len(failed) == 1
+    assert failed[0]["stage"] == "review"
+    assert failed[0]["output_tokens"] == 4096
+    saved = json.loads(cache_path(annotator, job).read_text())
+    assert saved["errors"] == result["errors"]
+    resumed, resumed_fake = annotator_with_fake(config)
+    result = resumed.annotate(job, use_ai=True)
+    assert result["status"] == "reviewed"
+    assert result["errors"] == []
+    assert [stage for stage, _ in resumed_fake.calls] == ["review"]
+
+
+def test_invalid_extraction_envelope_has_stage_diagnostic_and_is_not_cached(config):
+    annotator, fake = annotator_with_fake(config)
+
+    def invalid(_model, _prompt):
+        return {"private-response": "private-key/raw-source"}, {
+            "input_tokens": 5, "output_tokens": 7, "total_tokens": 12,
+        }
+
+    fake.generate = invalid
+    job = record()
+    result = annotator.annotate(job, use_ai=True)
+    assert result["status"] == "partial"
+    assert result["errors"][0]["code"] == "invalid_extraction"
+    assert result["errors"][0]["stage"] == "extract"
+    assert result["usage"][0]["failed"] is True
+    assert "private-key" not in json.dumps(result)
+    assert not any(stage.get("extraction") for stage in result["stages"].values())
+
+
 def test_checkpoint_write_volume_is_bounded_by_source_size(config, monkeypatch):
     annotator, _ = annotator_with_fake(config, extractor=lambda _: [])
     sizes = []
@@ -345,6 +401,179 @@ def test_partial_resume_only_retries_missing_review(config):
     assert [stage for stage, _ in retried.calls] == ["review"]
     assert resumed["status"] == "reviewed"
     assert resumed["coverage"] == {"chunks": 1, "completed_chunks": 1}
+
+
+def many_claim_record():
+    return record(
+        remote_text="",
+        description_clean="Responsibilities:\n" + "\n".join(
+            f"You will coordinate project {index} with customers and business leaders."
+            for index in range(24)
+        ),
+    )
+
+
+def extract_responsibilities(data):
+    return [{
+        "kind": "responsibility", "value": unit["text"],
+        "unit_id": unit["unit_id"], "source_snippet": unit["text"],
+        "requirement": "informational", "polarity": "affirmative", "is_inference": False,
+    } for unit in data["units"] if unit["field"].startswith("description")
+            and "You will" in unit["text"]]
+
+
+def test_large_review_batches_preserve_full_source_and_cover_every_claim_once(config):
+    config = replace(config, chunk_chars=20000, review_batch_size=8)
+    annotator, fake = annotator_with_fake(config, extractor=extract_responsibilities)
+    result = annotator.annotate(many_claim_record(), use_ai=True)
+    extracted = next(data for stage, data in fake.calls if stage == "extract")
+    reviewed = [data for stage, data in fake.calls if stage == "review"]
+    assert len(reviewed) >= 3
+    assert all(data["units"] == extracted["units"] for data in reviewed)
+    assert all(data["chunk_id"] == extracted["chunk_id"] for data in reviewed)
+    assert all(1 <= len(data["claims"]) <= 8 for data in reviewed)
+    reviewed_ids = [claim["claim_id"] for data in reviewed for claim in data["claims"]]
+    assert len(reviewed_ids) == len(set(reviewed_ids))
+    assert set(reviewed_ids) == {claim["claim_id"] for claim in result["claims"]}
+    assert result["status"] == "reviewed"
+    assert annotator.stats["review_calls"] == len(reviewed)
+    stage = result["stages"][extracted["chunk_id"]]
+    assert len(stage["review_batches"]) == len(reviewed)
+    assert len(stage["review"]["reviews"]) == len(reviewed_ids)
+
+
+def test_failed_later_batch_preserves_completed_review_and_resumes_only_missing_batches(config):
+    config = replace(config, chunk_chars=20000, review_batch_size=8)
+    first, fake = annotator_with_fake(config, extractor=extract_responsibilities)
+    original = fake.generate
+    requests = 0
+
+    def fail_second_batch(model, prompt):
+        nonlocal requests
+        if model == config.review_model:
+            requests += 1
+            if requests == 2:
+                raise ai.AnnotationModelError(
+                    "Annotation provider returned an incomplete result.",
+                    code="output_truncated", finish_reason="MAX_TOKENS",
+                    usage={"input_tokens": 100, "output_tokens": 8192, "total_tokens": 8292},
+                )
+        return original(model, prompt)
+
+    fake.generate = fail_second_batch
+    job = many_claim_record()
+    partial = first.annotate(job, use_ai=True)
+    assert partial["status"] == "partial"
+    assert partial["coverage"]["completed_chunks"] == 0
+    assert partial["errors"][0]["batch_id"] == "batch-000002"
+    first_review = next(data for stage, data in fake.calls if stage == "review")
+    completed_ids = {claim["claim_id"] for claim in first_review["claims"]}
+    assert {
+        claim["claim_id"] for claim in partial["claims"] if claim["review_method"] == "model"
+    } == completed_ids
+    assert all(
+        claim["review_status"] != "SUPPORTED" for claim in partial["claims"]
+        if claim["claim_id"] not in completed_ids
+    )
+    failed = [usage for usage in partial["usage"] if usage.get("failed")]
+    assert len(failed) == 1 and failed[0]["batch_id"] == "batch-000002"
+    cache_path(first, job).unlink()
+    resumed, retry = annotator_with_fake(config, extractor=extract_responsibilities)
+    result = resumed.annotate(job, use_ai=True)
+    assert result["status"] == "reviewed"
+    assert result["errors"] == []
+    assert all(stage == "review" for stage, _ in retry.calls)
+    assert not completed_ids.intersection(
+        claim["claim_id"] for _, data in retry.calls for claim in data["claims"]
+    )
+    assert {
+        claim["claim_id"] for claim in result["claims"] if claim["review_method"] == "model"
+    } == {claim["claim_id"] for claim in result["claims"]}
+
+
+def test_interrupted_later_batch_resumes_completed_batch_checkpoint(config):
+    config = replace(config, chunk_chars=20000, review_batch_size=8)
+    first, fake = annotator_with_fake(config, extractor=extract_responsibilities)
+    original = fake.generate
+    requests = 0
+
+    def interrupt_second_batch(model, prompt):
+        nonlocal requests
+        if model == config.review_model:
+            requests += 1
+            if requests == 2:
+                raise KeyboardInterrupt("simulated process interruption")
+        return original(model, prompt)
+
+    fake.generate = interrupt_second_batch
+    job = many_claim_record()
+    with pytest.raises(KeyboardInterrupt):
+        first.annotate(job, use_ai=True)
+    assert not cache_path(first, job).exists()
+    completed_ids = {
+        claim["claim_id"] for stage, data in fake.calls if stage == "review"
+        for claim in data["claims"]
+    }
+    resumed, retry = annotator_with_fake(config, extractor=extract_responsibilities)
+    result = resumed.annotate(many_claim_record(), use_ai=True)
+    assert result["status"] == "reviewed"
+    assert all(stage == "review" for stage, _ in retry.calls)
+    assert not completed_ids.intersection(
+        claim["claim_id"] for _, data in retry.calls for claim in data["claims"]
+    )
+
+
+def test_review_cannot_use_foreign_id_to_promote_another_batch(config):
+    config = replace(config, chunk_chars=20000, review_batch_size=8)
+    annotator, fake = annotator_with_fake(config, extractor=extract_responsibilities)
+    original = fake.generate
+    job = many_claim_record()
+    all_drafts = []
+
+    def inject_foreign_review(model, prompt):
+        if model == config.extract_model:
+            payload, usage = original(model, prompt)
+            from job_intake.annotation.service import _drafts
+
+            chunk = chunk_source(source_units(job), config.chunk_chars)[0]
+            all_drafts.extend(_drafts(
+                payload, source_identity(job), chunk["units"], chunk["chunk_id"]
+            )[0])
+            return payload, usage
+        payload, usage = original(model, prompt)
+        assert len(all_drafts) > config.review_batch_size
+        payload["reviews"].append({
+            "claim_id": all_drafts[config.review_batch_size]["claim_id"],
+            "review_status": "SUPPORTED", "review_notes": "Foreign claim", "is_inference": False,
+        })
+        return payload, usage
+
+    fake.generate = inject_foreign_review
+    partial = annotator.annotate(job, use_ai=True)
+    assert partial["status"] == "partial"
+    foreign = next(
+        claim for claim in partial["claims"]
+        if claim["claim_id"] == all_drafts[config.review_batch_size]["claim_id"]
+    )
+    assert foreign["review_method"] == "unreviewed"
+    assert foreign["review_status"] != "SUPPORTED"
+    assert any("does not identify" in row["reason"] for row in partial["rejected"])
+    assert partial["errors"][0]["code"] == "invalid_review"
+    assert partial["errors"][0]["batch_id"] == "batch-000001"
+
+
+def test_review_batch_size_change_reuses_extraction_but_rebuilds_review(config):
+    config = replace(config, chunk_chars=20000, review_batch_size=8)
+    first, _ = annotator_with_fake(config, extractor=extract_responsibilities)
+    job = many_claim_record()
+    initial = first.annotate(job, use_ai=True)
+    changed = replace(config, review_batch_size=4)
+    second, fake = annotator_with_fake(changed, extractor=extract_responsibilities)
+    result = second.annotate(job, use_ai=True)
+    assert initial["cache_key"] != result["cache_key"]
+    assert result["status"] == "reviewed"
+    assert all(stage == "review" for stage, _ in fake.calls)
+    assert all(len(data["claims"]) <= 4 for _, data in fake.calls)
 
 
 def test_all_chunks_and_final_tail_are_present_in_both_passes(config):
@@ -653,6 +882,86 @@ def test_offline_partial_preserves_unfinished_review_and_never_promotes(config):
     apply_annotation_constraints(offline_job, evaluation, engine())
     assert evaluation.decision == FilterDecision.REVIEW
     assert "annotation:incomplete_source_review" in evaluation.risks
+
+
+@pytest.mark.parametrize("corrupt_extraction", [False, True])
+def test_offline_partial_retains_source_seeds_when_extraction_failed(
+    config, monkeypatch, corrupt_extraction,
+):
+    config = replace(config, chunk_chars=256)
+    first, fake = annotator_with_fake(config)
+    original = fake.generate
+    failed = False
+
+    def fail_first_extraction(model, prompt):
+        nonlocal failed
+        if model == config.extract_model and not failed:
+            failed = True
+            raise ai.AnnotationModelError(
+                "Annotation returned invalid JSON.", code="invalid_json",
+                usage={"input_tokens": 30, "output_tokens": 20, "total_tokens": 50},
+            )
+        return original(model, prompt)
+
+    fake.generate = fail_first_extraction
+    job = record(description_clean="Responsibilities:\n" + "\n".join(
+        f"You will coordinate project {index} with customers and business leaders."
+        for index in range(10)
+    ))
+    partial = first.annotate(job, use_ai=True)
+    assert partial["coverage"]["chunks"] > 1
+    assert partial["status"] == "partial"
+    failed_chunk = partial["errors"][0]["chunk_id"]
+    retained_ids = {
+        claim["claim_id"] for claim in partial["claims"] if claim["chunk_id"] == failed_chunk
+    }
+    assert retained_ids
+    if corrupt_extraction:
+        partial["stages"][failed_chunk]["extraction"] = {"invalid_envelope": []}
+    cache_path(first, job).unlink()
+    offline_job = replace(job, annotation=deepcopy(partial))
+    offline_annotator = VacancyAnnotator(config)
+    with monkeypatch.context() as offline_patch:
+        offline_patch.setattr(
+            Path, "read_text", lambda *_args, **_kwargs: pytest.fail("Offline cache read")
+        )
+        offline = offline_annotator.annotate(offline_job)
+    assert {claim["claim_id"] for claim in offline["claims"]} == {
+        claim["claim_id"] for claim in partial["claims"]
+    }
+    assert all(
+        claim["review_status"] == "UNREVIEWED" and claim.get("review_method") != "local"
+        for claim in offline["claims"] if claim["claim_id"] in retained_ids
+    )
+    assert offline["status"] == "partial"
+    assert offline["method"] == "two_pass"
+    assert offline["coverage"] == partial["coverage"]
+    assert offline["errors"] == partial["errors"]
+    assert offline["issues"] == partial["issues"]
+    assert offline_annotator.stats["extraction_calls"] == 0
+    assert offline_annotator.stats["review_calls"] == 0
+    from job_intake.annotation.evaluation import evaluate_annotation
+    from job_intake.config.settings import PrefilterConfig
+
+    result = evaluate_annotation(offline_job, config, PrefilterConfig())
+    findings = {finding["code"] for finding in result["findings"]}
+    assert result["integrity"] == "error"  # The original failed stage still needs review.
+    assert not findings.intersection({
+        "saved_claims_missing", "unattributable_saved_claim",
+        "saved_claim_review_mismatch", "summary_mismatch",
+    })
+    evaluation = JobEvaluation(decision=FilterDecision.PASS, bridge_role=True)
+    apply_annotation_constraints(offline_job, evaluation, engine())
+    assert evaluation.decision == FilterDecision.REVIEW
+    assert "annotation:incomplete_source_review" in evaluation.risks
+    # Offline reconstruction leaves the valid paid stages reusable: only the
+    # original failed extraction and its review are requested on an AI resume.
+    resumed, retry = annotator_with_fake(config)
+    result = resumed.annotate(offline_job, use_ai=True)
+    assert result["status"] == "reviewed"
+    assert result["errors"] == []
+    assert [stage for stage, _ in retry.calls] == ["extract", "review"]
+    assert retained_ids <= {claim["claim_id"] for claim in result["claims"]}
 
 
 def test_partial_record_resumes_from_persisted_stages_when_cache_file_is_missing(config):

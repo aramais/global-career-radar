@@ -1,11 +1,19 @@
-# High-recall mode: role mismatch lowers confidence, it does not discard vacancies.
+# Synced with career-orientation 2026-10-10 and direct user clarification in HR.
+# High-recall mode: unconfirmed scope stays REVIEW; explicit hiring blockers still reject.
 recall_first: true
 onsite_locations: [Sao Paulo, São Paulo]
 required_languages: [English]
+# The user manages projects and works with people; direct reports are optional.
+# These are evidence proxies: title alone does not confirm day-to-day responsibilities.
+required_scope_title_signals: [manager, head of, lead, director, chief, vice president]
+required_scope_description_signals: [project management, project leadership, program management, program leadership, lead projects, lead analytics projects, lead analytical projects, lead cross-functional projects, manage projects, managing projects, manage analytics projects, cross-functional leadership, manage stakeholders, team leadership, people management, manage a team]
+# Independently reviewed AI evidence must confirm actual responsibilities, not title alone.
+# P&L/Finance and causal inference remain preferences; direct reports are optional.
+required_annotation_focus: [project_management, people_interaction, decision_influence, working_english]
 positive_title_signals: []
-positive_description_signals: []
+positive_description_signals: [pricing, monetization, experimentation, causal inference, causal impact, decision science, decision support, strategic decisions, business decisions, unit economics, p&l, profit and loss, general manager, finance business partner, budget planning, commercial strategy, marketplace economics]
 negative_title_signals: [recruiting analytics, people analytics, security analytics]
-negative_description_signals: [recruiting analytics, hr analytics, fraud detection only]
+negative_description_signals: [recruiting analytics, hr analytics, fraud detection only, reporting only, reports only, dashboard maintenance only, dashboards only, routine reporting only, only produce reports, solo analysis only, individual analysis only, without stakeholder interaction]
 company_blacklist: []
 company_whitelist: []
 target_geographies: [Brazil, Brasil, BR, worldwide, global remote, LATAM, Latin America, South America, Americas]

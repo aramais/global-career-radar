@@ -81,6 +81,9 @@ class FilterRules:
     recall_first: bool = False
     onsite_locations: list[str] | None = None
     required_languages: list[str] | None = None
+    required_scope_title_signals: list[str] | None = None
+    required_scope_description_signals: list[str] | None = None
+    required_annotation_focus: list[str] | None = None
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> FilterRules:
@@ -102,6 +105,9 @@ class FilterRules:
             recall_first=data.get("recall_first", False),
             onsite_locations=data.get("onsite_locations", []),
             required_languages=data.get("required_languages", []),
+            required_scope_title_signals=data.get("required_scope_title_signals", []),
+            required_scope_description_signals=data.get("required_scope_description_signals", []),
+            required_annotation_focus=data.get("required_annotation_focus", []),
         )
 
 
@@ -201,9 +207,25 @@ class RuleEngine:
         review_hits = contains_any(text_blob, self.rules.review_phrases)
         risks.extend([f"review_flag:{hit}" for hit in review_hits])
 
+        scope_title_signals = self.rules.required_scope_title_signals or []
+        scope_description_signals = self.rules.required_scope_description_signals or []
+        if scope_title_signals or scope_description_signals:
+            scope_title_hits = asserted_phrase_hits(job.title, scope_title_signals, required=True)
+            scope_description_hits = asserted_phrase_hits(
+                role_description(job, exclude_boilerplate=True),
+                scope_description_signals, required=True,
+            )
+            matched.extend([f"scope_title:{hit}" for hit in scope_title_hits])
+            matched.extend([f"scope_description:{hit}" for hit in scope_description_hits])
+            if not scope_title_hits and not scope_description_hits:
+                risks.append("role:required_scope_unconfirmed")
+                reasons.append("Required role scope is not confirmed by the title or description.")
+
         if blockers:
             decision = FilterDecision.REJECT
-        elif self.rules.recall_first and risks:
+        elif risks and (
+            self.rules.recall_first or "role:required_scope_unconfirmed" in risks
+        ):
             reasons.append("Keep this opportunity for manual review of the flagged conditions.")
             decision = FilterDecision.REVIEW
         elif not positive_title_hits and not positive_desc_hits:
@@ -323,8 +345,13 @@ class RuleEngine:
                 r"\b(?:this role|this position|this job|you|candidates|applicants)\b", clause,
             ):
                 continue
+            # A candidate location before the obligation is not the office
+            # location ("candidates in Brazil must work onsite in London").
+            office_match = re.search(rf"\b{office}\b", clause)
+            office_context = clause[office_match.end():] if office_match else clause
             location = re.search(
-                r"\b(?:from|at|in|based in)\s+(?:(?:our|the|an?)\s+)?([^.;!?|]+)", clause,
+                r"\b(?:from|at|in|based in)\s+(?:(?:our|the|an?)\s+)?([^.;!?|]+)",
+                office_context,
             )
             locations.append(location[1].strip() if location else job.location_text)
         return locations
@@ -340,12 +367,26 @@ class RuleEngine:
         normalized = re.sub(
             r"\b(?:on[ -]?site|hybrid|in[ -]office|office[ -]based|remote)\b", "", normalized
         ).strip(" ,-/")
-        unknown = {"", "office", "tbd", "multiple locations", "location not specified"}
+        normalized = re.sub(r"^(?:our|the|an?)\s+", "", normalized)
+        unknown = {
+            "", "office", "offices", "headquarters", "hq", "tbd", "multiple locations",
+            "location not specified", "person",
+        }
         # A permitted country/region does not confirm the specific office city.
         unknown.update(
             normalize_text(self._geo_text(place)) for place in self.rules.target_geographies
         )
-        return normalized in unknown
+        if normalized in unknown:
+            return True
+        # Prepositions introduce time and generic office references too. Neither
+        # states a city that can safely support a hard geography rejection.
+        return bool(re.search(
+            r"^(?:(?:later|earlier|future|another|scheduled|specified)\s+(?:date|time)|"
+            r"(?:(?:assigned|designated|local|company|corporate|nearest)\s+)?"
+            r"(?:office[s]?|headquarters|hq|location|site)"
+            r"(?:$|\s+(?:for|to|when|on|at|not specified)\b))",
+            normalized,
+        ))
 
     def _geography_signals(self, job: JobRecord, text_blob: str) -> tuple[list[str], list[str]]:
         blockers: list[str] = []
@@ -372,12 +413,20 @@ class RuleEngine:
             r"\b(?:must (?:be (?:based|located)|reside|live)|"
             r"(?:current residence|residency)(?: required)?|"
             r"(?:applicants|candidates) (?:must )?(?:be based|reside|live)) in\s+"
-            r"([^.;!\n|]+)"
+            r"([^;!?\n|]+)"
         )
-        residency_matches = list(residency.finditer(text))
+        # Extract from sentence-aware clauses: a dot inside U.S./U.K. must not
+        # truncate an allowed alternative such as "the U.S. or Brazil".
+        # Split before case-folding so "U.S. Brazil ..." remains two sentences.
+        residency_matches = [
+            match for clause in assertion_clauses(geography_text)
+            for match in residency.finditer(self._geo_text(clause))
+        ]
         asserted_residency = []
         for match in residency_matches:
-            constraint = re.split(r"\b(?:but|however|although)\b", match[0])[0].strip()
+            constraint = re.split(
+                r"\b(?:but|however|although)\b", match[0]
+            )[0].strip().rstrip(".;!? ")
             if not asserted_phrase_hits(text, [constraint], required=True):
                 continue
             asserted_residency.append(match)
@@ -391,7 +440,7 @@ class RuleEngine:
             ) and not self._target_residency(location):
                 risks.append("geography:residency_location_unconfirmed")
             elif not self._target_residency(location):
-                blockers.append(match[0].strip())
+                blockers.append(match[0].strip().rstrip(".;!? "))
 
         for match in re.finditer(
             r"\b(?:cannot hire|can not hire|unable to hire|not hiring|not available|"

@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 from job_intake.models.job import JobRecord
 from job_intake.utils.text import canonicalize_url, contains_any, normalize_text
 
-TEXT_VERSION = "source-units-v2"
+TEXT_VERSION = "source-units-v3"
 _FIELDS = (
     "title", "company", "location_text", "remote_text", "employment_type",
     "salary_text", "timezone_text",
@@ -28,12 +28,14 @@ _HEADINGS = {
     "company": (
         "about us", "about the company", "about company", "who we are", "our company",
         "our mission", "our values", "company overview", "company description",
+        "about the team", "our team",
     ),
     "role": (
         "about the role", "the role", "your role", "role overview", "responsibilities",
         "key responsibilities", "your responsibilities", "what you will do",
         "what you'll do", "what you’ll do", "what you do", "your impact", "the opportunity",
-        "job description", "what you will own", "in this role", "duties",
+        "job description", "what you will own", "what you'll own", "what you’ll own",
+        "in this role", "duties",
     ),
     "requirements": (
         "requirements", "qualifications", "required qualifications", "what you bring",
@@ -142,7 +144,7 @@ def _raw_heading_positions(record: JobRecord, text: str) -> dict[int, str]:
         if section is None or not label:
             continue
         pattern = r"\s+".join(re.escape(word) for word in label.split())
-        match = re.search(pattern, text[cursor:])
+        match = re.search(pattern, text[cursor:], re.I)
         if match is not None:
             position = cursor + match.start()
             positions[position] = section
@@ -346,12 +348,28 @@ def scoped_description_text(description: str) -> str:
     )
 
 
-def role_description(record: JobRecord) -> str:
-    return "\n".join(
-        unit["text"] for unit in source_units(record)
-        if unit["field"].startswith("description_") and unit["section"] != "company"
+def role_description(record: JobRecord, *, exclude_boilerplate: bool = False) -> str:
+    units = [
+        unit for unit in source_units(record)
+        if unit["field"].startswith("description_")
         and not _NAVIGATION.fullmatch(unit["text"])
-    )
+    ]
+    if not exclude_boilerplate:
+        return "\n".join(unit["text"] for unit in units if unit["section"] != "company")
+    # Keep unsectioned role prose, but stop at Benefits/How to apply/etc. until
+    # a role or requirements section resumes. Source-unit scope also covers HTML headings.
+    kept = []
+    previous_section, excluded = "other", False
+    for unit in units:
+        section = unit["section"]
+        if section == "other":
+            excluded = excluded or previous_section != "other" or _heading(unit["text"]) == "other"
+        else:
+            excluded = section == "company"
+        if not excluded:
+            kept.append(unit["text"])
+        previous_section = section
+    return "\n".join(kept)
 
 
 def asserted_phrase_hits(text: str, phrases: list[str], *, required: bool = False) -> list[str]:

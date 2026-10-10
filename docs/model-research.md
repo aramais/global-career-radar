@@ -6,6 +6,79 @@
 Точность перечисленных моделей на наших вакансиях пока не измерена: live benchmark
 без API-ключей не запускался. Пресеты — кандидаты для сравнения, не рейтинг точности.
 
+## Выбор по умолчанию 10.10.2026
+
+По запросу «высокая точность, низко-средняя цена» модель извлечения в
+`config/settings.yaml` заменена с `gemini-2.5-flash-lite` на стабильную
+`gemini-3.8-flash`. Google описывает её как наиболее сильную Flash-модель и
+рекомендует thinking `medium` для качества большинства задач. Выбор для наших
+условий, отрицаний и обязанностей — инженерная оценка по возможностям модели;
+повышение точности именно на вакансиях ещё не измерено.
+[Описание модели](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash),
+[режимы reasoning](https://ai.google.dev/gemini-api/docs/latest-model).
+
+| Поле `annotation` в `config/settings.yaml` | Было | Стало |
+| --- | --- | --- |
+| `extract_model` | `gemini-2.5-flash-lite` | `gemini-3.8-flash` |
+| `extract_reasoning_effort` | отсутствовало; для 2.5 thinking level не передавался | `medium` |
+| `max_output_tokens` | `4096` | `8192` |
+| `review_max_output_tokens` | общий лимит `8192` | `16384`, только review |
+| `review_batch_size` | все drafts блока одним запросом | `8`, полный исходный блок в каждой порции |
+| `review_model` | `gemini-2.5-pro` | `gemini-3.6-flash` |
+| `review_reasoning_effort` | общая настройка `low` | `medium` |
+
+Выходной лимит увеличен, чтобы reasoning оставлял запас для полного JSON с цитатами;
+это максимум, а не фиксированное число оплачиваемых токенов. В API адаптер уже
+поддерживает Gemini 3: передаёт `thinkingConfig.thinkingLevel` и не отправляет
+старые sampling-параметры. Ключ остаётся `GEMINI_API_KEY`.
+После согласования каскада reviewer заменён с `gemini-2.5-pro` на стабильную
+`gemini-3.6-flash`: новая полная пара — 3.8 Flash → 3.6 Flash с thinking `medium`.
+Смена reviewer инвалидирует его кеш; совместимый кеш извлечения переиспользуется.
+
+После пробного запуска обнаружены `not_duty` и `MAX_TOKENS`. Исправление парсера
+HTML восстанавливает границы обязанностей, требований, benefits и company.
+Review делится на порции по 8 drafts, имеет отдельный лимит 16384; reasoning
+остаётся `medium`. Завершённые порции сохраняются, чтобы ошибка поздней порции
+не требовала повторного платного review ранних. Увеличенный лимит разрешает
+завершить JSON, но не требует расходовать весь максимум. Лимит Gemini включает
+thinking и итоговый ответ, что объясняет пустой ответ при расходе около 8192:
+[официальная документация thinking](https://ai.google.dev/gemini-api/docs/generate-content/thinking).
+Проверка качества по ручному эталону остаётся отдельной задачей.
+Предыдущая смена самого extractor требует нового извлечения, если его кеш ещё
+не создан. Пресеты продолжают задавать собственные пары.
+[Gemini 3.6 Flash](https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash).
+
+Тариф проверен **10.10.2026**: $0.75 за миллион входных и $3.75 за миллион выходных
+токенов, включая thinking, до 31.12.2026; с 01.01.2027 — $1.50/$7.50.
+Эти тарифы действуют для обеих моделей полной пары; каждая стадия оплачивается отдельно.
+[Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing).
+
+## Согласованный предварительный каскад 10.10.2026
+
+При `annotate --ai` основной YAML включает бесплатную проверку локальных
+обязательных препятствий, короткий скрининг 3.5 Flash-Lite и перепроверку
+предполагаемого отсева 3.8 Flash. Совпадающая причина с проверенной цитатой позволяет
+пропустить полную разметку. Неопределённость и сбои оставляют `full_review`.
+Это изменение маршрута обработки, а не новый карьерный профиль или пороги A/B.
+
+Результат скрининга сохраняется под `annotation.prefilter`; LLM-отсев остаётся
+пересматриваемым `REVIEW`/C. Неизвестный рабочий английский, отсутствие прямых
+подчинённых и формальное IC-название не образуют самостоятельного основания
+для отсева. Кеш каскада отделён от extraction/review и содержит исходные решения,
+модели и usage. Действующие ключи и модели видны в `--verbose` без значения ключей.
+
+Ранее измеренный расход на 525 вакансий даёт ориентир около $35 за полную пару
+3.8 → 3.6 при неизменном числе токенов. Если после каскада останется 30% записей,
+оценка составляет $12–16 вместе со скринингом и перепроверкой отсева. Это сценарий,
+а не измеренный счёт: 70% нерелевантности ещё не подтверждены, расход reasoning,
+повторы и реальные ответы могут изменить цену. Качество новой пары и каскада
+нужно проверять по размеченным примерам, особенно предполагаемым отказам.
+
+Native Gemini Batch уменьшает тариф токенов вдвое, но в этом каскаде пока не
+реализован; текущие запросы выполняются обычным способом. Сервис указывает целевое
+ожидание до 24 часов на пакет, а зависимости потребуют нескольких стадий.
+[Gemini Batch API](https://ai.google.dev/gemini-api/docs/batch-api).
+
 ## Тарифы и возможная роль
 
 USD за миллион токенов: обычный вход без кеша и обычный выход. Тарифы Batch, кеш,
@@ -17,8 +90,9 @@ USD за миллион токенов: обычный вход без кеша 
 | `gpt-6-luna` | $0.10 / $0.50 | Недорогое извлечение цитат и атомарных условий | [OpenAI Docs: pricing](https://developers.openai.com/api/docs/pricing) |
 | `gpt-6.1-sol` | $2.00 / $10.00 | Альтернативный генеративный reviewer для сложных условий | [OpenAI Docs: pricing](https://developers.openai.com/api/docs/pricing) |
 | `jev-1.13.0` | $0.042 / $0 | Выбор статуса проверки каждого готового утверждения | [TypeSafe models](https://docs.typesafe.ai/models) |
-| `gemini-3.5-flash-lite` | $0.30 / $2.50 | Альтернативное извлечение | [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) |
-| `gemini-3.8-flash` | $0.75 / $3.75 | Генеративная проверка в пресете `balanced` | [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) |
+| `gemini-3.5-flash-lite` | $0.30 / $2.50 | Предварительный скрининг; извлечение в пресете `balanced` | [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) |
+| `gemini-3.8-flash` | $0.75 / $3.75 | Основное извлечение; короткая перепроверка отсева; reviewer пресета `balanced` | [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) |
+| `gemini-3.6-flash` | $0.75 / $3.75 | Основная независимая проверка | [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) |
 | `mistral-small-2603` | $0.15 / $0.60 | Альтернативное извлечение или проверка | [Mistral Small 4](https://docs.mistral.ai/models/mistral-small-4-0-26-03) |
 | `claude-haiku-4-5` | $1.00 / $5.00 | Генеративное извлечение или проверка с JSON Schema | [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) |
 | `claude-sonnet-5-5` | $2.00 / $10.00 | Альтернативная генеративная проверка | [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) |
@@ -27,7 +101,7 @@ USD за миллион токенов: обычный вход без кеша 
 | `glm-5.3-flash` | $0.15 / $0.50 | Альтернативное извлечение или проверка; учитывать thinking | [Z.AI pricing](https://docs.z.ai/guides/overview/pricing) |
 | `deepseek-flash` | $0.30 / $1.20 peak; $0.15 / $0.60 off-peak | DeepSeek V4.1 Flash; фиксировать время и обслужившую версию | [DeepSeek pricing](https://api-docs.deepseek.com/quick_start/pricing/) |
 
-Цена Gemini 3.8 Flash действует до 31.12.2026 включительно; с 01.01.2027 указан
+Цена Gemini 3.8/3.6 Flash действует до 31.12.2026 включительно; с 01.01.2027 указан
 тариф $1.50/$7.50. OpenAI в таблице использует Standard short-context тариф;
 длинный контекст стоит иначе. Для Qwen важны регион, scope и длина входа.
 Источники тарифов: [Gemini](https://ai.google.dev/gemini-api/docs/pricing),
@@ -75,6 +149,8 @@ Jev возвращает выбор из заданных вариантов и 
 
 ```bash
 .venv/bin/job-intake annotate --config config/settings.yaml --limit 10
+.venv/bin/job-intake annotate --config config/settings.yaml --ai --verbose --limit 10
+.venv/bin/job-intake annotate --config config/settings.yaml --ai --verbose --no-prefilter --limit 10
 .venv/bin/job-intake annotate --config config/settings.yaml --ai --preset budget-jev --limit 10
 .venv/bin/job-intake annotate --config config/settings.yaml --ai --preset balanced --limit 10
 ```
@@ -119,6 +195,23 @@ OpenAI reasoning-моделям и Gemini 3. Compatible transport запраши
 включая отсутствие JSON Schema режима у Singapore models согласно документации.
 [Anthropic structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs),
 [Qwen structured output](https://www.alibabacloud.com/help/en/model-studio/qwen-structured-output).
+
+Gemini GenerateContent получает `generationConfig.responseJsonSchema` для
+extraction, review и ID-only предфильтра. Схема задаёт обязательные поля, допустимые
+значения и ID, а для review — число элементов текущей партии. Дубли, неверные цитаты,
+неподтверждённый смысл и незавершённый JSON по-прежнему отклоняет локальный валидатор.
+Схема снижает риск ошибки формата; смысловую точность измеряет ручной эталон.
+[Gemini structured output](https://ai.google.dev/gemini-api/docs/generate-content/structured-output).
+
+В расширенном проходе 10.10.2026 отдельные review-порции получили HTTP 400 при
+той же структуре, что у успешных соседних запросов. Gemini transport теперь
+использует короткие claim aliases в prompt/schema и строго восстанавливает исходные
+ID перед валидацией. Тексты, thinking и модели сохраняются; совместимые успешные
+порции повторно не оплачиваются. Точная причина прежних HTTP 400 пока не установлена.
+После исправления повторный проход тех же 50 вакансий завершил 39 новых запросов
+без ошибок: 42 записи получили отсев, 8 — полную проверку. Eval этих 50 записей
+прошёл без ошибок и предупреждений. Это проверка целостности и устойчивости;
+выборка из 48 Supabase и 2 Wikimedia вакансий не измеряет точность на всём поиске.
 
 Стандартный endpoint `qwen` относится к Singapore. Для нового workspace или другого
 региона задайте соответствующий `*_base_url`, например

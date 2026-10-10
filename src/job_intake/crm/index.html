@@ -90,6 +90,11 @@ padding-top:10px;border-top:1px solid var(--line)}.annotation-fact{padding:10px 
 border-bottom:1px solid #edf1f5}.annotation-fact blockquote{white-space:pre-wrap;overflow-wrap:anywhere;
 margin:7px 0;padding:6px 12px;border-left:3px solid #cbd9ea;color:var(--muted)}
 .annotation-body h4{margin:14px 0 6px}.annotation-body .tags{margin:.4rem 0}
+.annotation-focus{padding:10px 12px;background:#f7f9fc;border:1px solid var(--line);border-radius:8px}
+.annotation-focus-row{padding:8px 0;border-bottom:1px solid #e8edf3}
+.annotation-focus-row:last-child{border-bottom:0}.annotation-focus-links{overflow-wrap:anywhere}
+.annotation-prefilter-evidence{padding:8px 0}.annotation-prefilter-evidence blockquote{
+white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0;padding-left:10px;border-left:3px solid var(--line)}
 @media(max-width:1050px){.filters{grid-template-columns:repeat(3,1fr)}
 .job-filter-grid{grid-template-columns:repeat(3,1fr)}.grid-cards{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:700px){.wrap{padding:18px 16px}.top{align-items:flex-start}.top .status{display:none}
@@ -775,12 +780,20 @@ async function setJobArchived(job, archived) {
 const annotationKinds = {role:'Роль',responsibility:'Задачи',skill:'Навыки',
   hiring_location:'Страны найма',work_mode:'Формат работы',working_language:'Рабочий язык',
   employment:'Тип договора',timezone:'Часовой пояс',salary:'Оплата',status:'Статус вакансии',
-  work_authorization:'Право на работу'};
+  work_authorization:'Право на работу',project_management:'Руководство проектами',
+  people_interaction:'Работа с людьми',decision_influence:'Влияние на решения',
+  business_economics:'Экономика бизнеса',
+  executive_finance_partnership:'Работа с руководителем бизнеса и финансами',
+  causal_inference:'Причинно-следственный анализ',direct_reports:'Прямые подчинённые',
+  hands_on_analysis:'Личное выполнение анализа',isolated_analysis:'Длительный анализ без работы с людьми'};
+const searchFocusLabels = {...annotationKinds,working_english:'Рабочий английский'};
 const annotationStatuses = {SUPPORTED:'Есть подтверждение',WEAKLY_SUPPORTED:'Слабое подтверждение',
   ANECDOTAL:'Косвенное свидетельство',CONFLICTING:'Противоречие',UNSUPPORTED:'Не подтверждено',
   NEEDS_VERIFICATION:'Нужна проверка',UNREVIEWED:'Ещё не проверено'};
-function annotationFact(claim,conflicted = false) {
+let annotationRenderSerial = 0;
+function annotationFact(claim,conflicted = false,anchor = '') {
   const fact = el('div',null,'annotation-fact');
+  if (anchor) fact.id = anchor;
   fact.append(el('strong',(annotationKinds[claim.kind] || claim.kind) + ': '),
     document.createTextNode(claim.value || ''));
   const tags = el('div',null,'tags');
@@ -802,14 +815,134 @@ function annotationFact(claim,conflicted = false) {
   if (claim.review_notes) fact.append(el('div',claim.review_notes,'tiny muted'));
   return fact;
 }
+function renderSearchFocus(focus,claimAnchors) {
+  const panel = el('div',null,'annotation-focus');
+  panel.append(el('p','Сверка обязанностей вакансии с направлением поиска по цитатам из источника.',
+    'small muted'));
+  if (focus.required_confirmed === true)
+    panel.append(el('p','Обязательные условия поиска подтверждены источником.','small'));
+  const summaries = [
+    ['unconfirmed_required','Обязательные условия без подтверждения: ','small status error'],
+    ['explicit_mismatches','Явные расхождения с поиском: ','small status error'],
+    ['confirmed_preferences','Подтверждённые предпочтения: ','small'],
+  ];
+  summaries.forEach(([key,prefix,className]) => {
+    const names = Array.isArray(focus[key]) ? focus[key] : [];
+    if (names.length) panel.append(el('p',prefix + names.map((name) =>
+      searchFocusLabels[name] || 'Другое условие').join('; '),className));
+  });
+  const priorities = {required:'Нужно для поиска',preferred:'Предпочтение',
+    informational:'Для уточнения',excluded:'Не подходит для поиска'};
+  const statuses = {confirmed:'Есть подтверждение',explicitly_absent:'Явно отсутствует',
+    unknown:'Не подтверждено',conflicting:'Есть противоречие'};
+  Object.entries(focus.dimensions || {}).forEach(([name,dimension]) => {
+    const row = el('div',null,'annotation-focus-row');
+    row.append(el('strong',searchFocusLabels[name] || 'Другое условие'));
+    const neutral = ['direct_reports','hands_on_analysis'].includes(name)
+      || dimension.priority === 'informational';
+    const mismatch = !neutral && (dimension.status === 'conflicting'
+      || (dimension.priority === 'required' && dimension.status === 'explicitly_absent')
+      || (dimension.priority === 'excluded' && dimension.status === 'confirmed'));
+    const confirmed = !neutral && dimension.status === 'confirmed'
+      && ['required','preferred'].includes(dimension.priority);
+    const tags = el('div',null,'tags');
+    tags.append(badge(priorities[dimension.priority] || 'Для уточнения'),
+      badge(statuses[dimension.status] || 'Не подтверждено',mismatch ? 'red'
+        : confirmed ? 'green' : dimension.status === 'unknown' && !neutral ? 'amber' : ''));
+    row.append(tags);
+    if (name === 'direct_reports') row.append(el('div',
+      'Прямые подчинённые не обязательны для поиска.','tiny muted'));
+    if (name === 'hands_on_analysis') row.append(el('div',
+      'Самостоятельный анализ допустим; важны руководство проектами и работа с людьми.',
+      'tiny muted'));
+    [['claim_ids','Цитаты: '],['unresolved_claim_ids','Непроверенные цитаты: ']].forEach(
+      ([key,prefix]) => {
+        const ids = Array.isArray(dimension[key]) ? [...new Set(dimension[key])] : [];
+        if (!ids.length) return;
+        const links = el('div',prefix,'small annotation-focus-links');
+        ids.forEach((id,index) => {
+          if (index) links.append(document.createTextNode(' · '));
+          if (claimAnchors.has(id)) {
+            const link = el('a','Цитата ' + (index + 1)); link.href = '#' + claimAnchors.get(id);
+            link.title = 'Утверждение: ' + id; links.append(link);
+          } else links.append(document.createTextNode('Цитата недоступна'));
+        });
+        row.append(links);
+      });
+    panel.append(row);
+  });
+  return panel;
+}
+function renderPrefilter(prefilter,unitAnchors,anchorPrefix,assessment) {
+  const panel = el('div',null,'annotation-focus');
+  const routing = prefilter.routing;
+  const decision = typeof prefilter.decision === 'string' ? prefilter.decision.toLowerCase() : '';
+  const statuses = {
+    suppressed:['Предварительно отфильтровано','amber',
+      'Подробная AI-проверка пропущена. Вакансия сохранена для ручной проверки (REVIEW, категория C).'],
+    full_review:['Передано на подробную AI-проверку','blue',
+      'Предварительный отбор определяет дальнейшую проверку; условия вакансии требуют подтверждения.'],
+    local_reject:['Явные ограничения вакансии','red',
+      'Подробная AI-проверка пропущена из-за локальных ограничений вакансии.'],
+  };
+  const status = statuses[routing] || ['Результат требует уточнения','amber',
+    'Предварительный отбор не подтверждает соответствие вакансии.'];
+  panel.append(badge(status[0],status[1]),el('p',status[2],'small'));
+  if (routing === 'full_review') {
+    panel.append(el('p',['keep','possible','probable'].includes(decision)
+      ? 'Вероятно подходит по предварительному отбору.'
+      : 'Соответствие пока неясно; вакансия передана на подробную проверку.','small'));
+  }
+  const reason = typeof prefilter.reason === 'string' ? prefilter.reason : '';
+  const reasonCode = typeof prefilter.reason_code === 'string' ? prefilter.reason_code : '';
+  if (reason || reasonCode) panel.append(el('p','Причина: ' + (reason || reasonCode),'small'));
+  if (routing === 'local_reject') {
+    const blockers = [...new Set([
+      ...(Array.isArray(prefilter.blockers) ? prefilter.blockers : []),
+      ...(Array.isArray(assessment?.blocker_signals) ? assessment.blocker_signals : []),
+    ].filter(value => typeof value === 'string'))];
+    if (blockers.length) panel.append(el('p','Ограничения: ' + blockers.join('; '),'small status error'));
+  }
+  const evidence = Array.isArray(prefilter.evidence) ? prefilter.evidence : [];
+  evidence.forEach((item,index) => {
+    if (!item || typeof item.source_snippet !== 'string' || !item.source_snippet.trim()) return;
+    const unitId = typeof item.unit_id === 'string' ? item.unit_id : '';
+    const existingAnchor = unitAnchors.get(unitId);
+    const sourceAnchor = existingAnchor || anchorPrefix + 'prefilter-source-' + index;
+    const row = el('div',null,'annotation-prefilter-evidence');
+    const link = el('a','Фрагмент источника ' + (index + 1));
+    link.href = '#' + sourceAnchor; link.title = 'Фрагмент источника: ' + unitId;
+    const quote = el('blockquote',item.source_snippet);
+    if (!existingAnchor) quote.id = sourceAnchor;
+    row.append(link,quote); panel.append(row);
+  });
+  return panel;
+}
 function renderJobAnnotation(job,assessment) {
   const body = el('div',null,'annotation-body'); const annotation = job.annotation || {};
+  const summary = annotation.summary || {}; const knowns = summary.knowns || [];
+  const prefilter = annotation.prefilter;
+  const fullReviewSkipped = ['suppressed','local_reject'].includes(prefilter?.routing);
+  const claimAnchors = new Map(); const unitAnchors = new Map();
+  const anchorPrefix = 'annotation-evidence-' + (++annotationRenderSerial) + '-';
+  [...knowns,...(annotation.claims || [])].forEach((claim) => {
+    if (typeof claim.claim_id === 'string' && !claimAnchors.has(claim.claim_id))
+      claimAnchors.set(claim.claim_id,anchorPrefix + claimAnchors.size);
+    if (annotation.version && !fullReviewSkipped && typeof claim.unit_id === 'string'
+      && !unitAnchors.has(claim.unit_id)
+      && claimAnchors.has(claim.claim_id)) unitAnchors.set(claim.unit_id,claimAnchors.get(claim.claim_id));
+  });
+  if (prefilter && typeof prefilter === 'object' && !Array.isArray(prefilter))
+    body.append(el('h4','Предварительный фильтр'),
+      renderPrefilter(prefilter,unitAnchors,anchorPrefix,assessment));
   if (!annotation.version) {
     body.append(el('p','Разметка ещё не выполнена.','muted'));
     return body;
   }
-  const twoPass = annotation.method === 'two_pass';
-  body.append(el('p',twoPass ? (annotation.status === 'partial'
+  const twoPass = annotation.method === 'two_pass' && !fullReviewSkipped;
+  body.append(el('p',fullReviewSkipped
+    ? 'Подробная проверка условий вакансии для этого предварительного отбора не выполнялась.'
+    : twoPass ? (annotation.status === 'partial'
     ? 'Независимая проверка выполнена частично. Непроверенные условия остаются неизвестными.'
     : 'Факты извлечены из текста и проверены второй моделью.')
     : 'Прямые поля источника и явные фразы. Проверка моделями не выполнялась.','muted'));
@@ -824,9 +957,13 @@ function renderJobAnnotation(job,assessment) {
     const risks = [...(assessment.risks || []),...(assessment.blocker_signals || [])];
     if (risks.length) body.append(el('p','Условия для проверки: ' + risks.join('; '),'small status error'));
   }
-  const summary = annotation.summary || {}; const knowns = summary.knowns || [];
+  if (fullReviewSkipped) return body;
   const knownIds = new Set(knowns.map((claim) => claim.claim_id));
   const conflictedIds = new Set((summary.contradictions || []).flatMap((item) => item.claim_ids || []));
+  if (summary.search_focus && Object.keys(summary.search_focus.dimensions || {}).length) {
+    body.append(el('h4','Условия выбранного поиска'),
+      renderSearchFocus(summary.search_focus,claimAnchors));
+  }
   if ((summary.contradictions || []).length) {
     body.append(el('h4','Противоречия в источнике'));
     summary.contradictions.forEach((item) => body.append(el('p',
@@ -835,7 +972,7 @@ function renderJobAnnotation(job,assessment) {
   }
   body.append(el('h4','Факты с цитатами из источника'));
   if (!knowns.length) body.append(el('p','Подтверждённых фактов пока нет.','muted'));
-  knowns.forEach((claim) => body.append(annotationFact(claim)));
+  knowns.forEach((claim) => body.append(annotationFact(claim,false,claimAnchors.get(claim.claim_id))));
   if ((summary.unknowns || []).length) {
     body.append(el('h4','Не подтверждено источником'));
     const tags = el('div',null,'tags'); summary.unknowns.forEach((kind) =>
@@ -844,7 +981,8 @@ function renderJobAnnotation(job,assessment) {
   const uncertain = (annotation.claims || []).filter((claim) => !knownIds.has(claim.claim_id));
   if (uncertain.length) {
     body.append(el('h4','Спорные и непроверенные утверждения'));
-    uncertain.forEach((claim) => body.append(annotationFact(claim,conflictedIds.has(claim.claim_id))));
+    uncertain.forEach((claim) => body.append(annotationFact(claim,conflictedIds.has(claim.claim_id),
+      claimAnchors.get(claim.claim_id))));
   }
   if ((annotation.issues || []).length)
     body.append(el('p','Пробелы проверки: ' + annotation.issues.join('; '),'small status error'));

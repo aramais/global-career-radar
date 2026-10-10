@@ -25,6 +25,33 @@ def _job(**changes) -> JobRecord:
     })
 
 
+@pytest.mark.parametrize("ownership", ["What you'll own:", "What you’ll own:"])
+def test_uppercase_flattened_html_keeps_role_requirements_benefits_boundaries(ownership):
+    raw = (
+        "<h3>About the Role</h3><p>You will build databases.</p>"
+        f"<h3>{ownership}</h3><p>Build query planning systems</p>"
+        "<h3>What you bring:</h3><p>Five years of development experience</p>"
+        "<h3>What We Offer</h3><p>We support you wherever you are.</p>"
+        "<h3>About the Team</h3><p>We build open source products.</p>"
+    )
+    clean = (
+        "ABOUT THE ROLE You will build databases. "
+        f"{ownership.upper()} Build query planning systems "
+        "WHAT YOU BRING: Five years of development experience "
+        "WHAT WE OFFER We support you wherever you are. "
+        "ABOUT THE TEAM We build open source products."
+    )
+    units = [unit for unit in source_units(_job(description_raw=raw, description_clean=clean))
+             if unit["field"] == "description_clean"]
+    assert "".join(unit["text"] for unit in units) == clean
+    assert next(unit for unit in units if "query planning" in unit["text"])["section"] == "role"
+    assert next(unit for unit in units if "Five years" in unit["text"])["section"] == "requirements"
+    assert next(unit for unit in units if "wherever you are" in unit["text"])["section"] == "other"
+    team = next(unit for unit in units if "open source products" in unit["text"])
+    assert team["section"] == "company"
+    assert all(clean[unit["offset_start"]:unit["offset_end"]] == unit["text"] for unit in units)
+
+
 def test_source_units_preserve_exact_unicode_whitespace_and_final_tail() -> None:
     description = (
         "## About us\r\n"

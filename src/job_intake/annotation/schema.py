@@ -14,6 +14,22 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from typing import Any
 
+FOCUS_KINDS = (
+    "project_management",
+    "people_interaction",
+    "decision_influence",
+    "business_economics",
+    "executive_finance_partnership",
+    "causal_inference",
+    "direct_reports",
+    "hands_on_analysis",
+    "isolated_analysis",
+)
+REQUIRED_FOCUS = (
+    "project_management", "people_interaction", "decision_influence", "working_english",
+)
+PREFERRED_FOCUS = ("business_economics", "executive_finance_partnership", "causal_inference")
+
 CLAIM_KINDS = frozenset(
     {
         "role",
@@ -27,7 +43,7 @@ CLAIM_KINDS = frozenset(
         "salary",
         "status",
         "work_authorization",
-    }
+    } | set(FOCUS_KINDS)
 )
 REQUIREMENTS = frozenset({"required", "preferred", "not_required", "informational"})
 POLARITIES = frozenset({"affirmative", "negative"})
@@ -93,6 +109,24 @@ _UNCONFIRMED = re.compile(
     r"\bnot\s+(?:yet\s+)?confirmed\b"
     r"|\b(?:unconfirmed|unclear|undetermined|unknown|might|possibly)\b"
     r"|\bmay\s+(?:be|change|vary|require|hire)\b",
+    re.IGNORECASE,
+)
+_CANDIDATE_HISTORY = re.compile(
+    r"\b(?:experience (?:in|with|of|leading|managing)|track record|previous(?:ly)?|"
+    r"prior experience|background in|(?:ability|able) to|proven ability|"
+    r"skills?|skillset|competenc(?:e|ies)|experienced (?:in|with|at)|skilled at)\b",
+    re.IGNORECASE,
+)
+_ROLE_SCOPE = re.compile(
+    r"\b(?:you (?:will|must)(?!\s+(?:have|bring|possess|demonstrate|be\s+able))|"
+    r"you['’]ll(?!\s+(?:have|bring|possess|demonstrate|be\s+able))|your responsibilities|"
+    r"(?:this|the|your) (?:role|position) (?:will|involves|owns|includes|leads|manages)|"
+    r"responsible for|responsibilities include)\b",
+    re.IGNORECASE,
+)
+_CONDITIONAL_SCOPE = re.compile(
+    r"\b(?:may|might|could)\s+(?:be\s+)?(?:lead|manage|own|coordinate|collaborate|"
+    r"partner|work|apply|analy[sz]e|perform|influence|participate|conduct|do|spend)\b",
     re.IGNORECASE,
 )
 _WORLDWIDE = re.compile(
@@ -182,6 +216,13 @@ def _evidence_warnings(claim: dict[str, Any], unit: dict[str, Any]) -> list[str]
     snippet_start = source_text.find(snippet)
     prefix = re.split(r"[.;!?]", source_text[:snippet_start])[-1][-80:]
     context = prefix + snippet
+    if claim["kind"] in FOCUS_KINDS:
+        if not unit["field"].startswith("description"):
+            warnings.append("title_or_metadata_is_not_actual_role_scope")
+        if _CANDIDATE_HISTORY.search(context) and not _ROLE_SCOPE.search(context):
+            warnings.append("candidate_history_or_skill_is_not_actual_role_scope")
+        if _CONDITIONAL_SCOPE.search(context):
+            warnings.append("conditional_scope_is_not_confirmed_role_responsibility")
     subjects = _language_entities(claim["value"]) if claim["kind"] == "working_language" else set()
     clauses = re.split(r"[,;.!?]|\b(?:but|whereas|while)\b", context, flags=re.IGNORECASE)
     # An optional French skill elsewhere in a quote is not an optional English
@@ -191,7 +232,7 @@ def _evidence_warnings(claim: dict[str, Any], unit: dict[str, Any]) -> list[str]
         if source_text.rstrip().endswith("?") or snippet.rstrip().endswith("?"):
             warnings.append("question_is_not_a_direct_assertion")
         if (
-            claim["kind"] in {"working_language", "hiring_location", "work_mode"}
+            claim["kind"] in {"working_language", "hiring_location", "work_mode", *FOCUS_KINDS}
             and claim["polarity"] == "affirmative"
             and any(_UNCONFIRMED.search(clause) for clause in (relevant or [context]))
         ):
@@ -382,6 +423,80 @@ def _exclusive_conflict(first: dict[str, Any], second: dict[str, Any]) -> bool:
     return False
 
 
+def _search_focus(
+    claims: list[dict[str, Any]], knowns: list[dict[str, Any]], contradictions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Describe advertised scope against the selected search, never candidate ability.
+
+    Missing evidence stays unknown. A preference in the advertisement does not
+    establish an actual duty, and direct reports or hands-on work are neutral.
+    """
+    dimensions: dict[str, dict[str, Any]] = {}
+    known_ids = {claim["claim_id"] for claim in knowns}
+    for name in (*FOCUS_KINDS, "working_english"):
+        kind = "working_language" if name == "working_english" else name
+        relevant = [claim for claim in claims if claim["kind"] == kind]
+        supported = [claim for claim in knowns if claim["kind"] == kind]
+        positive = []
+        negative = []
+        for claim in supported:
+            # Vacancy preferences and waived candidate requirements cannot
+            # establish duties or the working language of the role.
+            if claim["requirement"] not in {"required", "informational"}:
+                continue
+            if name == "working_english":
+                entities = _language_entities(claim["value"])
+                if "english" in entities:
+                    (positive if claim["polarity"] == "affirmative" else negative).append(claim)
+                elif (
+                    claim["polarity"] == "affirmative"
+                    and _EXCLUSIVE_LANGUAGE.search(claim["source_snippet"])
+                    and "english" not in _language_entities(claim["source_snippet"])
+                ):
+                    negative.append(claim)
+            else:
+                (positive if claim["polarity"] == "affirmative" else negative).append(claim)
+        conflicts = [row for row in contradictions if row["kind"] == kind]
+        if conflicts or (positive and negative):
+            status = "conflicting"
+        elif positive:
+            status = "confirmed"
+        elif negative:
+            status = "explicitly_absent"
+        else:
+            status = "unknown"
+        claim_ids = [claim["claim_id"] for claim in (*positive, *negative)]
+        claim_ids.extend(identifier for row in conflicts for identifier in row["claim_ids"])
+        dimensions[name] = {
+            "priority": (
+                "required" if name in REQUIRED_FOCUS else
+                "preferred" if name in PREFERRED_FOCUS else
+                "excluded" if name == "isolated_analysis" else "informational"
+            ),
+            "status": status,
+            "claim_ids": list(dict.fromkeys(claim_ids)),
+            "unresolved_claim_ids": [
+                claim["claim_id"] for claim in relevant if claim["claim_id"] not in known_ids
+            ],
+        }
+    unconfirmed = [name for name in REQUIRED_FOCUS if dimensions[name]["status"] != "confirmed"]
+    mismatches = [
+        name for name in REQUIRED_FOCUS if dimensions[name]["status"] == "explicitly_absent"
+    ]
+    if dimensions["isolated_analysis"]["status"] == "confirmed":
+        mismatches.append("isolated_analysis")
+    return {
+        "version": "career-focus-v1",
+        "dimensions": dimensions,
+        "required_confirmed": not unconfirmed and not mismatches,
+        "unconfirmed_required": unconfirmed,
+        "explicit_mismatches": mismatches,
+        "confirmed_preferences": [
+            name for name in PREFERRED_FOCUS if dimensions[name]["status"] == "confirmed"
+        ],
+    }
+
+
 def summarize_claims(claims: list[dict[str, Any]]) -> dict[str, Any]:
     """Expose supported facts, absent coverage and unresolved contradictions."""
     groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -473,4 +588,5 @@ def summarize_claims(claims: list[dict[str, Any]]) -> dict[str, Any]:
         "contradictions": contradictions,
         "coverage": coverage,
         "supported_claim_ids": [claim["claim_id"] for claim in knowns],
+        "search_focus": _search_focus(claims, knowns, contradictions),
     }

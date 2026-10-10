@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,10 @@ from sqlalchemy import select
 from job_intake.adapters.factory import build_adapter
 from job_intake.alerts.digest import build_daily_digest, build_instant_alert
 from job_intake.alerts.telegram import TelegramNotifier
+from job_intake.annotation.prefilter import VacancyPrefilter
+from job_intake.annotation.progress import ProgressCallback, emit_progress
 from job_intake.annotation.service import VacancyAnnotator, apply_annotation_constraints
-from job_intake.annotation.text import role_description
+from job_intake.annotation.text import role_description, source_hash
 from job_intake.config.settings import (
     AppConfig,
     SourceDefinition,
@@ -28,7 +31,7 @@ from job_intake.scoring.tiering import finalize_tier
 from job_intake.storage.database import Database
 from job_intake.storage.dedup import JobDeduplicator
 from job_intake.storage.models import AlertOutboxORM
-from job_intake.storage.repository import JobRepository
+from job_intake.storage.repository import JobRepository, validate_job_uids
 from job_intake.utils.logging import configure_logging
 from job_intake.utils.text import stable_hash
 
@@ -50,6 +53,7 @@ class JobIntakePipeline:
         self.telegram = TelegramNotifier(config.telegram)
         self.deduplicator = JobDeduplicator()
         self.annotator = VacancyAnnotator(config.annotation)
+        self.prefilter = VacancyPrefilter(config.prefilter)
 
     @property
     def profile_versions(self) -> dict[str, str]:
@@ -85,6 +89,13 @@ class JobIntakePipeline:
             "annotation_review_calls": 0,
             "annotation_cache_hits": 0,
             "annotation_errors": 0,
+            "prefilter_screen_calls": 0,
+            "prefilter_verify_calls": 0,
+            "prefilter_cache_hits": 0,
+            "prefilter_errors": 0,
+            "prefilter_suppressed": 0,
+            "prefilter_full_review": 0,
+            "prefilter_local_skipped": 0,
             "errors": [],
         }
 
@@ -192,13 +203,58 @@ class JobIntakePipeline:
             )
             if saved is not None and not record.annotation:
                 record.annotation = saved.annotation or {}
+            # Resolve reliable hard constraints before paying for any semantic stage.
+            engines = [stream.engine for stream in self.streams]
+            local_items = [engine.apply(record) for engine in engines]
+            requested_ai = (
+                use_llm and self.config.annotation.enabled and self.config.annotation.ai_enabled
+            )
+            route = None
+            if requested_ai and all(
+                item.evaluation.decision == FilterDecision.REJECT for item in local_items
+            ):
+                blockers = sorted({
+                    signal for item in local_items for signal in item.evaluation.blocker_signals
+                })
+                route = {
+                    "routing": "local_reject", "decision": "clearly_irrelevant",
+                    "reason_code": "hard_blocker",
+                    "reason": "All enabled profiles have explicit hard blockers.",
+                    "blockers": blockers, "source_hash": source_hash(record),
+                }
+                stats["prefilter_local_skipped"] += 1
+                emit_progress(
+                    self.annotator.progress, "prefilter_local_skip", routing="local_reject",
+                    reason_code="hard_blocker", blockers=len(blockers),
+                )
+            elif self.config.prefilter.enabled:
+                if requested_ai:
+                    before = dict(self.prefilter.stats)
+                    route = self.prefilter.route(record)
+                    for name, value in self.prefilter.stats.items():
+                        stats["prefilter_" + name] += value - before[name]
+                else:
+                    # Offline re-evaluation retains only a revalidated current route.
+                    route = self.prefilter.cached_route(record)
+                if route is not None:
+                    counter = (
+                        "prefilter_suppressed" if route["routing"] == "suppressed"
+                        else "prefilter_full_review"
+                    )
+                    stats[counter] += 1
+            suppressed = route is not None and route["routing"] == "suppressed"
             before = dict(self.annotator.stats)
-            self.annotator.annotate(record, use_ai=use_llm)
+            self.annotator.annotate(
+                record, use_ai=use_llm and not suppressed
+                and not (route is not None and route["routing"] == "local_reject"),
+            )
+            # Routing is deliberately outside source claims and their independent review.
+            record.annotation.pop("prefilter", None)
+            if route is not None:
+                record.annotation["prefilter"] = route
             for name, value in self.annotator.stats.items():
                 stats["annotation_" + name] += value - before[name]
-            for stream in self.streams:
-                engine = stream.engine
-                item = engine.apply(record)
+            for stream, engine, item in zip(self.streams, engines, local_items, strict=True):
                 apply_annotation_constraints(record, item.evaluation, engine)
                 item.profile_id, item.profile_name = stream.id, stream.name
                 item.profile_version, item.profile_context = stream.version, stream.context
@@ -209,9 +265,25 @@ class JobIntakePipeline:
                     role_description(record),
                     item.evaluation,
                 )
+                if suppressed and item.evaluation.decision != FilterDecision.REJECT:
+                    # Retain the source and CRM linkage; a routing verdict isn't an
+                    # independently reviewed final rejection or a hiring fact.
+                    item.evaluation.decision = FilterDecision.REVIEW
+                    item.evaluation.risks = sorted(set(
+                        item.evaluation.risks + ["prefilter:" + route["reason_code"]]
+                    ))
+                    item.evaluation.bridge_role = False
+                    item.evaluation.fit_score = 0.0
+                    item.evaluation.deterministic_score = 0.0
+                    item.evaluation.fit_reason = "Preliminary filter: " + route["reason_code"]
+                    item.evaluation.audit_log.append(
+                        "Independent preliminary checks agree on a mismatch; "
+                        "full AI review skipped. Source retained for manual review."
+                    )
                 if (
                     use_llm
                     and self.config.llm.enabled
+                    and not suppressed
                     and not (self.config.annotation.enabled and self.config.annotation.ai_enabled)
                     and item.evaluation.decision != FilterDecision.REJECT
                 ):
@@ -326,12 +398,54 @@ class JobIntakePipeline:
             except Exception as exc:
                 self._error(stats, "alert_errors", str(outbox_id), exc)
 
-    def reevaluate_saved(self, *, use_ai: bool = False, limit: int | None = None) -> dict[str, Any]:
+    def reevaluate_saved(
+        self, *, use_ai: bool = False, limit: int | None = None,
+        progress: ProgressCallback | None = None,
+        job_uids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Apply profiles offline; progress does not change evaluations or cache keys."""
+        selection = validate_job_uids(job_uids)
+        if selection is not None and limit is not None:
+            raise ValueError("Use either selected job UIDs or limit, not both")
+        previous_progress = self.annotator.progress
+        previous_prefilter_progress = self.prefilter.progress
+        self.annotator.set_progress(progress)
+        self.prefilter.set_progress(progress)
+        started = time.monotonic()
+        emit_progress(progress, "run_start")
+        try:
+            selected = {"job_uids": selection} if selection is not None else {}
+            result = self._reevaluate_saved(
+                use_ai=use_ai, limit=limit, progress=progress, **selected,
+            )
+            emit_progress(
+                progress, "run_complete", total=result["persisted"] + result["record_errors"],
+                persisted=result["persisted"], elapsed=time.monotonic() - started,
+                **{key: value for key, value in result.items() if key.startswith("prefilter_")},
+            )
+            return result
+        finally:
+            self.annotator.set_progress(previous_progress)
+            self.prefilter.set_progress(previous_prefilter_progress)
+
+    def _reevaluate_saved(
+        self, *, use_ai: bool, limit: int | None, progress: ProgressCallback | None,
+        job_uids: list[str] | None = None,
+    ) -> dict[str, Any]:
         """Apply profiles to saved data; AI is explicit opt-in, notifications stay disabled."""
         stats = self._stats()
         pending_groups = {}
         with self.database.session() as session:
-            jobs = JobRepository(session).list_jobs(limit=limit, archived=False)
+            selected = {"job_uids": job_uids} if job_uids is not None else {}
+            jobs = JobRepository(session).list_jobs(limit=limit, archived=False, **selected)
+            if job_uids is not None:
+                by_uid = {job.job_uid: job for job in jobs}
+                if set(job_uids) - set(by_uid):
+                    raise ValueError(
+                        "Requested jobs were not selected; check IDs and archive state"
+                    )
+                # A resumed run follows the frozen selection, even after saves reorder updated_at.
+                jobs = [by_uid[uid] for uid in job_uids]
             records = [
                 JobRecord(
                     source=j.source,
@@ -354,16 +468,33 @@ class JobIntakePipeline:
                 )
                 for j in jobs
             ]
-        for record in records:
+        emit_progress(progress, "jobs_loaded", total=len(records))
+        for index, record in enumerate(records, 1):
+            started = time.monotonic()
+            annotation_errors_before = stats["annotation_errors"]
+            prefilter_errors_before = stats["prefilter_errors"]
+            emit_progress(
+                progress, "job_start", index=index, total=len(records),
+                company=record.company, title=record.title,
+            )
             try:
                 items, keys, pending = self._evaluate_record(record, stats, use_llm=use_ai)
                 self._save(items, keys, observed=False, queue_alert=False)
                 stats["persisted"] += 1
                 stats["evaluations"] += len(items)
+                emit_progress(
+                    progress, "job_complete", evaluations=len(items),
+                    elapsed=time.monotonic() - started,
+                    errors=(stats["annotation_errors"] - annotation_errors_before
+                            + stats["prefilter_errors"] - prefilter_errors_before),
+                    annotation_errors=stats["annotation_errors"] - annotation_errors_before,
+                    prefilter_errors=stats["prefilter_errors"] - prefilter_errors_before,
+                )
                 if pending:
                     job_uid = self.deduplicator.build_identity(record).job_uid
                     pending_groups[job_uid] = (items, keys, pending)
             except Exception as exc:
+                emit_progress(progress, "job_error", error_type=type(exc).__name__)
                 self._error(stats, "record_errors", record.title, exc)
         self._finish_batches(pending_groups, stats, queue_alert=False)
         return stats

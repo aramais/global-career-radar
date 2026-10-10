@@ -65,6 +65,26 @@ def current_evaluations(job: JobORM, versions: dict[str, str]) -> list[JobProfil
     )
 
 
+def _public_prefilter(value: object) -> dict | None:
+    """Expose routing evidence, without API usage, cache internals or full source units."""
+    if not isinstance(value, dict):
+        return None
+    result = {
+        key: value[key] for key in ("routing", "decision", "reason_code", "reason", "version")
+        if isinstance(value.get(key), str)
+    }
+    evidence = value.get("evidence", [])
+    result["evidence"] = [
+        {key: row[key] for key in ("unit_id", "source_snippet")
+         if isinstance(row.get(key), str)}
+        for row in evidence if isinstance(row, dict)
+    ] if isinstance(evidence, list) else []
+    blockers = value.get("blockers", [])
+    if isinstance(blockers, list):
+        result["blockers"] = [item for item in blockers if isinstance(item, str)]
+    return result
+
+
 def serialize_job(job: JobORM, versions: dict[str, str], *, profile: str | None = None,
                   detailed: bool = False) -> dict:
     evaluations = current_evaluations(job, versions)
@@ -91,6 +111,9 @@ def serialize_job(job: JobORM, versions: dict[str, str], *, profile: str | None 
         result["description"] = job.description_clean or job.description_raw
         result["annotation"] = {key: value for key, value in (job.annotation or {}).items()
                                 if key in PUBLIC_ANNOTATION_FIELDS}
+        prefilter = _public_prefilter((job.annotation or {}).get("prefilter"))
+        if prefilter is not None:
+            result["annotation"]["prefilter"] = prefilter
     return result
 
 

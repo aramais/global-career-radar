@@ -4,17 +4,21 @@ import json
 import os
 import re
 import tempfile
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from job_intake.annotation.ai import (
     AnnotationModelClient,
+    AnnotationModelError,
     build_extraction_prompt,
     build_review_prompt,
+    error_diagnostic,
     prompts_version,
 )
 from job_intake.annotation.jev import JEV_VERSION, JevReviewClient, normalize_jev_review
+from job_intake.annotation.progress import ProgressCallback, emit_progress
 from job_intake.annotation.schema import prepare_claims, review_claims, summarize_claims
 from job_intake.annotation.text import (
     asserted_phrase_hits,
@@ -128,6 +132,14 @@ class AnnotationStageClients:
             JevReviewClient(review) if review.provider == "jev" else AnnotationModelClient(review)
         )
 
+    def set_progress(self, progress: ProgressCallback | None) -> None:
+        for stage in ("extract", "review"):
+            client = getattr(self, stage)
+            client.progress = (
+                (lambda event, stage=stage: progress({**event, "stage": stage}))
+                if progress is not None else None
+            )
+
     def generate(self, model: str, prompt: str) -> tuple[dict, dict]:
         """Compatibility entry point for callers with distinct model identifiers."""
         if self.extract.config.model == self.review.config.model:
@@ -146,10 +158,24 @@ class AnnotationStageClients:
 
 
 class VacancyAnnotator:
-    def __init__(self, config: AnnotationConfig) -> None:
+    def __init__(
+        self, config: AnnotationConfig, *, progress: ProgressCallback | None = None,
+    ) -> None:
         self.config = config
         self.client = AnnotationStageClients(config)
         self.stats = {"extraction_calls": 0, "review_calls": 0, "cache_hits": 0, "errors": 0}
+        self.set_progress(progress)
+
+    def set_progress(self, progress: ProgressCallback | None) -> None:
+        self.progress = progress
+        if hasattr(self.client, "set_progress"):
+            self.client.set_progress(progress)
+
+    def _completed(self, annotation: dict) -> None:
+        emit_progress(
+            self.progress, "annotation_complete", status=annotation["status"],
+            claims=len(annotation.get("claims", [])),
+        )
 
     def _cache_key(self, record: JobRecord) -> str:
         config = asdict(self.config)
@@ -187,6 +213,8 @@ class VacancyAnnotator:
         return stable_hash(json.dumps({
             "extraction": extraction_key, "claims": drafts,
             "spec": asdict(self.config.resolved_stage("review")),
+            "review_batch_size": self.config.review_batch_size,
+            "review_batch_version": "exact-id-source-preserving-v1",
             "prompts": prompts_version(),
             "jev": JEV_VERSION if self.config.resolved_stage("review").provider == "jev" else None,
         }, sort_keys=True, ensure_ascii=False))
@@ -214,6 +242,104 @@ class VacancyAnnotator:
         return self._generate(
             "review", self.config.review_model, build_review_prompt(source_id, chunk, draft)
         )
+
+    def _batched_review(
+        self, source_id: str, chunk: dict, drafts: list[dict], review_key: str,
+        annotation: dict, path: Path,
+    ) -> dict:
+        """Bound output size while retaining every source unit for every review.
+
+        Only complete, exact-ID batches are reusable checkpoints. The aggregate
+        can remain partial for audit, but cannot become a completed chunk review
+        until every draft has an independent verdict.
+        """
+        chunk_id = chunk["chunk_id"]
+        stage = annotation["stages"][chunk_id]
+        if stage.get("review_batches_key") != review_key:
+            stage["review_batches"] = {}
+        stage["review_batches_key"] = review_key
+        cached_batches = stage.get("review_batches")
+        if not isinstance(cached_batches, dict):
+            cached_batches = {}
+        stage["review_batches"] = cached_batches
+        batches = [
+            drafts[offset:offset + self.config.review_batch_size]
+            for offset in range(0, len(drafts), self.config.review_batch_size)
+        ]
+        aggregate = {"reviews": []}
+        for index, batch in enumerate(batches, 1):
+            batch_id = f"batch-{index:06d}"
+            claim_ids = [claim["claim_id"] for claim in batch]
+            emit_progress(
+                self.progress, "review_batch_start", batch_id=batch_id,
+                index=index, total=len(batches), claims=len(batch),
+            )
+            cached = cached_batches.get(batch_id)
+            if cached is not None:
+                try:
+                    if (
+                        not isinstance(cached, dict)
+                        or cached.get("review_key") != review_key
+                        or cached.get("claim_ids") != claim_ids
+                        or not self._review_complete(batch, cached["review"])
+                        or review_claims(batch, cached["review"])[1]
+                    ):
+                        raise ValueError("Invalid review batch checkpoint")
+                except (KeyError, TypeError, ValueError):
+                    cached_batches.pop(batch_id, None)
+                    cached = None
+                    annotation["issues"].append(
+                        chunk_id + ": invalid review batch checkpoint rebuilt"
+                    )
+            if cached is not None:
+                aggregate["reviews"].extend(cached["review"]["reviews"])
+                stage["review"] = aggregate
+                self.stats["cache_hits"] += 1
+                emit_progress(self.progress, "cache_hit", stage="review " + batch_id)
+                continue
+            usage_recorded = False
+            try:
+                # The source chunk is deliberately unchanged; filtering its units
+                # to the current claims could conceal context or contradictions.
+                payload, usage = self._review(source_id, chunk, batch)
+                try:
+                    _, bad = review_claims(batch, payload)
+                except (TypeError, ValueError) as error:
+                    error.code = "invalid_review"
+                    error.usage = usage
+                    raise
+                annotation["usage"].append({
+                    "stage": "review", "chunk_id": chunk_id, "batch_id": batch_id,
+                    "model": self.config.review_model,
+                    "provider": self.config.resolved_stage("review").provider, **usage,
+                })
+                usage_recorded = True
+                invalid = {row["index"] for row in bad}
+                # A foreign ID from this response must not review a draft that
+                # belongs to a later batch.
+                aggregate["reviews"].extend(
+                    row for row_index, row in enumerate(payload["reviews"])
+                    if row_index not in invalid
+                )
+                stage["review"] = aggregate
+                annotation["rejected"].extend(bad)
+                complete = self._review_complete(batch, payload) and not bad
+                if complete:
+                    cached_batches[batch_id] = {
+                        "review_key": review_key, "claim_ids": claim_ids,
+                        "review": payload, "provenance": self._provenance("review"),
+                    }
+                self._checkpoint_stage(path, annotation, chunk_id)
+                if not complete:
+                    error = ValueError("Missing exact-ID reviews")
+                    error.code = "invalid_review"
+                    error.usage = usage
+                    raise error
+            except Exception as error:
+                error.batch_id = batch_id
+                error.usage_recorded = usage_recorded
+                raise
+        return aggregate
 
     def _provenance(self, stage: str) -> dict:
         spec = self.config.resolved_stage(stage)
@@ -344,13 +470,21 @@ class VacancyAnnotator:
         except ValueError:
             stages = {}
         for chunk in chunks:
+            units = [unit for unit in chunk["units"] if unit["text"].strip()]
+            # These attributable drafts were seeded before extraction in the
+            # original AI run. A missing or corrupt model stage cannot erase
+            # them, and their UNREVIEWED status must not become local support.
+            seeded, _ = _drafts(
+                {"claims": []}, source_identity(record), units, chunk["chunk_id"]
+            )
+            by_id.update({claim["claim_id"]: claim for claim in seeded})
             try:
                 stage = stages.get(chunk["chunk_id"], {})
-                units = [unit for unit in chunk["units"] if unit["text"].strip()]
                 drafts, bad = _drafts(
                     stage["extraction"], source_identity(record), units, chunk["chunk_id"]
                 )
                 rejected.extend(bad)
+                by_id.update({claim["claim_id"]: claim for claim in drafts})
                 review = stage.get("review", {"reviews": []})
                 provider = saved.get("review_provider", "")
                 options = self._jev_options(saved["review_model"])
@@ -401,6 +535,7 @@ class VacancyAnnotator:
             "claims": [],
             "rejected": [],
             "issues": [],
+            "errors": [],
             "stages": {},
             "usage": [],
             "extract_model": self.config.extract_model,
@@ -409,6 +544,7 @@ class VacancyAnnotator:
             "review_provider": review_spec.provider,
             "model_stages": {stage: self._provenance(stage) for stage in ("extract", "review")},
             "chunk_chars": self.config.chunk_chars,
+            "review_batch_size": self.config.review_batch_size,
             "description_complete": record.source_metadata.get("description_complete") is not False,
         }
         semantic_units = [unit for unit in units if unit["text"].strip()]
@@ -457,6 +593,8 @@ class VacancyAnnotator:
             if verified is not None and (not available_ai or verified["status"] == "reviewed"):
                 self.stats["cache_hits"] += 1
                 record.annotation = verified
+                emit_progress(self.progress, "cache_hit", stage="saved annotation")
+                self._completed(verified)
                 return verified
             if verified is not None:
                 annotation["stages"] = verified["stages"]
@@ -470,8 +608,13 @@ class VacancyAnnotator:
                 )
             if requested_ai:
                 annotation["issues"].append("AI unavailable: set " + extract_spec.api_key_env)
+                annotation["errors"].append(error_diagnostic(
+                    AnnotationModelError("Annotation API key is missing.", code="missing_api_key"),
+                    stage="extract",
+                ))
             annotation["summary"] = summarize_claims(local)
             record.annotation = annotation
+            self._completed(annotation)
             return annotation
 
         path = Path(self.config.cache_dir) / source_id / (key + ".json")
@@ -493,8 +636,10 @@ class VacancyAnnotator:
         annotation["method"] = "two_pass"
         claims, rejected = [], []
         chunks = chunk_source(units, self.config.chunk_chars)
+        emit_progress(self.progress, "chunks_loaded", total=len(chunks))
         completed = 0
-        for chunk in chunks:
+        for chunk_index, chunk in enumerate(chunks, 1):
+            emit_progress(self.progress, "chunk_start", index=chunk_index, total=len(chunks))
             chunk_id = chunk["chunk_id"]
             self._load_stage_checkpoint(path, annotation, chunk_id)
             chunk_units = [unit for unit in chunk["units"] if unit["text"].strip()]
@@ -503,6 +648,9 @@ class VacancyAnnotator:
             extraction_path = self._extraction_path(record, extraction_key)
             seeded, _ = _drafts({"claims": []}, source_id, chunk_units, chunk_id)
             claims.extend(seeded)
+            active_stage = "extract"
+            active_usage = None
+            usage_recorded = False
             try:
                 if stage.get("extraction_key", extraction_key) != extraction_key:
                     stage.clear()
@@ -531,12 +679,27 @@ class VacancyAnnotator:
                         annotation["issues"].append(chunk_id + ": invalid extraction cache rebuilt")
                 if "extraction" not in stage:
                     self.stats["extraction_calls"] += 1
+                    started = time.monotonic()
+                    emit_progress(
+                        self.progress, "stage_start", stage="extract",
+                        provider=extract_spec.provider, model=self.config.extract_model,
+                    )
                     payload, usage = self._generate(
                         "extract", self.config.extract_model,
                         build_extraction_prompt(source_id, chunk)
                     )
+                    active_usage = usage
                     # An invalid envelope is never cached as a completed extraction.
-                    prepare_claims(payload, source_id, chunk_units, chunk_id)
+                    try:
+                        prepare_claims(payload, source_id, chunk_units, chunk_id)
+                    except (TypeError, ValueError) as error:
+                        error.code = "invalid_extraction"
+                        error.usage = usage
+                        raise
+                    emit_progress(
+                        self.progress, "stage_complete", stage="extract",
+                        elapsed=time.monotonic() - started,
+                    )
                     stage["extraction"] = payload
                     stage["extraction_key"] = extraction_key
                     stage["extraction_provenance"] = self._provenance("extract")
@@ -554,11 +717,16 @@ class VacancyAnnotator:
                             **usage,
                         }
                     )
+                    usage_recorded = True
                     self._checkpoint_stage(path, annotation, chunk_id)
                 else:
                     self.stats["cache_hits"] += 1
+                    emit_progress(self.progress, "cache_hit", stage="extract")
                 draft, bad = _drafts(stage["extraction"], source_id, chunk_units, chunk_id)
                 rejected.extend(bad)
+                active_stage = "review"
+                active_usage = None
+                usage_recorded = False
                 review_key = self._review_key(extraction_key, draft)
                 if stage.get("review_key", review_key) != review_key:
                     stage.pop("review", None)
@@ -572,19 +740,35 @@ class VacancyAnnotator:
                         stage.pop("review")
                         annotation["issues"].append(chunk_id + ": invalid review cache rebuilt")
                 if "review" not in stage:
+                    review_started = None
                     if draft:
-                        payload, usage = self._review(source_id, chunk, draft)
-                        review_claims(draft, payload)
-                        stage["review"] = payload
-                        annotation["usage"].append(
-                            {
-                                "stage": "review",
-                                "chunk_id": chunk_id,
-                                "model": self.config.review_model,
-                                "provider": review_spec.provider,
-                                **usage,
-                            }
+                        review_started = time.monotonic()
+                        emit_progress(
+                            self.progress, "stage_start", stage="review",
+                            provider=review_spec.provider, model=self.config.review_model,
                         )
+                        if review_spec.provider == "jev":
+                            # Jev already batches its verifier statements.
+                            payload, usage = self._review(source_id, chunk, draft)
+                            active_usage = usage
+                            try:
+                                review_claims(draft, payload)
+                            except (TypeError, ValueError) as error:
+                                error.code = "invalid_review"
+                                error.usage = usage
+                                raise
+                            stage["review"] = payload
+                            annotation["usage"].append({
+                                "stage": "review", "chunk_id": chunk_id,
+                                "model": self.config.review_model,
+                                "provider": review_spec.provider, **usage,
+                            })
+                            usage_recorded = True
+                        else:
+                            stage["review"] = self._batched_review(
+                                source_id, chunk, draft, review_key, annotation, path,
+                            )
+                            usage_recorded = True
                     else:
                         stage["review"] = {"reviews": []}
                         if review_spec.provider == "jev":
@@ -596,6 +780,9 @@ class VacancyAnnotator:
                     stage["review_key"] = review_key
                     stage["review_provenance"] = self._provenance("review")
                     self._checkpoint_stage(path, annotation, chunk_id)
+                else:
+                    review_started = None
+                    emit_progress(self.progress, "cache_hit", stage="review")
                 reviewed, bad = _reviewed(
                     draft, stage["review"], review_spec.provider, jev_options
                 )
@@ -604,11 +791,40 @@ class VacancyAnnotator:
                 if not self._review_complete(
                     draft, stage["review"], review_spec.provider, jev_options
                 ):
-                    raise ValueError("Missing exact-ID reviews")
+                    error = ValueError("Missing exact-ID reviews")
+                    error.code = "invalid_review"
+                    error.usage = active_usage
+                    raise error
+                if review_started is not None:
+                    emit_progress(
+                        self.progress, "stage_complete", stage="review",
+                        elapsed=time.monotonic() - review_started,
+                    )
                 completed += 1
+                emit_progress(self.progress, "chunk_complete", claims=len(reviewed))
             except Exception as exc:  # Any model failure must leave the vacancy reviewable.
                 self.stats["errors"] += 1
-                annotation["issues"].append(chunk_id + ": " + type(exc).__name__)
+                diagnostic = error_diagnostic(exc, stage=active_stage, chunk_id=chunk_id)
+                batch_id = getattr(exc, "batch_id", None)
+                if isinstance(batch_id, str) and re.fullmatch(r"batch-\d{6}", batch_id):
+                    diagnostic["batch_id"] = batch_id
+                annotation["errors"].append(diagnostic)
+                if (
+                    not usage_recorded and not getattr(exc, "usage_recorded", False)
+                    and "usage" in diagnostic
+                ):
+                    spec = self.config.resolved_stage(active_stage)
+                    annotation["usage"].append({
+                        **diagnostic["usage"], "stage": active_stage, "chunk_id": chunk_id,
+                        "model": spec.model, "provider": spec.provider, "failed": True,
+                        **({"batch_id": batch_id} if "batch_id" in diagnostic else {}),
+                    })
+                emit_progress(
+                    self.progress, "chunk_error", stage=active_stage,
+                    error_type=diagnostic["error_type"], code=diagnostic["code"],
+                    **({"batch_id": batch_id} if "batch_id" in diagnostic else {}),
+                )
+                annotation["issues"].append(chunk_id + ": " + diagnostic["error_type"])
                 # Preserve valid drafts even when the reviewer is unavailable.
                 if "extraction" in stage:
                     try:
@@ -632,6 +848,7 @@ class VacancyAnnotator:
         annotation["summary"] = summarize_claims(annotation["claims"])
         self._write(path, annotation)
         record.annotation = annotation
+        self._completed(annotation)
         return annotation
 
 
@@ -641,6 +858,8 @@ def apply_annotation_constraints(record: JobRecord, evaluation: JobEvaluation, e
     if not annotation or evaluation.decision == FilterDecision.REJECT:
         return
     summary = annotation.get("summary", {})
+    focus = summary.get("search_focus", {})
+    focus_dimensions = focus.get("dimensions", {})
     knowns = summary.get("knowns", [])
     confirmed_language = confirmed_geography = False
     required_locations = []
@@ -708,8 +927,28 @@ def apply_annotation_constraints(record: JobRecord, evaluation: JobEvaluation, e
             resolved.add("language:working_language_unconfirmed")
         if confirmed_geography:
             resolved.add("geography:eligibility_unconfirmed")
+        if (
+            annotation.get("method") == "two_pass"
+            and engine.rules.required_annotation_focus
+            and all(
+                focus_dimensions.get(name, {}).get("status") == "confirmed"
+                for name in ("project_management", "people_interaction")
+            )
+        ):
+            resolved.add("role:required_scope_unconfirmed")
         evaluation.risks = [risk for risk in evaluation.risks if risk not in resolved]
     if annotation.get("method") == "two_pass":
+        for name in engine.rules.required_annotation_focus or []:
+            status = focus_dimensions.get(name, {}).get("status", "unknown")
+            if status != "confirmed":
+                evaluation.risks.append(f"annotation:search_focus:{name}:{status}")
+            else:
+                evaluation.matched_signals.append("grounded_focus:" + name)
+        if (
+            engine.rules.required_annotation_focus
+            and focus_dimensions.get("isolated_analysis", {}).get("status") == "confirmed"
+        ):
+            evaluation.risks.append("annotation:search_focus:isolated_analysis")
         if engine.rules.required_languages and not confirmed_language:
             evaluation.risks.append("language:working_language_unconfirmed")
         if engine.rules.target_geographies and not confirmed_geography:
