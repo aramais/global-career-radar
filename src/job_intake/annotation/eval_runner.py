@@ -425,15 +425,25 @@ def run_evaluation(
         report["log"] = evaluate_log(log_path)
     if gold_path:
         report["gold"] = compare_saved_gold(rows, gold_path)
-    report["passed"] = bool(rows) and report["counts"]["unannotated"] == 0 and not any(
+    report["integrity_passed"] = bool(rows) and report["counts"]["unannotated"] == 0 and not any(
         finding["severity"] == "error" for job in report["jobs"] for finding in job["findings"]
     ) and not report.get("gold", {}).get("failures") and not report.get(
         "gold", {}
     ).get("counts", {}).get("invalid_reviews")
+    # Compatibility alias: neither name is a semantic-accuracy acceptance gate.
+    report["passed"] = report["integrity_passed"]
     return report
 
 
 def write_report(report: dict, output: Path, *, protected_paths: list[Path]) -> Path:
+    return write_text_report(
+        json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        output, protected_paths=protected_paths,
+    )
+
+
+def write_text_report(content: str, output: Path, *, protected_paths: list[Path]) -> Path:
+    """Atomically replace a report without overwriting source inputs."""
     path = output.expanduser().resolve()
     if path in {entry.expanduser().resolve() for entry in protected_paths}:
         raise ValueError("Report must not overwrite the database, config, log or gold inputs")
@@ -445,8 +455,7 @@ def write_report(report: dict, output: Path, *, protected_paths: list[Path]) -> 
             suffix=".tmp", delete=False,
         ) as handle:
             temporary = Path(handle.name)
-            json.dump(report, handle, ensure_ascii=False, indent=2, allow_nan=False)
-            handle.write("\n")
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(path)

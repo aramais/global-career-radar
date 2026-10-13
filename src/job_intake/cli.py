@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -9,10 +10,17 @@ from typing import Annotated
 
 import typer
 
-from job_intake.annotation.eval_runner import run_evaluation, sqlite_path, write_report
+from job_intake.annotation.eval_runner import (
+    read_saved_records,
+    run_evaluation,
+    sqlite_path,
+    write_report,
+    write_text_report,
+)
 from job_intake.annotation.progress import AnnotationProgressReporter
 from job_intake.config.settings import (
     ANNOTATION_PROVIDER_DEFAULTS,
+    AppConfig,
     SourceDefinition,
     load_app_config,
     load_yaml_mapping,
@@ -24,6 +32,10 @@ from job_intake.storage.repository import validate_job_uids
 
 app = typer.Typer(add_completion=False, help="Personal multi-profile job search")
 app.add_typer(crm_app, name="crm")
+eval_app = typer.Typer(no_args_is_help=False, help="Read-only integrity and accuracy evaluation")
+gold_app = typer.Typer(help="Prepare and validate human vacancy labels without API calls")
+app.add_typer(eval_app, name="eval")
+app.add_typer(gold_app, name="gold")
 
 _ANNOTATION_PRESETS = {
     "budget-jev": {
@@ -346,8 +358,9 @@ def annotate(
         raise typer.Exit(code=1)
 
 
-@app.command("eval")
+@eval_app.callback(invoke_without_command=True)
 def eval_annotations(
+    ctx: typer.Context,
     config: str = typer.Option("config/settings.yaml", help="App config YAML"),
     limit: int = typer.Option(10, min=1, help="Most recently updated active vacancies"),
     all_jobs: bool = typer.Option(False, "--all", help="Check all active saved vacancies"),
@@ -366,6 +379,8 @@ def eval_annotations(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Print individual finding details"),
 ) -> None:
     """Check saved evidence/reviews without API calls, migrations, rescoring or notifications."""
+    if ctx.invoked_subcommand is not None:
+        return
     try:
         settings = load_app_config(config)
         protected = [sqlite_path(settings.database_url), Path(config), settings.rules_path,
@@ -440,8 +455,150 @@ def eval_annotations(
     else:
         typer.echo("Semantic accuracy is not measured without manual gold (--gold).")
     typer.echo(f"Report: {path}")
-    if not report["passed"]:
+    if not report["integrity_passed"]:
         raise typer.Exit(code=1)
+
+
+def _eval_inputs(settings: AppConfig, config: str, *inputs: Path | None) -> list[Path]:
+    database = sqlite_path(settings.database_url)
+    return [
+        database, *(Path(str(database) + suffix) for suffix in ("-wal", "-shm", "-journal")),
+        Path(config), Path(config).resolve().parent.parent / ".env", settings.rules_path,
+        settings.search_profiles_path, settings.company_watchlist_path,
+        *(path for path in inputs if path is not None),
+    ]
+
+
+def _eval_destinations(outputs: list[Path], protected: list[Path]) -> None:
+    resolved = [path.expanduser().resolve() for path in outputs]
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("Report destinations must be distinct")
+    if set(resolved) & {path.expanduser().resolve() for path in protected}:
+        raise ValueError("Report must not overwrite the database, config, log or gold inputs")
+
+
+@gold_app.command("sample")
+def gold_sample(
+    config: str = typer.Option("config/settings.yaml", help="App config YAML"),
+    out: Annotated[Path, typer.Option(help="Blind JSONL")] = Path(
+        "data/local/gold/vacancy-tags-v1.jsonl"
+    ),
+    seed: int = typer.Option(20261013, help="Reproducible random sampling seed"),
+    strata: Annotated[
+        Path | None, typer.Option(help="YAML mapping of stratum names to requested counts")
+    ] = None,
+    include_saved_rejects: bool = typer.Option(
+        False, "--include-saved-rejects", help="Fill local-reject shortage with saved final rejects"
+    ),
+) -> None:
+    """Prepare unlabeled source snapshots and a separate sampling manifest, read-only."""
+    from job_intake.annotation.gold import sample_gold
+
+    try:
+        settings = load_app_config(config)
+        manifest_path = out.with_suffix(".manifest.json")
+        protected = _eval_inputs(settings, config, strata)
+        _eval_destinations([out, manifest_path], protected)
+        counts = load_yaml_mapping(strata) if strata else None
+        cases, manifest = sample_gold(
+            settings, seed=seed, strata=counts, include_saved_rejects=include_saved_rejects,
+        )
+        content = "".join(json.dumps(case, ensure_ascii=False, allow_nan=False) + "\n"
+                          for case in cases)
+        write_text_report(content, out, protected_paths=protected)
+        write_report(manifest, manifest_path, protected_paths=protected)
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Sample: {len(cases)} unlabeled vacancies. API calls=0; database=read-only.")
+    typer.echo(f"Blind labels: {out.resolve()}; sampling manifest: {manifest_path.resolve()}")
+
+
+@gold_app.command("validate")
+def gold_validate(
+    config: str = typer.Option("config/settings.yaml", help="App config YAML"),
+    gold: Annotated[Path, typer.Option(help="Gold JSONL")] = Path(
+        "data/local/gold/vacancy-tags-v1.jsonl"
+    ),
+    output: Annotated[Path, typer.Option()] = Path("data/local/eval/gold-validation.json"),
+) -> None:
+    """Validate vacancy labels and rebind their quotes to current source units."""
+    from job_intake.annotation.benchmark import read_jsonl
+    from job_intake.annotation.gold import validate_gold
+
+    try:
+        settings = load_app_config(config)
+        protected = _eval_inputs(settings, config, gold)
+        _eval_destinations([output], protected)
+        cases = read_jsonl(gold)
+        if not cases or any(not isinstance(case.get("job_uid"), str) for case in cases):
+            raise ValueError("Gold must contain vacancy rows with job_uid")
+        _, rows, problems = read_saved_records(
+            settings.database_url, limit=None, job_uids=[case["job_uid"] for case in cases],
+        )
+        streams = load_streams(load_yaml_mapping(settings.rules_path),
+                               load_yaml_mapping(settings.search_profiles_path))
+        report = validate_gold(rows, cases, profile_ids=[stream.id for stream in streams])
+        report["source_problems"] = problems
+        if any(item["severity"] == "error" and item["code"] != "invalid_annotation_json"
+               for items in problems.values() for item in items):
+            report["valid"] = False
+        write_report(report, output, protected_paths=protected)
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Gold valid={report['valid']}; labeled={report['labeled_count']}; "
+               f"relevant={report['relevant_count']}. API calls=0; database=read-only.")
+    typer.echo(f"Report: {output.resolve()}")
+    if not report["valid"]:
+        raise typer.Exit(code=1)
+
+
+@eval_app.command("accuracy")
+def eval_accuracy(
+    gold: Annotated[Path, typer.Option(help="Human vacancy-level gold JSONL")],
+    config: str = typer.Option("config/settings.yaml", help="App config YAML"),
+    variant: str = typer.Option("saved", help="Phase 0 supports saved annotations only"),
+    output: Annotated[Path, typer.Option()] = Path("data/local/eval/accuracy-saved.json"),
+    prices: Annotated[Path | None, typer.Option(help="Dated YAML token tariffs")] = None,
+    log: Annotated[Path | None, typer.Option(help="Optional annotation run log")] = None,
+) -> None:
+    """Measure a saved baseline against human labels without API calls or DB writes."""
+    from job_intake.annotation.accuracy import run_accuracy, write_accuracy_report
+
+    try:
+        settings = load_app_config(config)
+        protected = _eval_inputs(settings, config, gold,
+                                 prices or settings.rules_path.parent / "eval_prices.yaml", log)
+        _eval_destinations([output, output.with_suffix(".md")], protected)
+        report = run_accuracy(settings, gold=gold, variant=variant, prices=prices, log=log)
+        paths = write_accuracy_report(report, output, protected_paths=protected)
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo("Accuracy baseline calculated. API calls=0; database=read-only.")
+    typer.echo(f"Reports: {paths}")
+
+
+@eval_app.command("rules-diff")
+def eval_rules_diff(
+    baseline: Annotated[str, typer.Option(help="Git revision or rules snapshot JSON")],
+    config: str = typer.Option("config/settings.yaml", help="App config YAML"),
+    output: Annotated[Path, typer.Option()] = Path("data/local/eval/rules-diff.json"),
+    limit: Annotated[int | None, typer.Option(min=1, help="Active vacancies to compare")] = None,
+) -> None:
+    """Compare deterministic decisions on the same source snapshot, without API calls."""
+    from job_intake.annotation.rules_diff import run_rules_diff, write_rules_diff_report
+
+    try:
+        settings = load_app_config(config)
+        baseline_path = Path(baseline)
+        protected = _eval_inputs(settings, config,
+                                 baseline_path if baseline_path.is_file() else None)
+        _eval_destinations([output, output.with_suffix(".md")], protected)
+        report = run_rules_diff(settings, baseline=baseline, limit=limit)
+        paths = write_rules_diff_report(report, output, protected_paths=protected)
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Rules diff: {report['counts']}. API calls=0; database=read-only.")
+    typer.echo(f"Reports: {paths}")
 
 
 @app.command()

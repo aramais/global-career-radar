@@ -74,6 +74,7 @@ def test_eval_selects_latest_active_rows_without_mutating_database(stored, tmp_p
     report = json.loads(report_path.read_text())
     assert [row["job_uid"] for row in report["jobs"]] == ["recent"]
     assert report["database_access"] == "read_only"
+    assert report["integrity_passed"] is report["passed"] is True
     assert path.read_bytes() == before
     with sqlite3.connect(path) as connection:
         assert len(list(connection.execute("PRAGMA table_info(jobs)"))) == 13

@@ -1,0 +1,651 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vacancy-tags-v1 human template",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "gate_outcome",
+    "job_uid",
+    "labeled_at",
+    "method",
+    "notes",
+    "relevance",
+    "source_hash",
+    "tags",
+    "text_version"
+  ],
+  "properties": {
+    "schema": {
+      "const": "vacancy-tags-v1"
+    },
+    "job_uid": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "text_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "labeled_at": {
+      "anyOf": [
+        {
+          "type": "string",
+          "format": "date"
+        },
+        {
+          "type": "string",
+          "format": "date-time"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "method": {
+      "enum": [
+        "blind",
+        "assisted",
+        null
+      ]
+    },
+    "tags": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hiring_geography": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "brazil_explicit",
+                "includes_brazil_region",
+                "excludes_brazil",
+                "restricted_elsewhere",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "work_mode": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "remote",
+                "remote_or_hybrid",
+                "hybrid",
+                "onsite",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            },
+            "office_location": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "working_language": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "english_required",
+                "other_language_required",
+                "english_optional",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "work_authorization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "country_required",
+                "not_required",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            },
+            "country": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "employment_type": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "full_time",
+                "contract",
+                "part_time",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "vacancy_closed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "true",
+                "false"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "role_family": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "product",
+                "analytics",
+                "data_science",
+                "business_strategy_finance",
+                "engineering",
+                "design",
+                "sales_marketing_partnerships",
+                "support_ops",
+                "other"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "analytics_intensity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "core",
+                "supporting",
+                "none",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "seniority": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "ic",
+                "lead",
+                "manager",
+                "head_director",
+                "executive",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "project_management": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "duty",
+                "skill_only",
+                "explicitly_absent",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "people_interaction": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "duty",
+                "skill_only",
+                "explicitly_absent",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "decision_influence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "duty",
+                "skill_only",
+                "explicitly_absent",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "isolated_analysis": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "explicit",
+                "not_indicated"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "direct_reports": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "yes",
+                "explicitly_none",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "hands_on_share": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "predominant",
+                "partial",
+                "none",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "business_economics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "duty",
+                "skill_only",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "finance_gm_partnership": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "duty",
+                "skill_only",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "causal_experimentation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "duty",
+                "skill_only",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        },
+        "marketplace_domain": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "yes",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "relevance": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[a-z0-9][a-z0-9_-]*$"
+      },
+      "additionalProperties": {
+        "enum": [
+          0,
+          1,
+          2,
+          3,
+          null
+        ]
+      }
+    },
+    "gate_outcome": {
+      "enum": [
+        "eligible",
+        "ineligible",
+        "unknown",
+        null
+      ]
+    },
+    "notes": {
+      "type": "string"
+    },
+    "label_scope": {
+      "enum": [
+        "blind_decisions",
+        "full_tags",
+        "constraints"
+      ]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "company": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "original_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "apply_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_job_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "posted_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "location_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remote_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "employment_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "salary_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timezone_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description_raw": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description_clean": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "description_complete": {
+              "type": "boolean"
+            },
+            "applicant_location_requirements": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "working_language": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}
