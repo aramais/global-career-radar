@@ -165,9 +165,11 @@ def test_added_profiles_are_reported_without_losing_stable_job_ids(policy_reposi
     config.search_profiles_path.write_text(yaml.safe_dump(profiles))
     report = _run(policy_repository)
     assert report["counts"]["profiles_added"] == ["second"]
-    added = next(change for change in report["changes"] if change["profile_id"] == "second")
-    assert added["before"] is None and added["job_uid"] == "stable-job"
-    assert added["changed_fields"] == ["profile_presence"]
+    assert report["current"]["policy"] == "single-role-v1"
+    assert len(report["current"]["evaluations"]) == 1
+    assert report["current"]["evaluations"][0]["job_uid"] == "stable-job"
+    assert report["current"]["evaluations"][0]["profile_id"] == "other"
+    assert all(change["profile_id"] != "second" for change in report["changes"])
     assert report["counts"]["decision_flips"] == 0
 
 
@@ -316,5 +318,23 @@ def test_snapshot_rejects_missing_vacancy_profile_outcomes(policy_repository, tm
     report["current"]["evaluations"] = []
     snapshot = tmp_path / "baseline.json"
     snapshot.write_text(json.dumps(report))
-    with pytest.raises(ValueError, match="every selected"):
+    with pytest.raises(ValueError, match="exactly one selected role"):
         _run(policy_repository, str(snapshot))
+
+
+def test_legacy_git_baseline_preserves_matrix_without_fabricating_role(policy_repository):
+    repository, config, _ = policy_repository
+    classifier = repository / "src/job_intake/classification.py"
+    original = classifier.read_text()
+    classifier.unlink()
+    profiles = yaml.safe_load(config.search_profiles_path.read_text())
+    profiles["streams"].append({"id": "second", "scoring": {"threshold_a": 20, "threshold_b": 8}})
+    config.search_profiles_path.write_text(yaml.safe_dump(profiles))
+    baseline = _commit(repository)
+    classifier.write_text(original)
+    report = _run(policy_repository, baseline)
+    assert report["baseline"]["policy"] == "multi-profile-legacy"
+    assert report["current"]["policy"] == "single-role-v1"
+    assert report["counts"]["evaluations_before"] == 2
+    assert report["counts"]["evaluations_after"] == 1
+    assert report["counts"]["classification_policy_changed"] is True

@@ -174,7 +174,7 @@ def _read_sheet(
             if column in cells:
                 raise WorkbookError(f"Duplicate worksheet cell: {name}!{column}{number}")
             formula_node = item.find(_tag("f"))
-            formula = formula_node.text if formula_node is not None else None
+            formula = (formula_node.text or "") if formula_node is not None else None
             value = _cell_value(item, shared_strings)
             if formula_node is not None and item.find(_tag("v")) is None:
                 warnings.append(f"{name}!{column}{number}: formula has no cached value")

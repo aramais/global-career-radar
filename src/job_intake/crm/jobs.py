@@ -9,7 +9,7 @@ from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session, load_only, selectinload
 
 from job_intake.storage.models import JobORM, JobProfileEvaluationORM
-from job_intake.storage.queries import ranked_profile_evaluations
+from job_intake.storage.queries import classification_is_current, ranked_profile_evaluations
 
 JOB_QUERY_FIELDS = {"profile_id", "job_archive", "query", "tier", "score_min", "score_max",
                     "sort", "offset", "limit"}
@@ -21,12 +21,15 @@ LIST_COLUMNS = (
     JobORM.id, JobORM.job_uid, JobORM.company, JobORM.title, JobORM.content_hash,
     JobORM.archived_at, JobORM.archive_version, JobORM.apply_url, JobORM.original_url,
     JobORM.location_text, JobORM.remote_text,
+    JobORM.role_label, JobORM.role_classification,
 )
 EVALUATION_COLUMNS = (
     JobProfileEvaluationORM.job_uid, JobProfileEvaluationORM.profile_id,
     JobProfileEvaluationORM.profile_name, JobProfileEvaluationORM.profile_version,
     JobProfileEvaluationORM.content_hash, JobProfileEvaluationORM.tier,
     JobProfileEvaluationORM.decision, JobProfileEvaluationORM.fit_score,
+    JobProfileEvaluationORM.classification_version,
+    JobProfileEvaluationORM.classification_source_hash,
 )
 
 
@@ -58,7 +61,9 @@ def _score(query: dict, key: str) -> float | None:
 def current_evaluations(job: JobORM, versions: dict[str, str]) -> list[JobProfileEvaluationORM]:
     return sorted(
         (p for p in job.profile_evaluations
-         if versions.get(p.profile_id) == p.profile_version and p.content_hash == job.content_hash),
+         if classification_is_current(job, p)
+         and versions.get(p.profile_id) == p.profile_version
+         and p.content_hash == job.content_hash),
         key=lambda p: ({"A": 0, "B": 1, "C": 2}.get(p.tier, 3),
                        {"pass": 0, "review": 1, "reject": 2}.get(p.decision, 3),
                        -p.fit_score, p.profile_id),
@@ -88,8 +93,12 @@ def _public_prefilter(value: object) -> dict | None:
 def serialize_job(job: JobORM, versions: dict[str, str], *, profile: str | None = None,
                   detailed: bool = False) -> dict:
     evaluations = current_evaluations(job, versions)
-    best = next((p for p in evaluations if p.profile_id == profile), None) if profile else None
-    best = best or next(iter(evaluations), None)
+    classified = classification_is_current(job, next(iter(job.profile_evaluations), None))
+    best = next(iter(evaluations), None)
+    if profile and job.role_label != profile:
+        best = None
+        evaluations = []
+    scored = best is not None and job.role_label != "other"
     archived_at = job.archived_at
     if archived_at is not None and archived_at.tzinfo is None:
         archived_at = archived_at.replace(tzinfo=UTC)
@@ -99,13 +108,27 @@ def serialize_job(job: JobORM, versions: dict[str, str], *, profile: str | None 
         "archived_at": archived_at.isoformat() if archived_at else None,
         "archive_version": job.archive_version, "url": job.apply_url or job.original_url,
         "location": job.location_text, "remote": job.remote_text,
-        "fit_score": best.fit_score if best else None, "tier": best.tier if best else None,
+        "role_label": job.role_label,
+        "role_name": (job.role_classification or {}).get("name"),
+        "classification_reason": (job.role_classification or {}).get("reason"),
+        "classification_state": "current" if classified else "needs_reclassification",
+        "evaluation_state": ("unscored" if classified and job.role_label == "other"
+                             else "current" if best else "needs_reevaluation"),
+        "eligibility": ({"decision": best.decision,
+                         **({"blocker_signals": best.blocker_signals, "risks": best.risks}
+                            if detailed else {})} if best else None),
+        "relevance": ({"id": best.profile_id, "name": best.profile_name,
+                       "score": best.fit_score, "tier": best.tier, "decision": best.decision,
+                       **({"fit_reason": best.fit_reason, "risks": best.risks,
+                           "blocker_signals": best.blocker_signals} if detailed else {})}
+                      if scored else None),
+        "fit_score": best.fit_score if scored else None, "tier": best.tier if scored else None,
         "decision": best.decision if best else None,
         "profiles": [{"id": p.profile_id, "name": p.profile_name, "score": p.fit_score,
                       "tier": p.tier, "decision": p.decision,
                       **({"fit_reason": p.fit_reason, "risks": p.risks,
                           "blocker_signals": p.blocker_signals} if detailed else {})}
-                     for p in evaluations],
+                     for p in evaluations if job.role_label != "other"],
     }
     if detailed:
         result["description"] = job.description_clean or job.description_raw
@@ -144,14 +167,16 @@ def list_job_page(session: Session, versions: dict[str, str], query: dict[str, s
         statement = statement.where(JobORM.archived_at.is_not(None) if archive == "archived"
                                     else JobORM.archived_at.is_(None))
     if profile:
-        statement = statement.where(ranked.c.id.is_not(None))
+        statement = statement.where(JobORM.role_label == profile)
     if tier:
-        statement = statement.where(ranked.c.id.is_(None) if tier == "unrated"
-                                    else ranked.c.tier == tier)
+        statement = statement.where(
+            or_(ranked.c.id.is_(None), JobORM.role_label == "other") if tier == "unrated"
+            else and_(JobORM.role_label != "other", ranked.c.tier == tier)
+        )
     if minimum is not None:
-        statement = statement.where(ranked.c.fit_score >= minimum)
+        statement = statement.where(JobORM.role_label != "other", ranked.c.fit_score >= minimum)
     if maximum is not None:
-        statement = statement.where(ranked.c.fit_score <= maximum)
+        statement = statement.where(JobORM.role_label != "other", ranked.c.fit_score <= maximum)
     search = query.get("query", "").strip()
     if len(search) > 500 or "\x00" in search:
         raise ValueError("Search text is too long or contains a null character")
@@ -165,10 +190,12 @@ def list_job_page(session: Session, versions: dict[str, str], query: dict[str, s
             lower(column).contains(search.lower(), autoescape=True) for column in columns
         )))
     total = session.scalar(select(func.count()).select_from(statement.subquery())) or 0
-    unrated = case((ranked.c.id.is_(None), 1), else_=0)
+    unscored = or_(ranked.c.id.is_(None), JobORM.role_label == "other")
+    unrated = case((unscored, 1), else_=0)
     tier_rank = case((ranked.c.tier == "A", 0), (ranked.c.tier == "B", 1), else_=2)
     tier_order = tier_rank.desc() if sort == "tier-desc" else tier_rank.asc()
-    score_order = ranked.c.fit_score.asc() if sort == "score-asc" else ranked.c.fit_score.desc()
+    score = case((unscored, None), else_=ranked.c.fit_score)
+    score_order = score.asc() if sort == "score-asc" else score.desc()
     order = (score_order, tier_order) if sort.startswith("score-") else (tier_order, score_order)
     statement = statement.order_by(unrated, *order, JobORM.job_uid).offset(offset).limit(limit)
     statement = statement.options(

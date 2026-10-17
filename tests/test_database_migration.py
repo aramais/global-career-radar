@@ -132,7 +132,7 @@ def test_additive_migration_preserves_legacy_data_and_is_idempotent(
             "jobs",
             "job_events",
             "job_feedback",
-            "job_profile_evaluations",
+            "job_relevance_evaluations",
             "alert_outbox",
         } <= set(inspector.get_table_names())
         columns = {column["name"]: column for column in inspector.get_columns("jobs")}
@@ -144,6 +144,8 @@ def test_additive_migration_preserves_legacy_data_and_is_idempotent(
             "alert_pending",
             "archived_at",
             "archive_version",
+            "role_label",
+            "role_classification",
         } <= set(columns)
         assert columns["alert_pending"]["nullable"] is False
         with closing(sqlite3.connect(path)) as connection:
@@ -155,6 +157,8 @@ def test_additive_migration_preserves_legacy_data_and_is_idempotent(
         with database.session() as session:
             job = session.scalar(select(JobORM).where(JobORM.job_uid == "legacy-job-uid"))
             assert job is not None
+            assert job.role_label is None
+            assert job.role_classification == {}
             assert job.best_profile_id is None
             assert job.best_profile_name is None
             assert job.alert_pending is False
@@ -222,5 +226,44 @@ def test_additive_migration_preserves_legacy_data_and_is_idempotent(
             assert job.profile_evaluations[0].profile_id == "analytics"
             assert len(job.alert_outbox) == 1
             assert job.alert_outbox[0].message == "Saved alert"
+    finally:
+        database.engine.dispose()
+
+
+def test_multi_profile_history_survives_without_becoming_role_classification(tmp_path):
+    from job_intake.crm.jobs import job_detail
+    from job_intake.storage.repository import JobRepository
+
+    path = tmp_path / "multi.db"
+    create_legacy_database(path, True)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript('''
+            CREATE TABLE job_profile_evaluations (
+                job_uid TEXT, profile_id TEXT, fit_score FLOAT,
+                UNIQUE(job_uid, profile_id)
+            );
+            INSERT INTO job_profile_evaluations VALUES ('legacy-job-uid','product',30);
+            INSERT INTO job_profile_evaluations VALUES ('legacy-job-uid','science',10);
+            ALTER TABLE jobs ADD COLUMN best_profile_id TEXT;
+            UPDATE jobs SET best_profile_id='product';
+        ''')
+        connection.commit()
+    database = Database(f"sqlite:///{path}")
+    try:
+        database.create_schema()
+        database.create_schema()
+        with closing(sqlite3.connect(path)) as connection:
+            assert connection.execute(
+                "SELECT profile_id,fit_score FROM job_profile_evaluations ORDER BY profile_id"
+            ).fetchall() == [("product", 30), ("science", 10)]
+            assert connection.execute(
+                "SELECT count(*) FROM job_relevance_evaluations"
+            ).fetchone() == (0,)
+        with database.session() as session:
+            detail = job_detail(session, {"product": "v1", "science": "v1"}, "legacy-job-uid")
+            assert detail["role_label"] is None
+            assert detail["relevance"] is None
+            assert detail["profiles"] == []
+            assert JobRepository(session).recent_jobs_for_digest(hours=100000) == []
     finally:
         database.engine.dispose()

@@ -48,6 +48,8 @@ class Database:
         "best_profile_name": "VARCHAR(255)",
         "alert_pending": "BOOLEAN NOT NULL DEFAULT 0",
         "annotation": "JSON NOT NULL DEFAULT '{}'",
+        "role_label": "VARCHAR(100)",
+        "role_classification": "JSON NOT NULL DEFAULT '{}'",
         "archived_at": "DATETIME",
         "archive_version": "INTEGER NOT NULL DEFAULT 1",
     }
@@ -63,6 +65,10 @@ class Database:
         migrations = {
             "jobs": self._JOBS_ADDITIVE_COLUMNS,
             "crm_companies": {"version": "INTEGER NOT NULL DEFAULT 1"},
+            "job_relevance_evaluations": {
+                "classification_version": "VARCHAR(64) NOT NULL DEFAULT ''",
+                "classification_source_hash": "VARCHAR(64) NOT NULL DEFAULT ''",
+            },
         }
         tables = set(inspector.get_table_names())
         for table, additions in migrations.items():

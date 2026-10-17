@@ -5,9 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from job_intake.classification import RoleClassifier
 from job_intake.config.settings import load_yaml_mapping
 from job_intake.models.job import FilterDecision, JobRecord, JobStatus, JobTier
-from job_intake.profiles import SearchStream, load_streams
+from job_intake.profiles import SearchStream, load_streams, with_other_stream
 from job_intake.scoring.tiering import finalize_tier
 from job_intake.storage.database import Database
 from job_intake.storage.repository import JobRepository
@@ -316,7 +317,12 @@ def test_low_fit_unknown_language_is_visible_in_wide_export(streams, tmp_path) -
         title="Operations Associate", description_clean="General business coordination.",
         source_metadata={},
     )
-    items = [_evaluate(stream, record) for stream in streams]
+    stream, classification = RoleClassifier(with_other_stream(
+        streams, load_yaml_mapping(CONFIG_DIR / "rules.yaml"),
+    )).classify(record)
+    item = _evaluate(stream, record)
+    item.role_classification = classification
+    items = [item]
     assert all(item.evaluation.tier == JobTier.C for item in items)
     assert all(item.evaluation.decision == FilterDecision.REVIEW for item in items)
     database = Database("sqlite:///:memory:")
@@ -327,13 +333,15 @@ def test_low_fit_unknown_language_is_visible_in_wide_export(streams, tmp_path) -
         session.commit()
         path = repository.export_shortlisted_csv(
             tmp_path / "wide-search.csv", wide=True,
-            active_profile_versions={stream.id: stream.version for stream in streams},
+            active_profile_versions={stream.id: stream.version},
         )
     with path.open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert len(rows) == 1
     assert rows[0]["title"] == "Operations Associate"
-    assert rows[0]["tier"] == "C"
+    assert rows[0]["role_label"] == "other"
+    assert rows[0]["evaluation_state"] == "unscored"
+    assert rows[0]["tier"] == rows[0]["fit_score"] == ""
     assert rows[0]["filter_decision"] == "review"
     assert "language:working_language_unconfirmed" in rows[0]["risks"]
 

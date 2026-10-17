@@ -15,7 +15,7 @@ from job_intake.annotation.prefilter import SCREEN_PROMPT, VERIFY_PROMPT
 from job_intake.config.settings import PrefilterConfig, load_app_config, load_yaml_mapping
 from job_intake.models.job import FilterDecision, JobStatus
 from job_intake.pipeline import JobIntakePipeline
-from job_intake.profiles import load_streams
+from job_intake.profiles import load_streams, with_other_stream
 from job_intake.storage.models import AlertOutboxORM, JobORM, JobProfileEvaluationORM
 
 
@@ -53,7 +53,10 @@ def app_config(tmp_path, monkeypatch):
     monkeypatch.setenv("PREFILTER_PIPELINE_TEST_KEY", "fake-test-key")
     config = _config(tmp_path, ai=True)
     profiles = yaml.safe_load(config.search_profiles_path.read_text())
-    profiles["streams"].append({**deepcopy(profiles["streams"][0]), "id": "analytics"})
+    profiles["streams"].append({
+        **deepcopy(profiles["streams"][0]), "id": "analytics",
+        "rules": {"positive_title_signals": ["head of analytics"]},
+    })
     config.search_profiles_path.write_text(yaml.safe_dump(profiles))
     return replace(config, prefilter=PrefilterConfig(
         enabled=True, api_key_env="PREFILTER_PIPELINE_TEST_KEY",
@@ -85,7 +88,7 @@ def test_confirmed_suppression_skips_full_ai_once_across_profiles_and_retains_so
     assert stats["prefilter_screen_calls"] == stats["prefilter_verify_calls"] == 1
     assert stats["annotation_extraction_calls"] == stats["annotation_review_calls"] == 0
     assert keys == {} and pending == []
-    assert len(items) == 2
+    assert len(items) == 1
     assert all(item.evaluation.decision == FilterDecision.REVIEW for item in items)
     assert all(item.evaluation.tier.value == "C" for item in items)
     assert all(item.evaluation.fit_score == 0 for item in items)
@@ -96,7 +99,7 @@ def test_confirmed_suppression_skips_full_ai_once_across_profiles_and_retains_so
         assert stored.status == "open"
         assert stored.description_clean == record.description_clean
         assert stored.annotation["prefilter"]["routing"] == "suppressed"
-        assert len(list(session.scalars(select(JobProfileEvaluationORM)))) == 2
+        assert len(list(session.scalars(select(JobProfileEvaluationORM)))) == 1
         assert list(session.scalars(select(AlertOutboxORM))) == []
 
 
@@ -114,7 +117,7 @@ def test_eligible_or_uncertain_or_disputed_routes_receive_full_annotation(
     record = noisy_record()
     stats = pipeline._stats()
     items, _, _ = pipeline._evaluate_record(record, stats, use_llm=True)
-    assert len(items) == 2
+    assert len(items) == 1
     assert stats["prefilter_full_review"] == 1
     assert stats["prefilter_suppressed"] == 0
     assert stats["annotation_extraction_calls"] == stats["annotation_review_calls"] == 1
@@ -149,9 +152,9 @@ def test_hard_blockers_skip_both_prefilter_and_full_ai_before_payment(app_config
     assert record.annotation["prefilter"]["routing"] == "local_reject"
 
 
-def test_a_blocker_in_only_one_profile_does_not_skip_other_profiles(app_config):
+def test_a_blocker_in_an_unselected_role_does_not_affect_selected_role(app_config):
     data = yaml.safe_load(app_config.search_profiles_path.read_text())
-    data["streams"][1]["rules"] = {"company_blacklist": ["Example"]}
+    data["streams"][1]["rules"]["company_blacklist"] = ["Example"]
     app_config.search_profiles_path.write_text(yaml.safe_dump(data))
     pipeline = pipeline_with_fakes(app_config, GateFake(screen="uncertain"))
     stats = pipeline._stats()
@@ -159,7 +162,7 @@ def test_a_blocker_in_only_one_profile_does_not_skip_other_profiles(app_config):
     assert stats["prefilter_local_skipped"] == 0
     assert stats["annotation_extraction_calls"] == 1
     assert [item.evaluation.decision for item in items] == [
-        FilterDecision.PASS, FilterDecision.REJECT,
+        FilterDecision.PASS,
     ]
 
 
@@ -174,7 +177,7 @@ def test_cached_suppression_survives_offline_reevaluation_and_observation_dates(
 
     offline = pipeline_with_fakes(app_config)
     result = offline.reevaluate_saved()
-    assert result["persisted"] == 1 and result["evaluations"] == 2
+    assert result["persisted"] == 1 and result["evaluations"] == 1
     assert result["prefilter_suppressed"] == 1
     assert offline.prefilter.client.calls == offline.annotator.client.calls == []
     with offline.database.session() as session:
@@ -211,10 +214,10 @@ def test_bypass_removes_suppression_and_allows_explicit_full_review(app_config):
 
 def test_active_versions_match_shared_crm_loader_and_model_defaults(app_config):
     pipeline = pipeline_with_fakes(app_config)
-    shared = load_streams(
+    shared = with_other_stream(load_streams(
         load_yaml_mapping(app_config.rules_path),
         load_yaml_mapping(app_config.search_profiles_path),
-    )
+    ), load_yaml_mapping(app_config.rules_path))
     assert pipeline.profile_versions == {stream.id: stream.version for stream in shared}
     actual = load_app_config("config/settings.yaml")
     assert actual.annotation.review_model == "gemini-3.6-flash"

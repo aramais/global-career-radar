@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import csv
-import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import and_, case, delete, func, literal, or_, select, update
+from sqlalchemy import and_, case, delete, or_, select, update
 from sqlalchemy.orm import aliased, selectinload
 
 from job_intake.alerts.digest import DigestJob
+from job_intake.annotation.text import source_hash
 from job_intake.models.job import EvaluatedJob, JobRecord, JobTier
 from job_intake.storage.dedup import JobDeduplicator
 from job_intake.storage.models import (
@@ -19,7 +19,7 @@ from job_intake.storage.models import (
     JobORM,
     JobProfileEvaluationORM,
 )
-from job_intake.storage.queries import ranked_profile_evaluations
+from job_intake.storage.queries import classification_is_current, ranked_profile_evaluations
 from job_intake.utils.csv import spreadsheet_safe_value
 
 
@@ -63,6 +63,23 @@ class JobRepository:
 
     def upsert_evaluated_job(self, item: EvaluatedJob, *, observed: bool = True) -> UpsertResult:
         identity = self.deduplicator.build_identity(item.record)
+        classification = dict(getattr(item, "role_classification", None) or {
+            "label": item.profile_id,
+            "name": item.profile_name or item.profile_id,
+            "version": "assigned-v1",
+            "source_hash": source_hash(item.record),
+            "content_hash": identity.content_hash,
+            "method": "assigned",
+            "reason": "Explicit role assignment supplied by the importing caller.",
+        })
+        if (
+            classification.get("label") != item.profile_id
+            or classification.get("content_hash") != identity.content_hash
+            or classification.get("source_hash") != source_hash(item.record)
+            or not isinstance(classification.get("version"), str)
+            or not classification.get("version")
+        ):
+            raise ValueError("Role classification must match the evaluation and source content")
         existing = self.session.scalar(select(JobORM).where(JobORM.job_uid == identity.job_uid))
         now = datetime.now(UTC)
 
@@ -103,6 +120,8 @@ class JobRepository:
                 bridge_role=item.evaluation.bridge_role,
                 source_metadata=item.record.source_metadata,
                 annotation=item.record.annotation,
+                role_label=item.profile_id,
+                role_classification=classification,
                 best_profile_id=item.profile_id,
                 best_profile_name=item.profile_name or item.profile_id,
             )
@@ -159,6 +178,8 @@ class JobRepository:
         existing.bridge_role = item.evaluation.bridge_role
         existing.source_metadata = item.record.source_metadata
         existing.annotation = item.record.annotation
+        existing.role_label = item.profile_id
+        existing.role_classification = classification
         existing.best_profile_id = item.profile_id
         existing.best_profile_name = item.profile_name or item.profile_id
         if observed:
@@ -201,18 +222,10 @@ class JobRepository:
         observed: bool = True,
         queue_alert: bool = False,
     ) -> UpsertResult:
-        """Save one vacancy plus independent evaluations; aggregate only the supplied profiles."""
-        if not items:
-            raise ValueError("At least one profile evaluation is required")
-        best = min(
-            items,
-            key=lambda item: (
-                {"A": 0, "B": 1, "C": 2}[item.evaluation.tier.value],
-                {"pass": 0, "review": 1, "reject": 2}[item.evaluation.decision.value],
-                -item.evaluation.fit_score,
-                item.profile_id,
-            ),
-        )
+        """Atomically save one assigned role and its single relevance evaluation."""
+        if len(items) != 1:
+            raise ValueError("Exactly one role relevance evaluation is required")
+        best = items[0]
         result = self.upsert_evaluated_job(best, observed=observed)
         self.session.flush()
         identity = self.deduplicator.build_identity(best.record)
@@ -220,15 +233,18 @@ class JobRepository:
             row = self.session.scalar(
                 select(JobProfileEvaluationORM).where(
                     JobProfileEvaluationORM.job_uid == result.job_uid,
-                    JobProfileEvaluationORM.profile_id == item.profile_id,
                 )
             )
             if row is None:
                 row = JobProfileEvaluationORM(job_uid=result.job_uid, profile_id=item.profile_id)
                 self.session.add(row)
+            row.profile_id = item.profile_id
             row.profile_name = item.profile_name or item.profile_id
             row.profile_version = item.profile_version
             row.content_hash = identity.content_hash
+            job = self.session.scalar(select(JobORM).where(JobORM.job_uid == result.job_uid))
+            row.classification_version = job.role_classification["version"]
+            row.classification_source_hash = job.role_classification["source_hash"]
             row.llm_cache_key = (cache_keys or {}).get(item.profile_id)
             for name in (
                 "deterministic_score",
@@ -323,15 +339,17 @@ class JobRepository:
             .where(JobORM.last_seen_at >= cutoff, JobORM.archived_at.is_(None))
             .order_by(JobORM.tier.asc(), JobORM.fit_score.desc())
         )
-        if active_profile_versions is None:
-            return list(self.session.scalars(stmt.where(JobORM.tier.in_(["A", "B"]))))
         jobs = []
         for job in self.session.scalars(stmt.options(selectinload(JobORM.profile_evaluations))):
             profiles = [
                 p
                 for p in job.profile_evaluations
                 if (
-                    active_profile_versions.get(p.profile_id) == p.profile_version
+                    p.profile_id == job.role_label
+                    and job.role_label != "other"
+                    and classification_is_current(job, p)
+                    and (active_profile_versions is None
+                         or active_profile_versions.get(p.profile_id) == p.profile_version)
                     and p.content_hash == job.content_hash
                     and p.tier in ("A", "B")
                     and p.decision != "reject"
@@ -339,15 +357,7 @@ class JobRepository:
             ]
             if not profiles:
                 continue
-            best = min(
-                profiles,
-                key=lambda p: (
-                    {"A": 0, "B": 1}[p.tier],
-                    {"pass": 0, "review": 1}[p.decision],
-                    -p.fit_score,
-                    p.profile_id,
-                ),
-            )
+            best = profiles[0]
             jobs.append(
                 DigestJob(
                     company=job.company,
@@ -435,6 +445,8 @@ class JobRepository:
         Delete dependencies in batches. Database SET NULL keeps CRM applications
         and their history; no source relationship is traversed for each job.
         """
+        from sqlalchemy import column, inspect, table
+
         # Sessions disable autoflush. Preserve pending CRM edits before refreshing
         # objects affected by database-level SET NULL and bulk deletes.
         self.session.flush()
@@ -445,6 +457,12 @@ class JobRepository:
             JobORM.archived_at.is_(None),
         )
         targets = select(JobORM.job_uid).where(*conditions)
+        # Historical profile matrices retain their original non-cascading FK.
+        # They are no longer ORM-mapped, so remove only the pruned jobs' rows
+        # explicitly while preserving all retained/archived vacancy history.
+        if inspect(self.session.connection()).has_table("job_profile_evaluations"):
+            legacy = table("job_profile_evaluations", column("job_uid"))
+            self.session.execute(delete(legacy).where(legacy.c.job_uid.in_(targets)))
         for model in (JobEventORM, FeedbackORM, JobProfileEvaluationORM, AlertOutboxORM):
             self.session.execute(
                 delete(model).where(model.job_uid.in_(targets))
@@ -473,13 +491,10 @@ class JobRepository:
             raise ValueError("limit must be a nonnegative integer")
         ranked = ranked_profile_evaluations(active_profile_versions, profile_id)
         selected_evaluation = aliased(JobProfileEvaluationORM, ranked)
-        current_sql = (
-            selected_evaluation.id.is_not(None)
-            if active_profile_versions is not None else literal(True)
-        )
-        tier_sql = func.coalesce(selected_evaluation.tier, JobORM.tier)
-        score_sql = func.coalesce(selected_evaluation.fit_score, JobORM.fit_score)
-        decision_sql = func.coalesce(selected_evaluation.decision, JobORM.filter_decision)
+        current_sql = selected_evaluation.id.is_not(None)
+        tier_sql = selected_evaluation.tier
+        score_sql = selected_evaluation.fit_score
+        decision_sql = selected_evaluation.decision
         query = (
             select(JobORM, selected_evaluation)
             .outerjoin(ranked, and_(
@@ -489,11 +504,12 @@ class JobRepository:
             .options(selectinload(JobORM.profile_evaluations))
         )
         if profile_id:
-            query = query.where(selected_evaluation.id.is_not(None))
+            query = query.where(JobORM.role_label == profile_id)
         if not include_rejected:
             query = query.where(or_(~current_sql, decision_sql != "reject"))
         if not wide:
-            query = query.where(current_sql, tier_sql.in_(("A", "B")))
+            query = query.where(current_sql, JobORM.role_label != "other",
+                                tier_sql.in_(("A", "B")))
         query = query.order_by(
             case((~current_sql, 3), else_=case(
                 {"A": 0, "B": 1, "C": 2}, value=tier_sql, else_=3,
@@ -503,28 +519,7 @@ class JobRepository:
         ).limit(limit)
         entries = []
         for row, selected in self.session.execute(query):
-            profiles = [
-                p
-                for p in row.profile_evaluations
-                if (
-                    active_profile_versions is None
-                    or (
-                        active_profile_versions.get(p.profile_id) == p.profile_version
-                        and p.content_hash == row.content_hash
-                    )
-                )
-            ]
-            profiles.sort(
-                key=lambda p: (
-                    {"A": 0, "B": 1, "C": 2}[p.tier],
-                    {"pass": 0, "review": 1, "reject": 2}[p.decision],
-                    -p.fit_score,
-                    p.profile_id,
-                )
-            )
-            current = selected is not None or active_profile_versions is None
-            evaluation = selected or row
-            entries.append((row, profiles, selected, evaluation, current))
+            entries.append((row, selected, selected is not None))
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
@@ -542,9 +537,10 @@ class JobRepository:
                     "fit_reason",
                     "apply_url",
                     "original_url",
-                    "profile_id",
-                    "profile_name",
-                    "profile_scores",
+                    "role_label",
+                    "role_name",
+                    "classification_reason",
+                    "classification_state",
                     "risks",
                     "location",
                     "remote",
@@ -554,51 +550,43 @@ class JobRepository:
                 ],
             )
             writer.writeheader()
-            for row, profiles, selected, evaluation, current in entries:
+            for row, selected, current in entries:
+                evaluation = selected
+                scored = current and row.role_label != "other"
+                classified = classification_is_current(
+                    row, next(iter(row.profile_evaluations), None),
+                )
                 values = {
                         "job_uid": row.job_uid,
                         "company": row.company,
                         "title": row.title,
-                        "tier": evaluation.tier if current else "",
-                        "bucket": evaluation.bucket if current else "",
-                        "fit_score": evaluation.fit_score if current else "",
-                        "filter_decision": (selected.decision if selected else row.filter_decision)
+                        "tier": evaluation.tier if scored else "",
+                        "bucket": evaluation.bucket if scored else "",
+                        "fit_score": evaluation.fit_score if scored else "",
+                        "filter_decision": selected.decision
                         if current
                         else "",
                         "matched_signals": ", ".join(evaluation.matched_signals) if current else "",
                         "detected_blockers": ", ".join(
-                            selected.blocker_signals if selected else row.detected_blockers
+                            selected.blocker_signals
                         )
                         if current
                         else "",
                         "fit_reason": evaluation.fit_reason if current else "",
                         "apply_url": row.apply_url,
                         "original_url": row.original_url,
-                        "profile_id": (selected.profile_id if selected else row.best_profile_id)
-                        if current
-                        else "",
-                        "profile_name": (
-                            selected.profile_name if selected else row.best_profile_name
-                        )
-                        if current
-                        else "",
-                        "profile_scores": json.dumps(
-                            {
-                                p.profile_id: {
-                                    "score": p.fit_score,
-                                    "tier": p.tier,
-                                    "decision": p.decision,
-                                }
-                                for p in profiles
-                            },
-                            ensure_ascii=False,
-                        ),
+                        "role_label": row.role_label or "",
+                        "role_name": (row.role_classification or {}).get("name", ""),
+                        "classification_reason": (row.role_classification or {}).get("reason", ""),
+                        "classification_state": ("current" if classified
+                                                 else "needs_reclassification"),
                         "risks": ", ".join(evaluation.risks) if current else "",
                         "location": row.location_text,
                         "remote": row.remote_text,
                         "salary": row.salary_text,
                         "description": row.description_clean or row.description_raw,
-                        "evaluation_state": "current" if current else "needs_reevaluation",
+                        "evaluation_state": ("unscored" if classified and row.role_label == "other"
+                                             else "current" if current else "needs_reevaluation"),
                     }
                 writer.writerow({
                     key: spreadsheet_safe_value(value) for key, value in values.items()

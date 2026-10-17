@@ -7,14 +7,32 @@ from sqlalchemy import and_, case, false, func, or_, select
 from job_intake.storage.models import JobORM, JobProfileEvaluationORM
 
 
+def classification_is_current(job, evaluation=None) -> bool:
+    """Check persisted provenance without loading the vacancy's full description."""
+    value = getattr(job, "role_classification", None)
+    if not isinstance(value, dict) or not (
+        value.get("label") == getattr(job, "role_label", None)
+        and bool(value.get("label"))
+        and value.get("content_hash") == getattr(job, "content_hash", None)
+        and isinstance(value.get("source_hash"), str) and bool(value["source_hash"])
+        and isinstance(value.get("version"), str) and bool(value["version"])
+    ):
+        return False
+    return evaluation is None or (
+        evaluation.profile_id == job.role_label
+        and evaluation.content_hash == job.content_hash
+        and value["version"] == evaluation.classification_version
+        and value["source_hash"] == evaluation.classification_source_hash
+    )
+
+
 def ranked_profile_evaluations(
     active_profile_versions: dict[str, str] | None, profile_id: str | None = None,
 ):
-    """Return all eligible evaluations, ranked within each vacancy.
+    """Return the one relevance evaluation for the vacancy's assigned role.
 
-    ``None`` preserves legacy consumers' unrestricted selection. A supplied map
-    requires both current criteria and current source content, including an
-    empty map (no current evaluations). Filter a requested profile before rank.
+    ``None`` omits only the criteria-version filter; classification and source
+    provenance are always required. An empty map means no current evaluations.
     """
     evaluation = JobProfileEvaluationORM
     query = select(
@@ -28,10 +46,19 @@ def ranked_profile_evaluations(
                 evaluation.profile_id,
             ),
         ).label("evaluation_rank"),
+    ).join(JobORM, JobORM.job_uid == evaluation.job_uid).where(
+        JobORM.role_label == evaluation.profile_id,
+        evaluation.content_hash == JobORM.content_hash,
+        JobORM.role_classification["label"].as_string() == JobORM.role_label,
+        JobORM.role_classification["content_hash"].as_string() == JobORM.content_hash,
+        JobORM.role_classification["version"].as_string() == evaluation.classification_version,
+        JobORM.role_classification["source_hash"].as_string()
+        == evaluation.classification_source_hash,
+        evaluation.classification_version != "",
+        evaluation.classification_source_hash != "",
     )
     if active_profile_versions is not None:
-        query = query.join(JobORM, JobORM.job_uid == evaluation.job_uid).where(
-            evaluation.content_hash == JobORM.content_hash,
+        query = query.where(
             or_(
                 *(
                     and_(evaluation.profile_id == profile, evaluation.profile_version == version)

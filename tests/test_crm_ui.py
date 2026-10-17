@@ -220,56 +220,28 @@ def test_job_filters_combine_stored_tier_and_inclusive_uncapped_score_range(
     assert _filtered_job_ids(graded_jobs, **options) == expected
 
 
-def test_job_filters_and_card_assessment_use_the_selected_profile_not_the_api_best():
+def test_job_filters_use_single_assigned_role_instead_of_alternative_score():
     jobs = [
-        {
-            "job_uid": "product-fit",
-            "tier": "A",
-            "fit_score": 25,
-            "profiles": [
-                {"id": "product", "tier": "A", "score": 25, "decision": "pass"},
-                {"id": "analytics", "tier": "C", "score": 0, "decision": "reject"},
-            ],
-        },
-        {
-            "job_uid": "analytics-fit",
-            "profiles": [
-                {"id": "product", "tier": "C", "score": 2, "decision": "review"},
-                {"id": "analytics", "tier": "B", "score": 9, "decision": "review"},
-            ],
-        },
-        {"job_uid": "no-analytics", "profiles": [{"id": "product", "tier": "A", "score": 50}]},
+        {"job_uid": "product-fit", "role_label": "product",
+         "relevance": {"id": "product", "tier": "A", "score": 25, "decision": "pass"}},
+        {"job_uid": "analytics-fit", "role_label": "analytics",
+         "relevance": {"id": "analytics", "tier": "B", "score": 9, "decision": "review"}},
+        {"job_uid": "stale-analytics", "role_label": "analytics", "relevance": None},
     ]
-    assert _filtered_job_ids(jobs, profileId="analytics", tier="B", minScore=6) == [
-        "analytics-fit"
-    ]
+    assert _filtered_job_ids(jobs, profileId="analytics", tier="B", minScore=6) == ["analytics-fit"]
     assert _filtered_job_ids(jobs, profileId="analytics", sort="score-asc") == [
-        "product-fit",
-        "analytics-fit",
+        "analytics-fit", "stale-analytics",
     ]
-    assert _run_javascript(
-        f"jobAssessment({json.dumps(jobs[0])}, 'analytics')"
-    ) == jobs[0]["profiles"][1]
-    assert _filtered_job_ids(jobs, tier="A") == ["no-analytics", "product-fit"]
+    assert _run_javascript(f"jobAssessment({json.dumps(jobs[0])}, 'analytics')") is None
+    assert _filtered_job_ids(jobs, tier="A") == ["product-fit"]
 
 
-def test_best_profile_prioritizes_tier_then_eligibility_then_score_and_has_stable_ties():
-    profiles = [
-        {"id": "high-score-review", "tier": "B", "score": 30, "decision": "review"},
-        {"id": "c", "tier": "B", "score": 12, "decision": "pass"},
-        {"id": "b", "tier": "B", "score": 12, "decision": "pass"},
-        {"id": "a", "tier": "A", "score": 14, "decision": "pass"},
-    ]
-    assert _run_javascript(
-        f"jobAssessment({json.dumps({'profiles': profiles})}, '').id"
-    ) == "a"
-    assert _run_javascript(
-        f"jobAssessment({json.dumps({'profiles': profiles[:-1]})}, '').id"
-    ) == "b"
-    tied_jobs = [
-        {"job_uid": "z", "profiles": [profiles[-1]]},
-        {"job_uid": "a", "profiles": [profiles[-1]]},
-    ]
+def test_old_multi_profile_payload_does_not_select_a_best_role():
+    profiles = [{"id": "product", "tier": "A", "score": 50},
+                {"id": "analytics", "tier": "B", "score": 10}]
+    assert _run_javascript(f"jobAssessment({json.dumps({'profiles': profiles})}, '')") is None
+    tied_jobs = [{"job_uid": "z", "profiles": [profiles[0]]},
+                 {"job_uid": "a", "profiles": [profiles[0]]}]
     assert _filtered_job_ids(tied_jobs) == ["a", "z"]
 
 
@@ -283,3 +255,13 @@ def test_missing_profile_scores_are_not_coerced_to_zero_or_included_in_numeric_r
     ]
     assert _filtered_job_ids(jobs, sort="score-asc") == ["zero", "missing"]
     assert _filtered_job_ids(jobs, minScore=0, maxScore=0) == ["zero"]
+
+
+def test_other_role_has_no_numeric_assessment_even_if_old_zero_is_present():
+    job = {"job_uid": "other", "role_label": "other", "evaluation_state": "unscored",
+           "profiles": [{"id": "other", "score": 0, "tier": "C"}],
+           "eligibility": {"decision": "reject"}}
+    assert _run_javascript(f"jobAssessment({json.dumps(job)}, '')") is None
+    assert _filtered_job_ids([job], minScore=0) == []
+    assert _filtered_job_ids([job], tier="unrated") == ["other"]
+    assert 'Роль требует проверки; релевантность не оценена.' in render_crm_page()

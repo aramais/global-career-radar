@@ -19,7 +19,7 @@ from job_intake.config.settings import AppConfig, load_yaml_mapping
 from job_intake.models.job import FilterDecision, JobRecord
 from job_intake.profiles import load_streams
 
-GOLD_SCHEMA = "vacancy-tags-v1"
+GOLD_SCHEMA = "vacancy-tags-v2"
 DEFAULT_PROFILE_IDS = (
     "product-management", "analytics-leadership", "business-analytics", "data-science-management",
 )
@@ -65,7 +65,7 @@ _METADATA_FIELDS = (
 )
 _REQUIRED = {
     "job_uid", "source_hash", "text_version", "labeled_at", "method", "tags", "relevance",
-    "gate_outcome", "notes",
+    "gate_outcome", "notes", "role_label",
 }
 _ROOT_FIELDS = _REQUIRED | {"schema", "source", "label_scope"}
 _PRODUCT_TITLE = re.compile(r"\bproduct\b|\bPM\b", re.I)
@@ -126,9 +126,8 @@ def gold_json_schema(*, template: bool = False) -> dict:
             "method": {"enum": ["blind", "assisted", *nullable]},
             "tags": {"type": "object", "additionalProperties": False,
                      "properties": label_properties},
-            "relevance": {"type": "object", "minProperties": 1,
-                          "propertyNames": {"pattern": "^[a-z0-9][a-z0-9_-]*$"},
-                          "additionalProperties": {"enum": [0, 1, 2, 3, *nullable]}},
+            "role_label": {"enum": [*DEFAULT_PROFILE_IDS, "other", *nullable]},
+            "relevance": {"enum": [0, 1, 2, 3, *nullable]},
             "gate_outcome": {"enum": ["eligible", "ineligible", "unknown", *nullable]},
             "notes": {"type": "string"},
             "label_scope": {"enum": ["blind_decisions", "full_tags", "constraints"]},
@@ -242,7 +241,9 @@ def validate_gold(
             continue
         record = records[uid]
         if case.get("schema", GOLD_SCHEMA) != GOLD_SCHEMA:
-            finding(errors, uid, "invalid_schema", "Unsupported gold schema.")
+            finding(errors, uid, "invalid_schema",
+                    "Unsupported gold schema; v1 requires manual migration to role_label "
+                    "and scalar relevance. Old ratings are never converted by argmax.")
         if "label_scope" in case and case["label_scope"] not in (
             "blind_decisions", "full_tags", "constraints",
         ):
@@ -263,13 +264,17 @@ def validate_gold(
             finding(errors, uid, "invalid_notes", "notes must be text.")
         if "source" in case and (message := _source_error(case["source"])):
             finding(errors, uid, "invalid_source_snapshot", message)
-        relevance = case.get("relevance")
-        if not isinstance(relevance, dict) or set(relevance) != expected_profiles or any(
-            value is not None and (type(value) is not int or value not in range(4))
-            for value in relevance.values()
+        role_label = case.get("role_label")
+        if role_label is not None and (
+            not isinstance(role_label, str) or role_label not in expected_profiles | {"other"}
         ):
+            finding(errors, uid, "invalid_role_label",
+                    "role_label must be one enabled stable profile ID, other, or null.")
+        relevance = case.get("relevance")
+        if relevance is not None and (type(relevance) is not int or relevance not in range(4)):
             finding(errors, uid, "invalid_relevance",
-                    "relevance requires each enabled stable profile ID and integers 0–3 or null.")
+                    "relevance must be a scalar integer 0–3 or null; legacy per-profile "
+                    "ratings require manual migration, never automatic argmax.")
         if case.get("gate_outcome") not in ("eligible", "ineligible", "unknown", None):
             finding(errors, uid, "invalid_gate_outcome", "Unknown gate_outcome.")
         if case.get("method") not in ("blind", "assisted", None):
@@ -318,29 +323,26 @@ def validate_gold(
                 finding(errors, uid, code, f"{tag} quote must match exactly one source occurrence.")
                 continue
             validated_tags[tag] = {**label, "evidence_ids": bindings[0] if bindings else []}
-        any_labels = bool(tags) or (
-            isinstance(relevance, dict) and any(value is not None for value in relevance.values())
-        ) or case.get("gate_outcome") is not None
+        any_labels = bool(tags) or role_label is not None or relevance is not None \
+            or case.get("gate_outcome") is not None
         if any_labels and (case.get("method") is None or labeled_at is None):
             finding(errors, uid, "missing_label_provenance",
                     "Human labels require method and labeled_at; templates leave labels null.")
-        complete = isinstance(relevance, dict) and bool(relevance) and all(
-            value is not None for value in relevance.values()
-        ) and case.get("gate_outcome") is not None
+        complete = role_label is not None and relevance is not None \
+            and case.get("gate_outcome") is not None
         if not complete:
             finding(warnings, uid, "unlabeled_case",
                     "Human decisions are incomplete; this case cannot enter decision metrics.")
         if len(errors) == before:
             rebound.append({**copy.deepcopy(case), "tags": validated_tags})
-    labeled = [case for case in rebound if all(
-        value is not None for value in case["relevance"].values()
-    ) and case["gate_outcome"] is not None]
+    labeled = [case for case in rebound if case["role_label"] is not None
+               and case["relevance"] is not None and case["gate_outcome"] is not None]
     return {
         "schema": GOLD_SCHEMA, "valid": not errors, "rows": rebound,
         "counts": {"cases": len(cases), "valid_cases": len(rebound), "labeled": len(labeled),
-                   "relevant": sum(max(case["relevance"].values()) >= 2 for case in labeled)},
+                   "relevant": sum(case["relevance"] >= 2 for case in labeled)},
         "labeled_count": len(labeled),
-        "relevant_count": sum(max(case["relevance"].values()) >= 2 for case in labeled),
+        "relevant_count": sum(case["relevance"] >= 2 for case in labeled),
         "errors": errors, "warnings": warnings,
     }
 
@@ -618,6 +620,6 @@ def sample_gold(
             "full_tags" if uid in manifest["full_tag_job_uids"] else "constraints"
         ),
         "labeled_at": None, "method": None, "tags": {},
-        "relevance": {stream.id: None for stream in streams}, "gate_outcome": None, "notes": "",
+        "role_label": None, "relevance": None, "gate_outcome": None, "notes": "",
     } for uid in order]
     return cases, manifest

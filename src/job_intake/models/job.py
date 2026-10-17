@@ -75,6 +75,8 @@ class EvaluatedJob:
     profile_name: str = ""
     profile_version: str = ""
     profile_context: str = ""
+    # Occupation classification is distinct from source facts and relevance.
+    role_classification: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

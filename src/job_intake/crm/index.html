@@ -134,7 +134,7 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
   <form class="panel filters" id="filters">
     <label class="search"><span>Поиск</span><input id="query" type="search"
       placeholder="Компания, роль, контакт или заметка"></label>
-    <label><span>Профиль поиска</span><select id="profileFilter"></select></label>
+    <label><span>Метка вакансии / профиль отклика</span><select id="profileFilter"></select></label>
     <label><span>Канал отклика</span><select id="channelFilter"></select></label>
     <label><span>Период воронки: с</span><input id="sinceFilter" type="date"></label>
     <label><span>По</span><input id="untilFilter" type="date"></label>
@@ -172,8 +172,10 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
         и приоритетную компанию. Это не шкала 0–15: балл может быть выше 15 или дробным.</p>
       <div id="gradingThresholds"></div>
       <p>Если условия работы требуют проверки, из оценки вычитаются 3 балла (до нуля).
-        Исключающее ограничение даёт 0 баллов и C. Оценка рассчитывается отдельно для каждого профиля;
-        низкий балл может означать неполное описание и не мешает откликнуться.</p>
+        Исключающее ограничение даёт 0 баллов и C. Сначала определяется одна метка роли,
+        затем рассчитывается одна оценка по её критериям;
+        низкий балл может означать неполное описание и не мешает откликнуться.
+        Для метки other релевантность остаётся без балла до уточнения роли.</p>
     </details>
   </section>
   <section class="panel job-bulk" id="jobBulkActions" aria-label="Массовые действия с вакансиями" hidden>
@@ -429,7 +431,7 @@ async function loadJobDetail(job) {
   return jobDetails.get(job.job_uid);
 }
 function setupFilters() {
-  const profiles = [{value:'',label:'Все профили'}, ...(state.profiles || []).map((item) =>
+  const profiles = [{value:'',label:'Все метки'}, ...(state.profiles || []).map((item) =>
     ({value:item.id || item.profile_id,label:item.name || item.profile_name || item.id}))];
   $('profileFilter').replaceChildren(...select(profiles).childNodes);
   $('channelFilter').replaceChildren(...select([{value:'',label:'Все каналы'},...values('channels')]).childNodes);
@@ -513,14 +515,11 @@ function compareTiers(a, b, direction) {
   return (left - right) * direction;
 }
 function jobAssessment(job, profileId) {
-  const profiles = job.profiles || [];
-  if (profileId) return profiles.find((item) => (item.id || item.profile_id) === profileId) || null;
-  // Match the API's best-profile order, regardless of the selected server-side filter.
-  const decisions = {pass:0,review:1,reject:2};
-  return [...profiles].sort((a,b) => compareTiers(a,b,1)
-    || (decisions[a.decision] ?? 3) - (decisions[b.decision] ?? 3)
-    || compareScores(assessmentScore(a),assessmentScore(b),-1)
-    || String(a.id || a.profile_id || '').localeCompare(String(b.id || b.profile_id || '')))[0] || null;
+  if (job.role_label === 'other') return null;
+  const assessment = job.relevance || ((job.profiles || []).length === 1 ? job.profiles[0] : null);
+  if (!assessment) return null;
+  const role = job.role_label || assessment.id || assessment.profile_id;
+  return profileId && role !== profileId ? null : assessment;
 }
 function filterAndSortJobs(jobs, options = {}) {
   const min = scoreNumber(options.minScore), max = scoreNumber(options.maxScore);
@@ -529,8 +528,8 @@ function filterAndSortJobs(jobs, options = {}) {
   const archive = options.archive || 'active';
   return jobs.filter((job) => archive === 'all' || Boolean(job.archived)
     === (archive === 'archived')).map((job) => ({job,assessment:jobAssessment(job,options.profileId)}))
-    .filter(({assessment}) => {
-      if (options.profileId && !assessment) return false;
+    .filter(({job,assessment}) => {
+      if (options.profileId && (job.role_label || assessment?.id || assessment?.profile_id) !== options.profileId) return false;
       const tier = ['A','B','C'].includes(assessment?.tier) ? assessment.tier : 'unrated';
       const score = assessmentScore(assessment);
       return (!options.tier || options.tier === tier)
@@ -600,9 +599,9 @@ async function setSelectedJobsArchived(archived) {
 }
 function renderJobFilters() {
   const profileId = $('profileFilter').value;
-  $('jobFilterScope').textContent = (profileId ? 'Оценка для фильтров: ' + profileName(profileId) + '.'
-    : 'Все профили: используется лучшая категория вакансии; при равенстве — пройденные условия, затем баллы.')
-    + ' Эта оценка выделена в карточке. '
+  $('jobFilterScope').textContent = (profileId ? 'Метка вакансии: ' + profileName(profileId) + '.'
+    : 'У вакансии одна метка и одна оценка релевантности.')
+    + ' '
     + ($('jobSort').value.startsWith('tier-') ? 'Внутри категории — сначала больший балл.'
       : 'При равных баллах — категория A → C.') + ' Без оценки — в конце.';
   const min = scoreNumber($('scoreMinFilter').value), max = scoreNumber($('scoreMaxFilter').value);
@@ -749,12 +748,15 @@ function jobCard(job) {
   const tags = el('div',null,'tags');
   if (job.archived) tags.append(badge('В архиве · ' + dateText(job.archived_at),'amber'));
   const assessment = jobAssessment(job,$('profileFilter').value);
-  (job.profiles || []).forEach((profile) => tags.append(badge((profile.name || profileName(profile.id
-    || profile.profile_id)) + ' · ' + (profile.tier || '—') + ' · '
-    + (assessmentScore(profile) === null ? 'Без оценки' : assessmentScore(profile) + ' баллов')
-    + (profile.decision ? ' · ' + ({pass:'Подходит',review:'Проверить условия',reject:'Есть ограничение'}[profile.decision]
-      || profile.decision) : ''),profile === assessment ? 'blue' : '')));
-  if (!assessment) tags.append(badge('Без актуальной оценки'));
+  tags.append(badge(job.role_name || profileName(job.role_label),'blue'));
+  if (assessment) tags.append(badge((assessment.tier || '—') + ' · '
+    + (assessmentScore(assessment) === null ? 'Без оценки' : assessmentScore(assessment) + ' баллов')
+    + (assessment.decision ? ' · ' + ({pass:'Подходит',review:'Проверить условия',reject:'Есть ограничение'}[assessment.decision]
+      || assessment.decision) : '')));
+  if (!assessment) tags.append(badge(job.evaluation_state === 'unscored'
+    ? 'Роль требует проверки; релевантность не оценена.' : 'Без актуальной оценки'));
+  if (!assessment && job.eligibility?.decision === 'reject')
+    tags.append(badge('Есть обязательное ограничение','amber'));
   card.append(head,tags);
   const links = el('div',null,'row'); links.append(sourceLink(job.url),
     el('span',[job.location,job.remote].filter(Boolean).join(' · '),'small muted')); card.append(links);
@@ -920,8 +922,16 @@ function renderPrefilter(prefilter,unitAnchors,anchorPrefix,assessment) {
 }
 function renderJobAnnotation(job,assessment) {
   const body = el('div',null,'annotation-body'); const annotation = job.annotation || {};
-  const summary = annotation.summary || {}; const knowns = summary.knowns || [];
   const prefilter = annotation.prefilter;
+  const eligibility = assessment || job.eligibility;
+  if (job.classification_reason) body.append(el('p',job.classification_reason,'small'));
+  if (eligibility) {
+    if (eligibility.fit_reason) body.append(el('p',eligibility.fit_reason,'small'));
+    const risks = [...(eligibility.risks || []),
+      ...(prefilter?.routing === 'local_reject' ? [] : eligibility.blocker_signals || [])];
+    if (risks.length) body.append(el('p','Условия для проверки: ' + risks.join('; '),'small status error'));
+  }
+  const summary = annotation.summary || {}; const knowns = summary.knowns || [];
   const fullReviewSkipped = ['suppressed','local_reject'].includes(prefilter?.routing);
   const claimAnchors = new Map(); const unitAnchors = new Map();
   const anchorPrefix = 'annotation-evidence-' + (++annotationRenderSerial) + '-';
@@ -934,7 +944,7 @@ function renderJobAnnotation(job,assessment) {
   });
   if (prefilter && typeof prefilter === 'object' && !Array.isArray(prefilter))
     body.append(el('h4','Предварительный фильтр'),
-      renderPrefilter(prefilter,unitAnchors,anchorPrefix,assessment));
+      renderPrefilter(prefilter,unitAnchors,anchorPrefix,eligibility));
   if (!annotation.version) {
     body.append(el('p','Разметка ещё не выполнена.','muted'));
     return body;
@@ -952,11 +962,6 @@ function renderJobAnnotation(job,assessment) {
   if (annotation.description_complete === false)
     body.append(el('p','Источник содержит неполное описание: другие ограничения могут быть пропущены.',
       'small status error'));
-  if (assessment) {
-    if (assessment.fit_reason) body.append(el('p',assessment.fit_reason,'small'));
-    const risks = [...(assessment.risks || []),...(assessment.blocker_signals || [])];
-    if (risks.length) body.append(el('p','Условия для проверки: ' + risks.join('; '),'small status error'));
-  }
   if (fullReviewSkipped) return body;
   const knownIds = new Set(knowns.map((claim) => claim.claim_id));
   const conflictedIds = new Set((summary.contradictions || []).flatMap((item) => item.claim_ids || []));
@@ -1159,12 +1164,12 @@ function createApplication() {
 }
 function addJob(job) {
   activeId = null; const body = showModal('Добавить вакансию в CRM',job.company + ' · ' + job.title);
-  const form = el('form'); const options = (state.profiles || []).map((profile) => ({value:profile.id
-    || profile.profile_id,label:profile.name || profile.profile_name || profile.id}));
-  const selected = $('profileFilter').value || (job.profiles || [])[0]?.id
-    || (job.profiles || [])[0]?.profile_id || options[0]?.value;
-  const profile = select(options,selected,'profile_id'); profile.required = true;
-  form.append(field('Поток поиска',profile),el('p','Начальный этап — «Сохранено». Канал и контакт можно указать в карточке.','help'));
+  if (!job.role_label) {
+    body.append(el('p','Сначала определите метку вакансии.','help')); return;
+  }
+  const form = el('form');
+  form.append(el('p','Метка: ' + (job.role_name || profileName(job.role_label)),'help'),
+    el('p','Начальный этап — «Сохранено». Канал и контакт можно указать в карточке.','help'));
   formButtons(form,'Добавить в CRM'); form.addEventListener('submit',(event) => { event.preventDefault();
     const payload = formValues(form); payload.job_uid = job.job_uid;
     write('/api/applications/from-job','POST',payload,(result) => {

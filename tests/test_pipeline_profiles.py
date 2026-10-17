@@ -7,6 +7,7 @@ from sqlalchemy import event, func, select
 from job_intake.config.settings import AppConfig, LLMConfig, SourceDefinition, TelegramConfig
 from job_intake.models.job import JobRecord
 from job_intake.pipeline import JobIntakePipeline
+from job_intake.profiles import SearchStream
 from job_intake.storage.models import AlertOutboxORM, JobORM, JobProfileEvaluationORM
 
 
@@ -102,19 +103,19 @@ def _sources(monkeypatch, record, *, fail_second=True):
     monkeypatch.setattr("job_intake.pipeline.build_adapter", lambda source: Adapter(source.name))
 
 
-def test_independent_profiles_and_source_failure_preserve_committed_job(tmp_path, monkeypatch):
+def test_single_classified_role_and_source_failure_preserve_committed_job(tmp_path, monkeypatch):
     config = _config(tmp_path)
     _sources(monkeypatch, _record())
     pipeline = JobIntakePipeline(config)
     result = pipeline.run()
     assert result["source_errors"] == 1
     assert result["persisted"] == 1
-    assert result["evaluations"] == 2
+    assert result["evaluations"] == 1
     with pipeline.database.session() as session:
         assert session.scalar(select(func.count()).select_from(JobORM)) == 1
         job = session.scalar(select(JobORM))
         scores = {p.profile_id: p.fit_score for p in job.profile_evaluations}
-        assert scores == {"product": 8, "analytics": 0}
+        assert scores == {"product": 8}
         assert job.best_profile_id == "product"
 
 
@@ -159,7 +160,7 @@ def test_alert_outbox_is_committed_before_send_and_retries_without_losing_job(
     def fail_send(message):
         with pipeline.database.session() as session:
             assert session.scalar(select(func.count()).select_from(JobORM)) == 1
-            assert session.scalar(select(func.count()).select_from(JobProfileEvaluationORM)) == 2
+            assert session.scalar(select(func.count()).select_from(JobProfileEvaluationORM)) == 1
             assert session.scalar(select(AlertOutboxORM)).status == "pending"
         raise RuntimeError("Telegram unavailable")
 
@@ -190,7 +191,7 @@ def test_semantic_cache_is_per_profile_and_invalidated_by_content_prompt_and_mod
     def fake_rerank(item):
         calls.append(item.profile_id)
         prompt = pipeline.reranker._render_prompt(item)
-        if len(calls) > 6:
+        if len(calls) > 3:
             assert prompt.startswith("Updated:")
         delta = 1 if item.profile_id == "product" else 5
         item.evaluation.semantic_score = delta
@@ -198,22 +199,22 @@ def test_semantic_cache_is_per_profile_and_invalidated_by_content_prompt_and_mod
         return item
 
     pipeline.reranker.rerank = fake_rerank
-    assert pipeline.run()["llm_calls"] == 2
-    assert pipeline.run()["llm_cache_hits"] == 2
+    assert pipeline.run()["llm_calls"] == 1
+    assert pipeline.run()["llm_cache_hits"] == 1
     with pipeline.database.session() as session:
         scores = {
             p.profile_id: p.semantic_score for p in session.scalars(select(JobProfileEvaluationORM))
         }
-        assert scores == {"product": 1, "analytics": 5}
+        assert scores == {"product": 1}
     record.description_clean = "A" * 900 + " changed tail. English is the working language."
-    assert pipeline.run()["llm_calls"] == 2
+    assert pipeline.run()["llm_calls"] == 1
     config.llm.model = "another-model"
-    assert pipeline.run()["llm_calls"] == 2
+    assert pipeline.run()["llm_calls"] == 1
     (tmp_path / "prompt.txt").write_text("Updated: {profile_context} {description}")
-    assert pipeline.run()["llm_calls"] == 2
+    assert pipeline.run()["llm_calls"] == 1
     record.source_metadata["working_language"] = ["English", "Portuguese"]
-    assert pipeline.run()["llm_calls"] == 2
-    assert len(calls) == 10
+    assert pipeline.run()["llm_calls"] == 1
+    assert len(calls) == 5
 
 
 def test_batch_uses_latest_observation_for_repeated_identity(tmp_path, monkeypatch):
@@ -233,7 +234,7 @@ def test_batch_uses_latest_observation_for_repeated_identity(tmp_path, monkeypat
     pipeline = JobIntakePipeline(config)
 
     def fake_batch(items):
-        assert len(items) == 2
+        assert len(items) == 1
         assert all(item.record.description_clean == latest.description_clean for item in items)
         for item in items:
             item.evaluation.semantic_score = 2
@@ -262,7 +263,7 @@ def test_batch_commits_deterministic_data_before_waiting(tmp_path, monkeypatch):
 
     pipeline.batch_reranker.rerank_many = fake_batch
     result = pipeline.run()
-    assert result["llm_batched"] == 2
+    assert result["llm_batched"] == 1
     with pipeline.database.session() as session:
         assert session.scalar(select(JobORM)).fit_score == 10
 
@@ -289,8 +290,8 @@ def test_saved_ai_reevaluation_finishes_batch_without_alerts_or_seen_date_change
     pipeline.batch_reranker.rerank_many = finish_batch
     pipeline.telegram.send = lambda *_: pytest.fail("Reevaluation sent an alert")
     stats = pipeline.reevaluate_saved(use_ai=True)
-    assert calls == [["product", "analytics"]]
-    assert stats["llm_batched"] == 2
+    assert calls == [["product"]]
+    assert stats["llm_batched"] == 1
     assert stats["record_errors"] == stats["alerts"] == 0
     with pipeline.database.session() as session:
         job = session.scalar(select(JobORM))
@@ -338,7 +339,7 @@ def test_pending_saved_batch_is_reported_and_resumed_instead_of_cached(tmp_path)
         scores = {p.semantic_score for p in session.scalars(select(JobProfileEvaluationORM))}
         assert scores == {None}
     second = pipeline.reevaluate_saved(use_ai=True)
-    assert calls == [["product", "analytics"], ["product", "analytics"]]
+    assert calls == [["product"], ["product"]]
     assert second["llm_batch_pending"] == second["llm_batch_errors"] == 0
     with pipeline.database.session() as session:
         assert {p.semantic_score for p in session.scalars(select(JobProfileEvaluationORM))} == {3}
@@ -395,3 +396,62 @@ def test_pending_alert_uses_current_reevaluated_risks(tmp_path, monkeypatch):
     pipeline._dispatch_alerts(stats)
     assert stats["alerts"] == 1
     assert "review_flag:roadmap" in messages[0]
+
+
+def test_role_changes_before_scoring_and_replaces_single_current_result(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    profiles = yaml.safe_load(config.search_profiles_path.read_text())
+    profiles["streams"][0]["scoring"]["description_weights"] = {"pricing": 999}
+    profiles["streams"].append({
+        "id": "data-science-management", "name": "Data Science Management",
+        "keywords": ["Data Science Manager"],
+        "rules": {"positive_title_signals": ["data science manager"]},
+        "scoring": {"title_weights": {"data science manager": 8}},
+    })
+    config.search_profiles_path.write_text(yaml.safe_dump(profiles))
+    pipeline = JobIntakePipeline(config)
+    original = SearchStream.scorer.fget
+    scored = []
+
+    def track(stream):
+        scored.append(stream.id)
+        return original(stream)
+
+    monkeypatch.setattr(SearchStream, "scorer", property(track))
+    record = _record("Own pricing projects. English is the working language.")
+    for title, label in [("Product Manager", "product"),
+                         ("Data Science Manager", "data-science-management"),
+                         ("Office Assistant", "other")]:
+        record.title = title
+        items, keys, pending = pipeline._evaluate_record(record, pipeline._stats(), use_llm=False)
+        assert len(items) == 1 and items[0].profile_id == label
+        assert pending == []
+        pipeline._save(items, keys, observed=False, queue_alert=False)
+        with pipeline.database.session() as session:
+            job = session.scalar(select(JobORM))
+            assert job.role_label == job.role_classification["label"] == label
+            assert [row.profile_id for row in job.profile_evaluations] == [label]
+            if label == "data-science-management":
+                assert job.fit_score == 8  # PM's 999-point pricing weight never runs.
+            if label == "other":
+                assert job.fit_score == 0
+                assert "unscored" in " ".join(job.audit_log)
+    assert scored == ["product", "data-science-management"]
+
+
+def test_pending_alert_rejects_inconsistent_classification_provenance(tmp_path, monkeypatch):
+    config = _config(tmp_path, telegram=True)
+    _sources(monkeypatch, _record(), fail_second=False)
+    pipeline = JobIntakePipeline(config)
+    pipeline.telegram.send = lambda _: False
+    assert pipeline.run()["alert_errors"] == 1
+    with pipeline.database.session() as session:
+        job = session.scalar(select(JobORM))
+        job.role_classification = {**job.role_classification, "source_hash": "outdated"}
+        session.commit()
+    pipeline.telegram.send = lambda _: pytest.fail("Inconsistent classification sent an alert")
+    stats = pipeline._stats()
+    pipeline._dispatch_alerts(stats)
+    assert stats["alerts"] == 0
+    with pipeline.database.session() as session:
+        assert session.scalar(select(AlertOutboxORM)).status == "cancelled"

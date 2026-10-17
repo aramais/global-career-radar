@@ -66,12 +66,24 @@ sys.path.insert(0, sys.argv[1])
 try:
     from job_intake.annotation.service import apply_annotation_constraints
     from job_intake.annotation.text import TEXT_VERSION, role_description
-    from job_intake.models.job import JobRecord, JobStatus
+    from job_intake.models.job import FilterDecision, JobRecord, JobStatus
     from job_intake.profiles import load_streams
     from job_intake.scoring.tiering import finalize_tier
 
     payload = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
     streams = load_streams(payload["rules"], payload["profiles"])
+    try:
+        from job_intake.classification import RoleClassifier
+    except ModuleNotFoundError as exc:
+        if exc.name != "job_intake.classification":
+            raise
+        classifier = None
+        policy = "multi-profile-legacy"
+    else:
+        from job_intake.profiles import with_other_stream
+        streams = with_other_stream(streams, payload["rules"])
+        classifier = RoleClassifier(streams)
+        policy = "single-role-v1"
     policies = [(stream, stream.engine, stream.scorer) for stream in streams]
     evaluations = []
     for saved in payload["records"]:
@@ -81,14 +93,26 @@ try:
         values["status"] = JobStatus(values["status"])
         record = JobRecord(**values)
         role_text = role_description(record)
-        for stream, engine, scorer in policies:
+        selected, classification = (classifier.classify(record, use_ai=False)
+                                    if classifier else (None, {}))
+        active = [(stream, engine, scorer) for stream, engine, scorer in policies
+                  if selected is None or stream.id == selected.id]
+        for stream, engine, scorer in active:
             item = engine.apply(record)
             apply_annotation_constraints(record, item.evaluation, engine)
             item.profile_id = stream.id
-            scorer.score(
-                record.source, record.company, record.title,
-                role_text, item.evaluation,
-            )
+            if classifier and stream.id == "other":
+                item.evaluation.fit_score = item.evaluation.deterministic_score = 0.0
+                item.evaluation.bridge_role = False
+                item.evaluation.fit_reason = classification["reason"]
+                if item.evaluation.decision != FilterDecision.REJECT:
+                    item.evaluation.decision = FilterDecision.REVIEW
+                item.evaluation.risks.append("role_classification:needs_review")
+            else:
+                scorer.score(
+                    record.source, record.company, record.title,
+                    role_text, item.evaluation,
+                )
             finalize_tier(item, stream.scoring.threshold_a, stream.scoring.threshold_b)
             result = item.evaluation
             evaluations.append({
@@ -101,7 +125,7 @@ try:
                 "matched_signals": result.matched_signals, "fit_reason": result.fit_reason,
             })
     print(json.dumps({
-        "text_version": TEXT_VERSION,
+        "text_version": TEXT_VERSION, "policy": policy,
         "profiles": {stream.id: stream.version for stream in streams},
         "evaluations": evaluations,
     }, ensure_ascii=False, allow_nan=False))
@@ -269,7 +293,18 @@ def _validate_revision(value: object, *, expected_jobs: set[str] | None = None) 
                 not isinstance(item, str) for item in row[name]
             ):
                 raise ValueError("Invalid rules-diff evaluation explanation")
-    if expected_jobs is not None and seen != {
+    policy = value.get("policy", "multi-profile-legacy")
+    if policy not in {"single-role-v1", "multi-profile-legacy"}:
+        raise ValueError("Invalid rules-diff classification policy")
+    if policy == "single-role-v1":
+        by_job = Counter(uid for uid, _ in seen)
+        if any(count != 1 for count in by_job.values()) or (
+            expected_jobs is not None and set(by_job) != expected_jobs
+        ):
+            raise ValueError(
+                "rules-diff snapshot must contain exactly one selected role per vacancy"
+            )
+    elif expected_jobs is not None and seen != {
         (uid, profile) for uid in expected_jobs for profile in value["profiles"]
     }:
         raise ValueError("rules-diff snapshot must contain every selected vacancy/profile outcome")
@@ -375,8 +410,8 @@ def run_rules_diff(
         "schema": RULES_DIFF_VERSION, "generated_at": datetime.now(UTC).isoformat(),
         "database": str(database), "database_access": "read_only", "api_calls": 0,
         "scope": {
-            "policy": "RuleEngine + saved annotation constraints + "
-                      "DeterministicScorer + finalize_tier",
+            "policy": "RoleClassifier (offline) + selected RuleEngine + "
+                      "saved annotation constraints + DeterministicScorer + finalize_tier",
             "saved_annotation_facts": "fixed", "paid_prefilter": "excluded",
             "semantic_reranking": "excluded", "annotation_refresh": "excluded",
         },
@@ -393,6 +428,9 @@ def run_rules_diff(
             "score_changes": sum("score" in entry["changed_fields"] for entry in comparable),
             "profiles_added": sorted(current["profiles"].keys() - previous["profiles"].keys()),
             "profiles_removed": sorted(previous["profiles"].keys() - current["profiles"].keys()),
+            "classification_policy_changed": (
+                previous.get("policy", "multi-profile-legacy") != current.get("policy")
+            ),
         },
         "decision_tier_transitions": dict(sorted(transitions.items())), "changes": changes,
         "flips": flips,
@@ -407,6 +445,8 @@ def render_rules_diff_markdown(report: dict) -> str:
     lines = [
         "# Deterministic rules diff", "",
         f"Baseline: `{baseline}`; current: working tree.",
+        f"Policies: {previous.get('policy', 'multi-profile-legacy')} → "
+        f"{report['current'].get('policy', 'multi-profile-legacy')}.",
         f"Vacancies: {counts['jobs']}; API calls: 0; SQLite: read-only.",
         "Saved annotation facts are fixed. Paid routing, semantic reranking, and "
         "annotation refresh are excluded.", "",

@@ -142,12 +142,13 @@ def test_period_uses_sao_paulo_day_and_separates_unknown_historical_dates(servic
 def test_state_exposes_actual_profile_thresholds_for_grading_help(service):
     service.streams[0].scoring.threshold_a = 17.5
     service.streams[0].scoring.threshold_b = 6.5
-    assert service.state({})["profiles"] == [
-        {"id": "product", "name": "Product", "threshold_a": 17.5, "threshold_b": 6.5}
-    ]
+    profiles = service.state({})["profiles"]
+    assert profiles[0] == {"id": "product", "name": "Product", "threshold_a": 17.5,
+                           "threshold_b": 6.5}
+    assert profiles[-1]["id"] == "other"
 
 
-def test_saved_job_idempotence_does_not_assign_disabled_profile(service):
+def test_saved_job_idempotence_preserves_assigned_role(service):
     with service.database.session() as session:
         item = EvaluatedJob(
             record=JobRecord(
@@ -164,7 +165,10 @@ def test_saved_job_idempotence_does_not_assign_disabled_profile(service):
         result = JobRepository(session).upsert_evaluations([item])
         session.commit()
     app = service.mutate("POST", "/api/applications/from-job", {"job_uid": result.job_uid})
-    assert app["profile_id"] is None
+    assert app["profile_id"] == "disabled"
+    with pytest.raises(RequestError, match="меткой вакансии"):
+        service.mutate("POST", "/api/applications/from-job",
+                       {"job_uid": result.job_uid, "profile_id": "product"})
     repeat = service.mutate("POST", "/api/applications/from-job", {"job_uid": result.job_uid})
     assert app["id"] == repeat["id"]
     with pytest.raises(RequestError):

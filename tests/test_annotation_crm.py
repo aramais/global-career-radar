@@ -665,3 +665,15 @@ def test_api_preserves_quote_and_notes_markup_as_data_for_text_only_ui(service):
     rendered = render_annotation(returned)
     assert bad["source_snippet"] in rendered["allText"]
     assert all(node["tag"] not in {"img", "script", "a"} for node in descendants(rendered))
+
+
+def test_other_role_keeps_eligibility_blockers_visible_without_source_annotation():
+    job = {"role_label": "other", "evaluation_state": "unscored",
+           "classification_reason": "Outside configured occupations.",
+           "eligibility": {"decision": "reject", "blocker_signals": ["status:closed"], "risks": []}}
+    rendered = _run_javascript(
+        DOM_SETUP + f"tree(renderJobAnnotation({json.dumps(job)},null))"
+    )
+    assert "Outside configured occupations." in rendered["allText"]
+    assert "status:closed" in rendered["allText"]
+    assert "0 баллов" not in rendered["allText"]

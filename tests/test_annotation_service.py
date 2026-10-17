@@ -1044,8 +1044,10 @@ def pipeline_config(tmp_path, annotation_config):
     }), encoding="utf-8")
     profiles.write_text(yaml.safe_dump({"streams": [{
         "id": profile_id, "name": profile_id, "context": profile_id,
-        "keywords": ["Product Manager"],
-        "rules": {"positive_title_signals": ["product manager"]},
+        "keywords": ["Product Manager" if profile_id == "product" else "Head of Analytics"],
+        "rules": {"positive_title_signals": [
+            "product manager" if profile_id == "product" else "head of analytics",
+        ]},
         "scoring": {
             "title_weights": {"product manager": weight},
             "threshold_a": 10, "threshold_b": 5,
@@ -1065,7 +1067,7 @@ def pipeline_config(tmp_path, annotation_config):
     )
 
 
-def test_pipeline_annotates_once_for_all_profiles_and_persists_exact_evidence(
+def test_pipeline_annotates_once_for_classified_role_and_persists_exact_evidence(
     config, tmp_path, monkeypatch
 ):
     app_config = pipeline_config(tmp_path, config)
@@ -1078,7 +1080,7 @@ def test_pipeline_annotates_once_for_all_profiles_and_persists_exact_evidence(
     result = pipeline.run()
     assert result["record_errors"] == 0
     assert result["persisted"] == 1
-    assert result["evaluations"] == 2
+    assert result["evaluations"] == 1
     assert result["annotation_extraction_calls"] == 1
     assert result["annotation_review_calls"] == 1
     assert result["llm_calls"] == 0
@@ -1087,16 +1089,16 @@ def test_pipeline_annotates_once_for_all_profiles_and_persists_exact_evidence(
         stored = session.scalar(select(JobORM))
         assert stored.annotation["status"] == "reviewed"
         assert stored.annotation["source_hash"] == source_hash(record())
-        assert {p.profile_id for p in stored.profile_evaluations} == {"product", "analytics"}
+        assert {p.profile_id for p in stored.profile_evaluations} == {"product"}
         assert all(p.semantic_score is None for p in stored.profile_evaluations)
         assert {p.profile_id: p.fit_score for p in stored.profile_evaluations} == {
-            "product": 15, "analytics": 7,
+            "product": 15,
         }
     second = JobIntakePipeline(app_config)
     repeated = ModelFake(config)
     second.annotator.client = repeated
     again = second.run()
-    assert again["evaluations"] == 2
+    assert again["evaluations"] == 1
     assert again["annotation_extraction_calls"] == 0
     assert again["annotation_review_calls"] == 0
     assert repeated.calls == []
@@ -1123,7 +1125,7 @@ def test_pipeline_offline_reevaluation_keeps_reviewed_evidence_without_api_or_no
     pipeline.telegram.send = forbidden
     result = pipeline.reevaluate_saved()
     assert result["persisted"] == 1
-    assert result["evaluations"] == 2
+    assert result["evaluations"] == 1
     assert result["annotation_extraction_calls"] == 0
     assert result["annotation_review_calls"] == 0
     with pipeline.database.session() as session:

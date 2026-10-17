@@ -30,7 +30,7 @@ def test_vacancy_export_sanitizes_all_untrusted_columns(tmp_path):
     database.create_schema()
     with database.session() as session:
         repository = JobRepository(session)
-        repository.upsert_evaluated_job(EvaluatedJob(
+        repository.upsert_evaluations([EvaluatedJob(
             record=JobRecord(
                 source="test", company="=1+2", title="@SUM(1)", original_url="+untrusted",
                 description_clean="\t=1+2", salary_text="-1+2", remote_text="\n=1+2",
@@ -39,7 +39,7 @@ def test_vacancy_export_sanitizes_all_untrusted_columns(tmp_path):
                 decision=FilterDecision.PASS, tier=JobTier.A, fit_score=20,
                 fit_reason="=1+2", matched_signals=["=1+2"], risks=["=1+2"],
             ),
-        ))
+        )])
         path = repository.export_shortlisted_csv(tmp_path / "export.csv")
     with path.open(newline="") as handle:
         row = next(csv.DictReader(handle))
@@ -57,6 +57,9 @@ def populate(database, count):
             {
                 "job_uid": f"j-{index}", "fingerprint": f"f-{index}", "content_hash": "hash",
                 "source": "test", "company": "Example", "title": f"Role {index}",
+                "role_label": "product",
+                "role_classification": {"label": "product", "content_hash": "hash",
+                                        "version": "assigned-v1", "source_hash": "source"},
                 "original_url": f"https://example.org/{index}", "description_raw": "text",
                 "description_clean": "text", "status": "open", "filter_decision": "pass",
                 "tier": "C", "last_seen_at": datetime.now(UTC) - timedelta(days=120),
@@ -66,6 +69,7 @@ def populate(database, count):
             {
                 "job_uid": f"j-{index}", "profile_id": "product", "profile_name": "Product",
                 "profile_version": "v1", "content_hash": "hash", "decision": "pass",
+                "classification_version": "assigned-v1", "classification_source_hash": "source",
                 "deterministic_score": index, "fit_score": index, "tier": "A",
                 "bucket": "A", "fit_reason": "Match",
             } for index in range(count)

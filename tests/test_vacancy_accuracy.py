@@ -17,7 +17,7 @@ from job_intake.annotation.accuracy import (
     run_accuracy,
     write_accuracy_report,
 )
-from job_intake.annotation.gold import DEFAULT_PROFILE_IDS, _snapshot
+from job_intake.annotation.gold import _snapshot
 from job_intake.annotation.text import TEXT_VERSION, source_hash
 from job_intake.config.settings import AppConfig, LLMConfig, TelegramConfig
 from job_intake.models.job import JobRecord
@@ -37,7 +37,7 @@ def job(annotation=None):
 def case(uid, relevance, *, gate="eligible", tags=None):
     return {
         "job_uid": uid,
-        "relevance": {"analytics-leadership": relevance},
+        "role_label": "analytics-leadership", "relevance": relevance,
         "gate_outcome": gate,
         "tags": tags or {},
     }
@@ -386,10 +386,10 @@ def stored(tmp_path):
             "CREATE TABLE jobs (job_uid TEXT, source TEXT, company TEXT, title TEXT, "
             "original_url TEXT, description_raw TEXT, description_clean TEXT, "
             "source_metadata TEXT, annotation TEXT, updated_at TEXT, content_hash TEXT, "
-            "status TEXT)"
+            "status TEXT, role_label TEXT, role_classification TEXT)"
         )
         connection.execute(
-            "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 "uid",
                 record.source,
@@ -403,17 +403,19 @@ def stored(tmp_path):
                 "2026-10-10",
                 "content",
                 "open",
+                "analytics-leadership",
+                json.dumps({"label": "analytics-leadership", "version": "test",
+                            "source_hash": source_hash(record), "content_hash": "content"}),
             ),
         )
         connection.execute(
-            "CREATE TABLE job_profile_evaluations (job_uid TEXT, profile_id TEXT, "
+            "CREATE TABLE job_relevance_evaluations (job_uid TEXT PRIMARY KEY, profile_id TEXT, "
             "profile_version TEXT, content_hash TEXT, decision TEXT, tier TEXT, fit_score REAL)"
         )
         connection.executemany(
-            "INSERT INTO job_profile_evaluations VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO job_relevance_evaluations VALUES (?,?,?,?,?,?,?)",
             [
-                ("uid", "analytics-leadership", "old", "content", "review", "B", 10),
-                ("uid", "product-management", "current", "content", "reject", "C", 50),
+                ("uid", "analytics-leadership", "current", "content", "review", "B", 10),
             ],
         )
     settings = AppConfig(
@@ -430,8 +432,10 @@ def stored(tmp_path):
     return path, settings, record
 
 
-def test_saved_profile_selection_matches_best_tier_and_flags_stale_versions(stored):
+def test_saved_relevance_with_stale_version_is_withheld(stored):
     path, settings, record = stored
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE job_relevance_evaluations SET profile_version='old'")
     before = path.read_bytes()
     predictions = read_saved_predictions(
         settings.database_url,
@@ -441,8 +445,8 @@ def test_saved_profile_selection_matches_best_tier_and_flags_stale_versions(stor
             "product-management": "current",
         },
     )
-    assert predictions["uid"]["tier"] == "B"
-    assert predictions["uid"]["decision"] == "review"
+    assert predictions["uid"]["tier"] is None
+    assert predictions["uid"]["decision"] is None
     assert predictions["uid"]["stale_profiles"] == ["analytics-leadership"]
     assert predictions["uid"]["current_eligible"] is False
     assert path.read_bytes() == before
@@ -454,7 +458,8 @@ def test_complete_decision_labels_without_tags_or_blind_sample_are_not_ready(sto
         for index in range(1, 160):
             connection.execute(
                 "INSERT INTO jobs SELECT ?, source, company, title, original_url, description_raw, "
-                "description_clean, source_metadata, annotation, updated_at, content_hash, status "
+                "description_clean, source_metadata, annotation, updated_at, content_hash, status, "
+                "role_label, role_classification "
                 "FROM jobs WHERE job_uid='uid'", (f"uid-{index}",),
             )
     gold = tmp_path / "decision-labels.jsonl"
@@ -462,7 +467,7 @@ def test_complete_decision_labels_without_tags_or_blind_sample_are_not_ready(sto
         "job_uid": "uid" if index == 0 else f"uid-{index}",
         "source_hash": source_hash(record), "text_version": TEXT_VERSION,
         "labeled_at": "2026-10-13", "method": "assisted", "tags": {},
-        "relevance": dict.fromkeys(DEFAULT_PROFILE_IDS, 2),
+        "role_label": "analytics-leadership", "relevance": 2,
         "gate_outcome": "unknown", "notes": "",
     } for index in range(160)]
     gold.write_text("".join(json.dumps(row) + "\n" for row in labels))
@@ -487,7 +492,7 @@ def test_run_accuracy_on_templates_writes_readonly_json_and_markdown(stored, tmp
                 "labeled_at": None,
                 "method": None,
                 "tags": {},
-                "relevance": dict.fromkeys(DEFAULT_PROFILE_IDS),
+                "role_label": None, "relevance": None,
                 "gate_outcome": None,
                 "notes": "",
             }
@@ -526,7 +531,7 @@ def test_outputs_protect_both_sibling_inputs_before_any_write(stored, tmp_path):
                 "labeled_at": None,
                 "method": None,
                 "tags": {},
-                "relevance": dict.fromkeys(DEFAULT_PROFILE_IDS),
+                "role_label": None, "relevance": None,
                 "gate_outcome": None,
                 "notes": "",
             }
@@ -556,7 +561,7 @@ def test_source_drift_withholds_old_labels_pending_human_review(stored, tmp_path
                 "labeled_at": "2026-10-10",
                 "method": "blind",
                 "tags": {},
-                "relevance": dict.fromkeys(DEFAULT_PROFILE_IDS, 2),
+                "role_label": "analytics-leadership", "relevance": 2,
                 "gate_outcome": "eligible",
                 "notes": "",
             }
@@ -590,7 +595,7 @@ def test_gold_survives_parser_version_change_with_unchanged_source_snapshot(stor
                 "method": "blind",
                 "tags": {},
                 "source": snapshot,
-                "relevance": dict.fromkeys(DEFAULT_PROFILE_IDS, 2),
+                "role_label": "analytics-leadership", "relevance": 2,
                 "gate_outcome": "eligible",
                 "notes": "",
             }
@@ -623,7 +628,7 @@ def test_parser_version_change_cannot_hide_semantic_raw_source_drift(stored, tmp
                 "method": "blind",
                 "tags": {},
                 "source": snapshot,
-                "relevance": dict.fromkeys(DEFAULT_PROFILE_IDS, 2),
+                "role_label": "analytics-leadership", "relevance": 2,
                 "gate_outcome": "eligible",
                 "notes": "",
             }
@@ -660,3 +665,88 @@ def test_compatible_geography_and_workmode_claims_choose_representable_values():
     assert mapped["tags"]["hiring_geography"] == "brazil_explicit"
     assert mapped["tags"]["work_mode"] == "remote_or_hybrid"
     assert not mapped["adapter_conflicts"]
+
+
+def test_role_classification_accuracy_is_separate_from_relevance_ranking():
+    cases = [case("correct", 3), case("wrong", 2), case("missing", 0)]
+    predictions = {
+        "correct": {"role_label": "analytics-leadership", "decision": "pass",
+                    "tier": "A", "fit_score": 20},
+        "wrong": {"role_label": "product-management", "decision": "pass",
+                  "tier": "A", "fit_score": 15},
+    }
+    result = evaluate_vacancies(cases, predictions)
+    roles = result["role_classification"]
+    assert roles["accuracy"]["value"] == pytest.approx(1 / 3, abs=1e-6)
+    assert roles["prediction_coverage"]["value"] == pytest.approx(2 / 3, abs=1e-6)
+    assert roles["confusion"]["analytics-leadership"]["product-management"] == 1
+    assert sum(roles["confusion"]["analytics-leadership"].values()) == 3
+    assert result["metrics"]["precision_A"]["value"] == 1
+
+
+def test_legacy_matrix_is_not_promoted_to_current_prediction(stored):
+    path, settings, record = stored
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "ALTER TABLE job_relevance_evaluations RENAME TO job_profile_evaluations"
+        )
+        connection.execute("UPDATE jobs SET role_label=NULL, role_classification='{}'")
+    before = path.read_bytes()
+    prediction = read_saved_predictions(settings.database_url, [("uid", record)])["uid"]
+    assert prediction["role_label"] is None
+    assert prediction["fit_score"] is None
+    assert prediction["decision_source"] == "reevaluation_required"
+    assert prediction["needs_reevaluation"] is True
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("label", "product-management"), ("source_hash", "0" * 64),
+    ("content_hash", "old"), ("version", "old"),
+])
+def test_saved_classification_must_match_current_source_and_taxonomy(stored, field, value):
+    path, settings, record = stored
+    with sqlite3.connect(path) as connection:
+        saved = connection.execute("SELECT role_classification FROM jobs").fetchone()[0]
+        payload = json.loads(saved)
+        payload[field] = value
+        connection.execute("UPDATE jobs SET role_classification=?", (json.dumps(payload),))
+    prediction = read_saved_predictions(
+        settings.database_url, [("uid", record)], classification_version="test",
+    )["uid"]
+    assert prediction["role_label"] is None
+    assert prediction["decision"] is None
+
+
+@pytest.mark.parametrize("decision", ["review", "reject"])
+def test_other_classification_has_no_relevance_score_or_ranking(stored, decision):
+    path, settings, record = stored
+    with sqlite3.connect(path) as connection:
+        saved = connection.execute("SELECT role_classification FROM jobs").fetchone()[0]
+        payload = {**json.loads(saved), "label": "other"}
+        connection.execute("UPDATE jobs SET role_label='other', role_classification=?",
+                           (json.dumps(payload),))
+        connection.execute(
+            "UPDATE job_relevance_evaluations SET profile_id='other', fit_score=0, "
+            "tier='C', decision=?", (decision,),
+        )
+    before = path.read_bytes()
+    predictions = read_saved_predictions(
+        settings.database_url, [("uid", record)], profile_versions={"other": "current"},
+        classification_version="test",
+    )
+    prediction = predictions["uid"]
+    assert prediction["role_label"] == "other"
+    assert prediction["fit_score"] is None and prediction["tier"] is None
+    assert prediction["relevance_evaluation"] is None
+    assert prediction["evaluation_state"] == "unscored"
+    assert prediction["decision_source"] == "role_unscored"
+    assert prediction["needs_reevaluation"] is False
+    assert prediction["current_eligible"] is False
+    assert prediction["decision"] == decision  # Explicit gates remain observable.
+    evaluation = evaluate_vacancies([{**case("uid", 0), "role_label": "other"}], predictions)
+    assert evaluation["role_classification"]["accuracy"]["value"] == 1
+    assert evaluation["ranking"] == []
+    assert evaluation["counts"]["ranked"] == 0
+    assert evaluation["decision_prediction_coverage"]["value"] == 0
+    assert path.read_bytes() == before

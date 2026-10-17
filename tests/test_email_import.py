@@ -70,12 +70,12 @@ def test_gmail_cli_import_is_offline_private_and_idempotent(tmp_path, monkeypatc
         result = runner.invoke(cli.app, ["import-gmail", str(snapshot)])
         assert result.exit_code == 0, result.output
         assert "persisted=1" in result.output
-        assert "evaluations=4" in result.output
+        assert "evaluations=1" in result.output
 
     database = Database(mail_config.database_url)
     with database.session() as session:
         assert session.scalar(select(func.count()).select_from(JobORM)) == 1
-        assert session.scalar(select(func.count()).select_from(JobProfileEvaluationORM)) == 4
+        assert session.scalar(select(func.count()).select_from(JobProfileEvaluationORM)) == 1
         assert session.scalar(select(func.count()).select_from(AlertOutboxORM)) == 0
         job = session.scalar(select(JobORM))
         assert job.source == "email-vacancies"
@@ -105,7 +105,7 @@ def test_eml_cli_import_does_not_run_other_sources(tmp_path, monkeypatch, mail_c
     result = CliRunner().invoke(cli.app, ["import-email", str(directory)])
     assert result.exit_code == 0, result.output
     assert "persisted=1" in result.output
-    assert "evaluations=4" in result.output
+    assert "evaluations=1" in result.output
 
 
 def test_failed_mail_import_reports_failure_without_mail_contents(

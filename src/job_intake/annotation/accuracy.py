@@ -6,6 +6,7 @@ token estimates and latest-run log telemetry have separate scopes; neither is a 
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -269,22 +270,18 @@ def adapt_saved_record(record: JobRecord) -> dict:
     }
 
 
-def _decision_key(row: dict) -> tuple:
-    return (
-        {"A": 0, "B": 1, "C": 2}.get(row.get("tier"), 3),
-        {"pass": 0, "review": 1, "reject": 2}.get(row.get("decision"), 3),
-        -row["fit_score"],
-        row.get("profile_id") or "",
-    )
-
-
 def read_saved_predictions(
     database_url: str,
     rows: list[tuple[str, JobRecord]],
     *,
     profile_versions: dict[str, str] | None = None,
+    classification_version: str | None = None,
 ) -> dict[str, dict]:
-    """Read decisions by SELECT on the existing DB; never initialize an ORM service."""
+    """Read the classified vacancy's single current score, without migrations.
+
+    Legacy profile matrices remain historical data. They cannot establish a role
+    label and are never promoted to a current prediction by choosing a winner.
+    """
     path = sqlite_path(database_url)
     connection = sqlite3.connect(f"file:{quote(str(path), safe='/')}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
@@ -292,91 +289,74 @@ def read_saved_predictions(
     try:
         connection.execute("PRAGMA query_only=ON")
         job_columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
-        profile_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(job_profile_evaluations)")
+        score_columns = {
+            row["name"] for row in connection.execute(
+                "PRAGMA table_info(job_relevance_evaluations)"
+            )
         }
-        fields = {
-            "job_uid",
-            "profile_id",
-            "profile_version",
-            "content_hash",
-            "decision",
-            "tier",
-            "fit_score",
-        }
+        fields = {"job_uid", "profile_id", "profile_version", "content_hash", "decision",
+                  "tier", "fit_score"}
         for uid, record in rows:
             prediction = {"job_uid": uid, **adapt_saved_record(record)}
             metadata = connection.execute("SELECT * FROM jobs WHERE job_uid = ?", (uid,)).fetchone()
-            saved = []
-            if profile_columns >= fields:
-                saved = [
-                    dict(row)
-                    for row in connection.execute(
-                        "SELECT job_uid, profile_id, profile_version, content_hash, "
-                        "decision, tier, fit_score FROM job_profile_evaluations "
-                        "WHERE job_uid = ? ORDER BY profile_id",
-                        (uid,),
-                    )
-                ]
-                if profile_versions is not None:
-                    saved = [row for row in saved if row["profile_id"] in profile_versions]
-            elif {"filter_decision", "tier", "fit_score"} <= job_columns:
-                saved = [
-                    {
-                        "decision": metadata["filter_decision"],
-                        "tier": metadata["tier"],
-                        "fit_score": metadata["fit_score"],
-                        "profile_id": None,
-                    }
-                ]
-                prediction["decision_source"] = "legacy_jobs_fallback"
-            saved = [
-                row
-                for row in saved
-                if row.get("decision") in {"pass", "review", "reject"}
+            label = metadata["role_label"] if "role_label" in job_columns else None
+            classification = {}
+            if "role_classification" in job_columns:
+                try:
+                    parsed = json.loads(metadata["role_classification"] or "{}")
+                    classification = parsed if isinstance(parsed, dict) else {}
+                except (TypeError, ValueError):
+                    pass
+            saved = [dict(row) for row in connection.execute(
+                "SELECT job_uid, profile_id, profile_version, content_hash, "
+                "decision, tier, fit_score FROM job_relevance_evaluations "
+                "WHERE job_uid = ?", (uid,),
+            )] if score_columns >= fields else []
+            stale_content = [row["profile_id"] for row in saved if (
+                "content_hash" not in job_columns
+                or row["content_hash"] != metadata["content_hash"]
+            )]
+            stale_profiles = [row["profile_id"] for row in saved if profile_versions is not None
+                              and row["profile_version"] != profile_versions.get(row["profile_id"])]
+            source_current = (
+                record.annotation.get("source_hash") == source_hash(record)
+                if record.annotation.get("source_hash") else None
+            )
+            classification_current = (
+                isinstance(label, str) and classification.get("label") == label
+                and bool(classification.get("version"))
+                and (classification_version is None
+                     or classification.get("version") == classification_version)
+                and classification.get("source_hash") == source_hash(record)
+                and "content_hash" in job_columns
+                and classification.get("content_hash") == metadata["content_hash"]
+                and (profile_versions is None or label in profile_versions)
+            )
+            valid = [row for row in saved if (
+                row["profile_id"] == label and classification_current
+                and row["profile_id"] not in stale_content + stale_profiles
+                and row.get("decision") in {"pass", "review", "reject"}
                 and row.get("tier") in {"A", "B", "C"}
                 and type(row.get("fit_score")) in {int, float}
                 and math.isfinite(row["fit_score"])
-            ]
-            stale_content = [
-                row["profile_id"]
-                for row in saved
-                if "content_hash" in job_columns
-                and row.get("content_hash") is not None
-                and row["content_hash"] != metadata["content_hash"]
-            ]
-            stale_profiles = [
-                row["profile_id"]
-                for row in saved
-                if profile_versions is not None
-                and row.get("profile_version") is not None
-                and row["profile_version"] != profile_versions.get(row["profile_id"])
-            ]
-            saved = [row for row in saved if row.get("profile_id") not in stale_content]
-            best = min(saved, key=_decision_key) if saved else {}
-            source_current = (
-                record.annotation.get("source_hash") == source_hash(record)
-                if record.annotation.get("source_hash")
-                else None
-            )
+            )]
+            current = valid[0] if len(valid) == 1 and source_current is not False else {}
+            unscored = classification_current and label == "other"
             prediction.update(
-                decision=best.get("decision"),
-                tier=best.get("tier"),
-                fit_score=best.get("fit_score"),
-                profile_id=best.get("profile_id"),
-                profile_evaluations=saved,
+                decision=current.get("decision"), tier=None if unscored else current.get("tier"),
+                fit_score=None if unscored else current.get("fit_score"),
+                profile_id=label if unscored else current.get("profile_id"),
+                role_label=label if classification_current else None,
+                role_classification=classification,
+                relevance_evaluation=None if unscored else current or None,
                 source_current=source_current,
-                stale_content_profiles=stale_content,
-                stale_profiles=stale_profiles,
-                current_eligible=(
-                    bool(best)
-                    and not stale_profiles
-                    and not stale_content
-                    and source_current is not False
-                )
-                if profile_versions is not None and "content_hash" in job_columns
-                else None,
-                decision_source=prediction.get("decision_source", "saved_profiles"),
+                stale_content_profiles=stale_content, stale_profiles=stale_profiles,
+                current_eligible=bool(current) and not unscored,
+                needs_reevaluation=not (bool(current) or unscored),
+                evaluation_state=("unscored" if unscored else
+                                  "current" if current else "needs_reevaluation"),
+                decision_source=("role_unscored" if unscored else
+                                 "classified_relevance" if current else "reevaluation_required"),
             )
             if source_current is False:
                 prediction["tags"] = dict.fromkeys(prediction["tags"], None)
@@ -393,14 +373,8 @@ def _value(tag: object) -> str | None:
 
 
 def _relevance(case: dict) -> int | None:
-    values = case.get("relevance")
-    if (
-        not isinstance(values, dict)
-        or not values
-        or any(type(v) is not int for v in values.values())
-    ):
-        return None
-    return max(values.values())
+    value = case.get("relevance")
+    return value if type(value) is int and value in range(4) else None
 
 
 def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
@@ -411,6 +385,7 @@ def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
         case
         for case in cases
         if _relevance(case) is not None
+        and isinstance(case.get("role_label"), str)
         and case.get("gate_outcome") in {"eligible", "ineligible", "unknown"}
     ]
     relevant = [case for case in labeled if _relevance(case) >= 2]
@@ -476,6 +451,22 @@ def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
         "denominator": ideal,
         "ci95": None,
         "note": "Graded ranking ratio, not binomial; missing ranks contribute no gain.",
+    }
+    role_pairs = [
+        (case["role_label"], prediction(case).get("role_label"))
+        for case in cases if isinstance(case.get("role_label"), str)
+    ]
+    role_confusion = Counter((gold, predicted or _MISSING) for gold, predicted in role_pairs)
+    role_metrics = {
+        "accuracy": proportion(sum(gold == predicted for gold, predicted in role_pairs),
+                               len(role_pairs)),
+        "prediction_coverage": proportion(sum(predicted is not None for _, predicted in role_pairs),
+                                          len(role_pairs)),
+        "confusion": {
+            gold: {predicted: count for (truth, predicted), count in sorted(role_confusion.items())
+                   if truth == gold}
+            for gold in sorted({gold for gold, _ in role_pairs})
+        },
     }
     tag_metrics = {}
     aggregate_negative = Counter()
@@ -559,6 +550,7 @@ def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
         },
         "decision_prediction_coverage": proportion(complete, len(labeled)),
         "metrics": metrics,
+        "role_classification": role_metrics,
         "tags": tag_metrics,
         "negative_restrictions": {
             "recall": proportion(aggregate_negative["tp"], aggregate_negative["actual"]),
@@ -939,13 +931,16 @@ def run_accuracy(
         raise ValueError("Gold is empty")
     database, rows, problems = read_saved_records(config.database_url, limit=None, job_uids=uids)
     versions = None
+    classifier_version = None
     if config.rules_path.is_file() and config.search_profiles_path.is_file():
-        versions = {
-            stream.id: stream.version
-            for stream in load_streams(
-                load_yaml_mapping(config.rules_path), load_yaml_mapping(config.search_profiles_path)
-            )
-        }
+        from job_intake.profiles import taxonomy_version, with_other_stream
+
+        rules = load_yaml_mapping(config.rules_path)
+        streams = with_other_stream(
+            load_streams(rules, load_yaml_mapping(config.search_profiles_path)), rules,
+        )
+        versions = {stream.id: stream.version for stream in streams}
+        classifier_version = taxonomy_version(streams)
     validated = validate_gold(
         rows,
         cases,
@@ -966,7 +961,10 @@ def run_accuracy(
         for warning in validated["warnings"]
         if warning.get("code") == "source_hash_changed"
     } - parser_only
-    predictions = read_saved_predictions(config.database_url, rows, profile_versions=versions)
+    predictions = read_saved_predictions(
+        config.database_url, rows, profile_versions=versions,
+        classification_version=classifier_version,
+    )
     for uid, findings in problems.items():
         if any(finding["severity"] == "error" for finding in findings):
             predictions[uid]["tags"] = dict.fromkeys(predictions[uid]["tags"], None)
@@ -974,7 +972,7 @@ def run_accuracy(
     price_path = prices or config.rules_path.parent / "eval_prices.yaml"
     price_config = load_prices(price_path)
     evaluation_cases = [
-        {**case, "relevance": None, "gate_outcome": None, "tags": {}}
+        {**case, "role_label": None, "relevance": None, "gate_outcome": None, "tags": {}}
         if case["job_uid"] in drift_uids
         else case
         for case in validated["rows"]
@@ -1004,7 +1002,7 @@ def run_accuracy(
         "source_findings": problems,
         "limitations": [
             "Legacy mapping is loss-aware; unmapped tags count as abstention errors.",
-            "Profile-stale decisions are historical; current CRM eligibility is unconfirmed.",
+            "Legacy profile matrices and stale decisions need classification and reevaluation.",
             "Exclusion counts observed cases only; incomplete coverage prevents acceptance.",
             "NDCG uses tier, score descending, job_uid in this gold cohort, not the full queue.",
         ],
@@ -1087,7 +1085,13 @@ def accuracy_markdown(report: dict) -> str:
     lines.extend(
         f"| {name} | {_formatted(metric)} |" for name, metric in evaluation["metrics"].items()
     )
+    role = evaluation["role_classification"]
     lines += [
+        "",
+        "## Role classification",
+        "",
+        f"Accuracy: {_formatted(role['accuracy'])}; "
+        f"coverage: {_formatted(role['prediction_coverage'])}.",
         "",
         "## Tags",
         "",

@@ -21,7 +21,7 @@ from job_intake.config.settings import AppConfig, load_yaml_mapping
 from job_intake.crm.jobs import JOB_QUERY_FIELDS, job_detail, list_job_page
 from job_intake.crm.repository import CRMRepository, serialize_application
 from job_intake.crm.schemas import CRMConflictError
-from job_intake.profiles import load_streams
+from job_intake.profiles import load_streams, with_other_stream
 from job_intake.storage.database import Database
 from job_intake.storage.models import JobORM
 from job_intake.storage.repository import JobArchiveConflictError, JobRepository
@@ -239,8 +239,9 @@ def csv_export(applications: list[dict]) -> bytes:
 class CRMService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
-        self.streams = load_streams(
-            load_yaml_mapping(config.rules_path), load_yaml_mapping(config.search_profiles_path)
+        rules = load_yaml_mapping(config.rules_path)
+        self.streams = with_other_stream(
+            load_streams(rules, load_yaml_mapping(config.search_profiles_path)), rules,
         )
         self.database = Database(config.database_url)
         self.database.create_schema()
@@ -419,29 +420,14 @@ class CRMService:
                 ):
                     raise RequestError("Некорректный ID вакансии")
                 profile = self.validate_profile(data.get("profile_id"))
-                if profile is None:
-                    job = session.scalar(
-                        select(JobORM).where(JobORM.job_uid == data.get("job_uid"))
-                    )
-                    if job is not None:
-                        versions = {s.id: s.version for s in self.streams}
-                        current = [
-                            p
-                            for p in job.profile_evaluations
-                            if (
-                                versions.get(p.profile_id) == p.profile_version
-                                and p.content_hash == job.content_hash
-                            )
-                        ]
-                        current.sort(
-                            key=lambda p: (
-                                {"A": 0, "B": 1, "C": 2}[p.tier],
-                                {"pass": 0, "review": 1, "reject": 2}[p.decision],
-                                -p.fit_score,
-                                p.profile_id,
-                            )
-                        )
-                        profile = current[0].profile_id if current else None
+                job = session.scalar(select(JobORM).where(JobORM.job_uid == data["job_uid"]))
+                if job is None:
+                    raise RequestError("Вакансия не найдена", 404)
+                if not job.role_label:
+                    raise RequestError("Сначала определите метку вакансии")
+                if profile is not None and profile != job.role_label:
+                    raise RequestError("Профиль отклика должен совпадать с меткой вакансии")
+                profile = job.role_label
                 row = repo.create_from_job(data.get("job_uid"), profile_id=profile)
                 result = serialize_application(row)
             elif method == "POST" and path == "/api/applications":

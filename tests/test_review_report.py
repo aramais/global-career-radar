@@ -13,6 +13,8 @@ def _profile(profile_id="analytics", **changes):
         "profile_id": profile_id,
         "profile_name": "Analytics Leadership",
         "profile_version": "version-1",
+        "classification_version": "taxonomy-v1",
+        "classification_source_hash": "source-v1",
         "content_hash": "content-v1",
         "decision": "pass",
         "fit_score": 20.0,
@@ -28,6 +30,10 @@ def _profile(profile_id="analytics", **changes):
 
 def _job(**changes):
     fields = {
+        "role_label": "analytics",
+        "role_classification": {"label": "analytics", "name": "Analytics Leadership",
+                                "reason": "Analytics scope", "version": "taxonomy-v1",
+                                "source_hash": "source-v1", "content_hash": "content-v1"},
         "company": "Example",
         "title": "Head of Analytics",
         "source": "test",
@@ -52,7 +58,18 @@ def _job(**changes):
         "risks": [],
         "audit_log": [],
     }
-    return SimpleNamespace(**{**fields, **changes})
+    fields.update(changes)
+    if "role_classification" not in changes:
+        fields["role_classification"] = {**fields["role_classification"],
+                                         "label": fields["role_label"],
+                                         "content_hash": fields["content_hash"]}
+    if "profile_evaluations" not in changes:
+        fields["profile_evaluations"] = [_profile(
+            decision=fields["filter_decision"], tier=fields["tier"], fit_score=fields["fit_score"],
+            fit_reason=fields["fit_reason"], risks=fields["risks"],
+            matched_signals=fields["matched_signals"], blocker_signals=fields["detected_blockers"],
+        )]
+    return SimpleNamespace(**fields)
 
 
 def _render(tmp_path, jobs, **kwargs):
@@ -85,37 +102,20 @@ def test_low_fit_c_remains_visible_separately_from_hard_rejection(tmp_path):
     assert _data(soup)[0]["evaluations"][0]["decision"] == "review"
 
 
-def test_selected_profile_shows_its_verdict_and_score_not_global_best(tmp_path):
-    job = _job(
-        profile_evaluations=[
-            _profile(),
-            _profile(
-                "product",
-                profile_name="Product Management",
-                decision="reject",
-                tier="C",
-                fit_score=0,
-                fit_reason="Product requirements differ.",
-                blocker_signals=["country:US only"],
-            ),
-        ]
-    )
+def test_role_filter_excludes_other_role_instead_of_showing_zero_score(tmp_path):
+    job = _job(profile_evaluations=[_profile()])
     _, soup = _render(tmp_path, [job], profile_id="product")
-
-    product = soup.select_one('.evaluation[data-profile-id="product"]')
-    analytics = soup.select_one('.evaluation[data-profile-id="analytics"]')
-    assert not product.has_attr("hidden")
-    assert analytics.has_attr("hidden")
-    assert "0 баллов" in product.text
-    assert "Явное ограничение" in product.text
-    assert soup.select_one('[data-group="reject"] .job-card') is not None
-    assert soup.select_one('#profile-filter option[value="product"]').has_attr("selected")
-    scores = {item["profile_id"]: item["fit_score"] for item in _data(soup)[0]["evaluations"]}
-    assert scores == {"analytics": 20.0, "product": 0.0}
+    assert soup.select_one(".job-card") is None
+    assert _data(soup) == []
+    _, soup = _render(tmp_path, [job], profile_id="analytics")
+    assert len(soup.select(".evaluation")) == 1
+    assert "20 баллов" in soup.select_one(".evaluation").text
+    assert _data(soup)[0]["role_label"] == "analytics"
 
 
 def test_disabled_and_stale_evaluations_do_not_leak_into_current_review(tmp_path):
     job = _job(
+        role_label="product",
         profile_evaluations=[
             _profile("disabled", profile_name="Do not show disabled", fit_score=99),
             _profile("analytics", fit_reason="Do not show stale", profile_version="old"),
@@ -166,17 +166,21 @@ def test_same_version_profile_with_old_job_content_requires_reevaluation(tmp_pat
     assert soup.select_one('[data-group="stale"] .job-card') is not None
 
 
-def test_best_profile_uses_tier_then_decision_before_score(tmp_path):
-    job = _job(
-        profile_evaluations=[
-            _profile("review", tier="C", decision="review", fit_score=5),
-            _profile("pass", tier="C", decision="pass", fit_score=1),
-        ]
-    )
+def test_assigned_role_is_used_even_when_other_legacy_score_is_higher(tmp_path):
+    job = _job(role_label="analytics", profile_evaluations=[
+        _profile("other-role", tier="A", fit_score=90),
+        _profile("analytics", tier="C", decision="review", fit_score=1),
+    ])
     _, soup = _render(tmp_path, [job])
+    assert soup.select_one('.evaluation[data-profile-id="other-role"]') is None
+    assert "1 баллов" in soup.select_one('.evaluation[data-profile-id="analytics"]').text
 
-    assert not soup.select_one('.evaluation[data-profile-id="pass"]').has_attr("hidden")
-    assert soup.select_one('.evaluation[data-profile-id="review"]').has_attr("hidden")
+
+def test_legacy_best_score_does_not_become_assigned_role(tmp_path):
+    _, soup = _render(tmp_path, [_job(role_label=None, role_classification={},
+                                    profile_evaluations=[_profile()])])
+    assert _data(soup)[0]["evaluations"] == []
+    assert soup.select_one('[data-group="stale"] .job-card') is not None
 
 
 def test_summary_preserves_all_four_active_streams_even_without_jobs(tmp_path):
@@ -358,3 +362,16 @@ def test_generated_reasons_remain_readable_after_signal_sorting_and_scoring(tmp_
         "Вакансия сохранена для ручного отбора. Уточните вопросы ниже.",
         "Есть совпадения с профилем. Обязательные ограничения не обнаружены.",
     ]
+
+
+def test_other_role_has_no_score_and_keeps_closed_gate(tmp_path):
+    job = _job(role_label="other", profile_evaluations=[_profile(
+        "other", tier="C", fit_score=0, decision="reject", blocker_signals=["status:closed"],
+    )])
+    html, soup = _render(tmp_path, [job])
+    assert soup.select_one(".evaluation") is None
+    assert "0 баллов" not in html
+    assert 'Роль требует проверки; релевантность не оценена.' in soup.select_one(".job-card").text
+    assert 'Вакансия закрыта' in soup.select_one(".job-card").text
+    assert soup.select_one('[data-group="reject"] .job-card') is not None
+    assert _data(soup)[0]["evaluation_state"] == "unscored"

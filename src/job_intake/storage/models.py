@@ -51,6 +51,8 @@ class JobORM(Base):
     last_alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     source_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
     annotation: Mapped[dict] = mapped_column(JSON, default=dict)
+    role_label: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    role_classification: Mapped[dict] = mapped_column(JSON, default=dict)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     archive_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -74,8 +76,10 @@ class JobORM(Base):
 
 
 class JobProfileEvaluationORM(Base):
-    __tablename__ = "job_profile_evaluations"
-    __table_args__ = (UniqueConstraint("job_uid", "profile_id"),)
+    # Legacy job_profile_evaluations is deliberately left untouched. A historical
+    # maximum across profile scores is not a role classification.
+    __tablename__ = "job_relevance_evaluations"
+    __table_args__ = (UniqueConstraint("job_uid"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_uid: Mapped[str] = mapped_column(ForeignKey("jobs.job_uid"), index=True)
@@ -84,6 +88,8 @@ class JobProfileEvaluationORM(Base):
     profile_version: Mapped[str] = mapped_column(String(64))
     content_hash: Mapped[str] = mapped_column(String(64))
     llm_cache_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    classification_version: Mapped[str] = mapped_column(String(64), default="")
+    classification_source_hash: Mapped[str] = mapped_column(String(64), default="")
     decision: Mapped[str] = mapped_column(String(32))
     deterministic_score: Mapped[float] = mapped_column(Float)
     semantic_score: Mapped[float | None] = mapped_column(Float, nullable=True)

@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from job_intake.storage.models import JobORM
+from job_intake.storage.queries import classification_is_current
 
 
 def _text(value: object) -> str:
@@ -69,19 +70,6 @@ def _group(evaluation: dict | None) -> str:
     if evaluation["decision"] == "reject":
         return "reject"
     return "low_fit" if evaluation["tier"] == "C" else "opportunities"
-
-
-def _best(evaluations: list[dict]) -> dict | None:
-    return min(
-        evaluations,
-        key=lambda item: (
-            {"A": 0, "B": 1, "C": 2}.get(item["tier"], 3),
-            {"pass": 0, "review": 1, "reject": 2}.get(item["decision"], 3),
-            -item["fit_score"],
-            item["profile_id"],
-        ),
-        default=None,
-    )
 
 
 def _list_markup(label: str, values: list) -> str:
@@ -227,7 +215,8 @@ def _evaluation_markup(evaluation: dict, selected: dict | None) -> str:
     )
 
 
-def _card_markup(job: JobORM, index: int, evaluations: list[dict], selected: dict | None) -> str:
+def _card_markup(job: JobORM, index: int, evaluations: list[dict], selected: dict | None,
+                 eligibility: dict | None = None) -> str:
     first_seen, _ = _date(getattr(job, "first_seen_at", None))
     metadata = [
         getattr(job, "location_text", None),
@@ -245,17 +234,21 @@ def _card_markup(job: JobORM, index: int, evaluations: list[dict], selected: dic
             links += (
                 f'<a href="{escape(url)}" target="_blank" rel="noopener noreferrer">{label}</a>'
             )
-    chips = "".join(
-        f'<button class="profile-chip" type="button" '
-        f'data-select-profile="{escape(evaluation["profile_id"])}">'
-        f"{escape(evaluation['profile_name'] or evaluation['profile_id'])}"
-        f" · {escape(evaluation['tier'])} · {evaluation['fit_score']:g}</button>"
-        for evaluation in evaluations
-    )
+    classification = getattr(job, "role_classification", None) or {}
+    role_label = _text(getattr(job, "role_label", ""))
+    role_name = _text(classification.get("name")) or role_label or "Метка не определена"
+    chips = f'<span class="profile-chip">{escape(role_name)}</span>'
+    classification_reason = _text(classification.get("reason"))
+    if classification_reason:
+        chips += f'<span class="classification-reason">{escape(classification_reason)}</span>'
     description = _text(
         getattr(job, "description_clean", None) or getattr(job, "description_raw", "")
     )
     stale_hidden = " hidden" if selected is not None else ""
+    note = ("Роль требует проверки; релевантность не оценена."
+            if role_label == "other" and classification_is_current(
+                job, next(iter(getattr(job, "profile_evaluations", None) or []), None),
+            ) else "Нет актуальной оценки. Переклассифицируйте и пересчитайте вакансию.")
     return (
         f'<article class="job-card" data-job-index="{index}">'
         '<div class="card-heading"><div>'
@@ -265,8 +258,11 @@ def _card_markup(job: JobORM, index: int, evaluations: list[dict], selected: dic
         f'<p class="discovered">Найдена {first_seen} · {escape(_text(job.source))}</p>'
         f'<div class="profile-chips">{chips}</div>'
         + "".join(_evaluation_markup(item, selected) for item in evaluations)
+        + (_list_markup("Обязательные ограничения", [
+            _human_signal(item) for item in eligibility["blocker_signals"]
+        ]) if eligibility is not None and selected is None else "")
         + f'<p class="stale-note"{stale_hidden}>'
-        "Нет актуальной оценки. Пересчитайте сохранённые вакансии для текущих профилей.</p>"
+        f"{note}</p>"
         + '<details class="description"><summary>Полное сохранённое описание</summary>'
         f'<div class="description-text">{escape(description or "Описание не сохранено.")}</div>'
         + "</details></article>"
@@ -282,18 +278,27 @@ def render_html_report(
     active_profile_versions: dict[str, str] | None = None,
     active_profile_names: dict[str, str] | None = None,
 ) -> Path:
-    """Render an offline review feed, preserving low-fit jobs and profile-specific verdicts."""
+    """Render one assigned role and its relevance, including vacancies awaiting reevaluation."""
     active_ids = set(active_profile_ids) if active_profile_ids is not None else None
     names = dict(active_profile_names or {})
     data = []
     groups: dict[str, list[str]] = {"opportunities": [], "low_fit": [], "reject": [], "stale": []}
     for index, job in enumerate(jobs):
+        role_label = getattr(job, "role_label", None)
+        if profile_id and role_label != profile_id:
+            continue
         stored = list(getattr(job, "profile_evaluations", None) or [])
+        classified = classification_is_current(job, next(iter(stored), None))
         evaluations = []
+        eligibility = None
         content_hash = _text(getattr(job, "content_hash", ""))
         for row in stored:
+            if not classification_is_current(job, row):
+                continue
             item = _evaluation(row)
             item_id = item["profile_id"]
+            if item_id != role_label:
+                continue
             if active_ids is not None and item_id not in active_ids:
                 continue
             if active_profile_versions is not None and (
@@ -303,22 +308,22 @@ def render_html_report(
                 continue
             if content_hash and item["content_hash"] != content_hash:
                 continue
+            if role_label == "other":
+                eligibility = item
+                continue
             if item_id in names:
                 item["profile_name"] = names[item_id]
             evaluations.append(item)
             names.setdefault(item_id, item["profile_name"] or item_id)
-        if not stored and active_ids is None and active_profile_versions is None:
-            evaluations = [_evaluation(job, legacy=True)]
-            names.setdefault("legacy", "Основной профиль")
-        selected = (
-            next((item for item in evaluations if item["profile_id"] == profile_id), None)
-            if profile_id
-            else _best(evaluations)
-        )
+        selected = next(iter(evaluations), None)
         _, seen_at = _date(getattr(job, "first_seen_at", None))
         data.append(
             {
                 "index": index,
+                "role_label": role_label,
+                "classification_state": "current" if classified else "needs_reclassification",
+                "evaluation_state": ("unscored" if role_label == "other" and classified
+                                     else "current" if selected else "needs_reevaluation"),
                 "seen_at": seen_at,
                 "search_text": " ".join(
                     [
@@ -331,14 +336,17 @@ def render_html_report(
                     ]
                 ),
                 "evaluations": evaluations,
+                "eligibility": eligibility,
             }
         )
-        groups[_group(selected)].append(_card_markup(job, index, evaluations, selected))
+        group = ("reject" if eligibility and eligibility["decision"] == "reject"
+                 else _group(selected))
+        groups[group].append(_card_markup(job, index, evaluations, selected, eligibility))
 
     profile_ids = list(active_profile_ids) if active_profile_ids is not None else sorted(names)
     if active_profile_versions is not None:
         profile_ids = [item_id for item_id in profile_ids if item_id in active_profile_versions]
-    options = '<option value="">Все потоки · лучшая актуальная оценка</option>'
+    options = '<option value="">Все метки вакансий</option>'
     summaries = []
     for item_id in profile_ids:
         name = names.get(item_id, item_id)
@@ -384,12 +392,12 @@ def render_html_report(
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         "<title>Личный поиск работы</title><style>" + _STYLES + "</style></head><body>"
         '<main><header><p class="eyebrow">Личный поиск работы</p>'
-        "<h1>Возможности по всем потокам</h1>"
+        "<h1>Вакансии по меткам</h1>"
         '<p class="intro">Сравнивайте роли и условия. Низкая оценка сохраняет вакансию '
         "для ручного отбора; обязательные ограничения показаны отдельно.</p></header>"
         f'<div class="stream-summaries">{"".join(summaries)}</div>'
         '<form class="filters" onsubmit="return false">'
-        f'<label>Поток<select id="profile-filter">{options}</select></label>'
+        f'<label>Метка<select id="profile-filter">{options}</select></label>'
         '<label>Результат<select id="decision-filter">'
         '<option value="all">Все результаты</option><option value="pass">Подходит</option>'
         '<option value="review">Проверить вручную</option>'
@@ -400,9 +408,9 @@ def render_html_report(
         '<option value="newest">Сначала новые</option></select></label>'
         '<label class="search-label">Поиск<input id="text-filter" type="search" '
         'placeholder="Компания, роль или слово в описании"></label></form>'
-        f'<p id="result-count" aria-live="polite">Сохранено вакансий: {len(jobs)}</p>'
+        f'<p id="result-count" aria-live="polite">Сохранено вакансий: {len(data)}</p>'
         f'{sections}<p id="empty-state" hidden>По этим условиям вакансий нет. '
-        "Попробуйте другой поток или результат.</p>"
+        "Попробуйте другую метку или результат.</p>"
         "<noscript>Фильтры работают при включённом JavaScript. Все сохранённые "
         "вакансии доступны ниже.</noscript></main>"
         f'<script type="application/json" id="jobs-data">{payload}</script>'
@@ -464,16 +472,9 @@ _SCRIPT = """
     .map(card => [Number(card.dataset.jobIndex), card]));
   const sections = new Map(Array.from(document.querySelectorAll('.feed-group'))
     .map(section => [section.dataset.group, section]));
-  const tierOrder = {A: 0, B: 1, C: 2};
-  const decisionOrder = {pass: 0, review: 1, reject: 2};
-  const compare = (a, b) => (tierOrder[a.tier] ?? 3) - (tierOrder[b.tier] ?? 3)
-    || (decisionOrder[a.decision] ?? 3) - (decisionOrder[b.decision] ?? 3)
-    || b.fit_score - a.fit_score
-    || (a.profile_id < b.profile_id ? -1 : a.profile_id > b.profile_id ? 1 : 0);
-  const selected = job => profile.value
-    ? job.evaluations.find(item => item.profile_id === profile.value)
-    : [...job.evaluations].sort(compare)[0];
-  const group = item => !item ? 'stale' : item.decision === 'reject' ? 'reject'
+  const selected = job => job.evaluations[0];
+  const group = (item, job) => job.eligibility?.decision === 'reject' ? 'reject'
+    : !item ? 'stale' : item.decision === 'reject' ? 'reject'
     : item.tier === 'C' ? 'low_fit' : 'opportunities';
   function refresh() {
     const counts = {opportunities: 0, low_fit: 0, reject: 0, stale: 0};
@@ -485,11 +486,11 @@ _SCRIPT = """
     const query = search.value.trim().toLocaleLowerCase();
     for (const {job, evaluation} of entries) {
       const card = cards.get(job.index);
-      const key = group(evaluation);
+      const key = group(evaluation, job);
       const matchesDecision = decision.value === 'all'
         || (['stale', 'low_fit', 'reject'].includes(decision.value)
           ? key === decision.value : evaluation?.decision === decision.value);
-      const visible = matchesDecision
+      const visible = (!profile.value || job.role_label === profile.value) && matchesDecision
         && (!query || job.search_text.toLocaleLowerCase().includes(query));
       card.hidden = !visible;
       for (const panel of card.querySelectorAll('.evaluation')) {

@@ -32,7 +32,7 @@ def label(record, **overrides):
     return {
         "job_uid": "uid", "source_hash": source_hash(record), "text_version": TEXT_VERSION,
         "labeled_at": "2026-10-13", "method": "blind", "tags": {},
-        "relevance": dict.fromkeys(DEFAULT_PROFILE_IDS, 2), "gate_outcome": "eligible",
+        "role_label": "analytics-leadership", "relevance": 2, "gate_outcome": "eligible",
         "notes": "", **overrides,
     }
 
@@ -139,7 +139,9 @@ def test_gold_does_not_bind_across_unrelated_source_fields():
     }}}, "invalid_tag_label"),
     ({"tags": {"vacancy_closed": {"value": True, "quote": ""}}}, "invalid_tag_value"),
     ({"tags": {"project_management": {"value": "duty", "quote": ""}}}, "missing_quote"),
-    ({"relevance": dict.fromkeys(DEFAULT_PROFILE_IDS, True)}, "invalid_relevance"),
+    ({"relevance": True}, "invalid_relevance"),
+    ({"role_label": "missing-profile"}, "invalid_role_label"),
+    ({"role_label": []}, "invalid_role_label"),
     ({"relevance": {"model_profile": 2}}, "invalid_relevance"),
     ({"method": "model"}, "invalid_method"),
     ({"method": []}, "invalid_method"),
@@ -162,12 +164,12 @@ def test_gold_rejects_invalid_schemas_and_no_fabricated_provenance(patch, code):
 def test_gold_unlabeled_template_and_partial_tags_are_valid_but_not_semantic_decisions():
     record = job()
     template = label(record, labeled_at=None, method=None,
-                     relevance=dict.fromkeys(DEFAULT_PROFILE_IDS), gate_outcome=None)
+                     role_label=None, relevance=None, gate_outcome=None)
     report = validate_gold([("uid", record)], [template])
     assert report["valid"]
     assert report["labeled_count"] == report["relevant_count"] == 0
     assert report["warnings"][0]["code"] == "unlabeled_case"
-    partial = label(record, relevance=dict.fromkeys(DEFAULT_PROFILE_IDS), gate_outcome=None,
+    partial = label(record, role_label=None, relevance=None, gate_outcome=None,
                     tags={"working_language": {"value": "unspecified", "quote": ""}})
     report = validate_gold([("uid", record)], [partial])
     assert report["valid"]
@@ -253,7 +255,7 @@ def test_sample_exact_strata_unique_and_blind_without_saved_decisions(sample_dat
                       '"prefilter"', '"saved_fit_score"', '"stratum"'):
         assert forbidden not in text
     assert all(case["gate_outcome"] is None and case["tags"] == {} for case in cases)
-    assert all(set(case["relevance"].values()) == {None} for case in cases)
+    assert all(case["role_label"] is None and case["relevance"] is None for case in cases)
     again, manifest_again = sample_gold(settings)
     assert again == cases
     assert manifest_again["selection"] == manifest["selection"]
@@ -339,3 +341,33 @@ def test_us_difficulty_heuristic_does_not_confuse_country_with_about_us():
     assert "us_visa" not in difficult_features(job("About us: work with us on projects."))
     assert "us_visa" in difficult_features(job("This job is US only."))
     assert "us_visa" in difficult_features(job("This job is U.S. only."))
+
+
+def test_v1_gold_requires_manual_migration_and_is_not_mutated():
+    record = job()
+    row = label(record, schema="vacancy-tags-v1", relevance={
+        "product-management": 0, "analytics-leadership": 3,
+        "business-analytics": 1, "data-science-management": 0,
+    })
+    row.pop("role_label")
+    before = copy.deepcopy(row)
+    report = validate_gold([("uid", record)], [row])
+    assert not report["valid"]
+    assert report["labeled_count"] == 0
+    assert any("manual migration" in error["message"] for error in report["errors"])
+    assert row == before
+
+
+def test_single_role_and_one_scalar_rating_preserve_fact_tags():
+    record = job()
+    row = label(record, role_label="other", relevance=0, tags={
+        "project_management": {"value": "duty", "quote": "You will lead projects."},
+    })
+    report = validate_gold([("uid", record)], [row])
+    assert report["valid"]
+    assert report["labeled_count"] == 1
+    assert report["relevant_count"] == 0
+    assert report["rows"][0]["tags"]["project_management"]["evidence_ids"]
+    schema = gold_json_schema()
+    assert schema["properties"]["relevance"]["enum"] == [0, 1, 2, 3]
+    assert schema["properties"]["role_label"]["enum"] == [*DEFAULT_PROFILE_IDS, "other"]

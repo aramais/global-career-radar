@@ -27,7 +27,10 @@ def seed_jobs(service, count=1, *, description="Full description", annotations=N
     for index in range(count):
         uid = f"audit-job-{index:04}"
         jobs.append({
-            "job_uid": uid, "fingerprint": uid, "content_hash": uid, "source": "fixture",
+            "job_uid": uid, "role_label": "product", "fingerprint": uid, "content_hash": uid,
+            "source": "fixture",
+            "role_classification": {"label": "product", "content_hash": uid,
+                                    "version": "taxonomy-v1", "source_hash": uid},
             "company": "Fixture", "title": "Unique old target" if index == 0 else f"Job {index}",
             "original_url": f"https://example.invalid/{uid}", "description_raw": description,
             "description_clean": description, "annotation": annotations or {}, "status": "open",
@@ -37,6 +40,7 @@ def seed_jobs(service, count=1, *, description="Full description", annotations=N
         evaluations.append({
             "job_uid": uid, "profile_id": "product", "profile_name": "Product",
             "profile_version": service.streams[0].version, "content_hash": uid,
+            "classification_version": "taxonomy-v1", "classification_source_hash": uid,
             "decision": "pass" if index == 0 else "reject",
             "deterministic_score": 20 if index == 0 else 0,
             "fit_score": 20 if index == 0 else 0, "tier": "A" if index == 0 else "C",
@@ -207,7 +211,7 @@ def test_job_filter_and_sort_use_current_profile_version_and_source_hash(service
     assert [job["job_uid"] for job in service.jobs({"sort": "tier-desc"})["jobs"]] == [
         ids[1], ids[0], ids[2], ids[3],
     ]
-    assert service.jobs({"profile_id": "product", "tier": "unrated"})["total"] == 0
+    assert service.jobs({"profile_id": "product", "tier": "unrated"})["total"] == 2
     assert service.jobs({"tier": "unrated"})["total"] == 2
     assert service.jobs({"query": "%"})["total"] == 0
     with pytest.raises(ValueError):

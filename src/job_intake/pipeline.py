@@ -18,6 +18,7 @@ from job_intake.annotation.prefilter import VacancyPrefilter
 from job_intake.annotation.progress import ProgressCallback, emit_progress
 from job_intake.annotation.service import VacancyAnnotator, apply_annotation_constraints
 from job_intake.annotation.text import role_description, source_hash
+from job_intake.classification import RoleClassifier
 from job_intake.config.settings import (
     AppConfig,
     SourceDefinition,
@@ -25,12 +26,13 @@ from job_intake.config.settings import (
     load_yaml_mapping,
 )
 from job_intake.models.job import EvaluatedJob, FilterDecision, JobRecord, JobStatus, JobTier
-from job_intake.profiles import SearchStream, load_streams
+from job_intake.profiles import SearchStream, load_streams, with_other_stream
 from job_intake.scoring.llm import BatchReranker, build_reranker, should_skip_llm
 from job_intake.scoring.tiering import finalize_tier
 from job_intake.storage.database import Database
 from job_intake.storage.dedup import JobDeduplicator
 from job_intake.storage.models import AlertOutboxORM
+from job_intake.storage.queries import classification_is_current
 from job_intake.storage.repository import JobRepository, validate_job_uids
 from job_intake.utils.logging import configure_logging
 from job_intake.utils.text import stable_hash
@@ -41,9 +43,12 @@ LOGGER = logging.getLogger(__name__)
 class JobIntakePipeline:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
-        self.streams = load_streams(
-            load_yaml_mapping(config.rules_path), load_yaml_mapping(config.search_profiles_path)
+        common_rules = load_yaml_mapping(config.rules_path)
+        self.streams = with_other_stream(
+            load_streams(common_rules, load_yaml_mapping(config.search_profiles_path)),
+            common_rules,
         )
+        self.classifier = RoleClassifier(self.streams, config.annotation)
         self.database = Database(config.database_url)
         self.database.create_schema()
         self.reranker = build_reranker(config.llm)
@@ -89,6 +94,9 @@ class JobIntakePipeline:
             "annotation_review_calls": 0,
             "annotation_cache_hits": 0,
             "annotation_errors": 0,
+            "classification_calls": 0,
+            "classification_cache_hits": 0,
+            "classification_errors": 0,
             "prefilter_screen_calls": 0,
             "prefilter_verify_calls": 0,
             "prefilter_cache_hits": 0,
@@ -180,6 +188,8 @@ class JobIntakePipeline:
                     "content": self.deduplicator.build_identity(record).content_hash,
                     "metadata": record.source_metadata,
                     "profile": stream.version,
+                    "classification": self.classifier.version,
+                    "role_label": stream.id,
                     "llm": asdict(self.config.llm),
                     "prompt": prompt,
                 },
@@ -203,23 +213,35 @@ class JobIntakePipeline:
             )
             if saved is not None and not record.annotation:
                 record.annotation = saved.annotation or {}
-            # Resolve reliable hard constraints before paying for any semantic stage.
-            engines = [stream.engine for stream in self.streams]
-            local_items = [engine.apply(record) for engine in engines]
+            # Choose occupation before evaluating relevance or per-role conditions.
+            before_classification = dict(self.classifier.stats)
+            stream, classification = self.classifier.classify(
+                record,
+                use_ai=False,
+                previous=saved.role_classification if saved is not None else None,
+            )
+            engine = stream.engine
+            local_item = engine.apply(record)
             requested_ai = (
                 use_llm and self.config.annotation.enabled and self.config.annotation.ai_enabled
             )
-            route = None
-            if requested_ai and all(
-                item.evaluation.decision == FilterDecision.REJECT for item in local_items
+            if (
+                stream.id == "other" and requested_ai
+                and classification["method"] != "model"
+                and local_item.evaluation.decision != FilterDecision.REJECT
             ):
-                blockers = sorted({
-                    signal for item in local_items for signal in item.evaluation.blocker_signals
-                })
+                stream, classification = self.classifier.classify(record, use_ai=True)
+                engine = stream.engine
+                local_item = engine.apply(record)
+            for name, value in self.classifier.stats.items():
+                stats["classification_" + name] += value - before_classification[name]
+            route = None
+            if requested_ai and local_item.evaluation.decision == FilterDecision.REJECT:
+                blockers = sorted(set(local_item.evaluation.blocker_signals))
                 route = {
                     "routing": "local_reject", "decision": "clearly_irrelevant",
                     "reason_code": "hard_blocker",
-                    "reason": "All enabled profiles have explicit hard blockers.",
+                    "reason": "The classified role has explicit hard blockers.",
                     "blockers": blockers, "source_hash": source_hash(record),
                 }
                 stats["prefilter_local_skipped"] += 1
@@ -254,71 +276,84 @@ class JobIntakePipeline:
                 record.annotation["prefilter"] = route
             for name, value in self.annotator.stats.items():
                 stats["annotation_" + name] += value - before[name]
-            for stream, engine, item in zip(self.streams, engines, local_items, strict=True):
-                apply_annotation_constraints(record, item.evaluation, engine)
-                item.profile_id, item.profile_name = stream.id, stream.name
-                item.profile_version, item.profile_context = stream.version, stream.context
-                stream.scorer.score(
-                    record.source,
-                    record.company,
-                    record.title,
-                    role_description(record),
-                    item.evaluation,
-                )
-                if suppressed and item.evaluation.decision != FilterDecision.REJECT:
-                    # Retain the source and CRM linkage; a routing verdict isn't an
-                    # independently reviewed final rejection or a hiring fact.
+            item = local_item
+            apply_annotation_constraints(record, item.evaluation, engine)
+            item.profile_id, item.profile_name = stream.id, stream.name
+            item.profile_version, item.profile_context = stream.version, stream.context
+            item.role_classification = classification
+            if stream.id == "other":
+                # No relevance estimate against an unrelated occupation.
+                item.evaluation.fit_score = item.evaluation.deterministic_score = 0.0
+                item.evaluation.bridge_role = False
+                item.evaluation.fit_reason = classification["reason"]
+                if item.evaluation.decision != FilterDecision.REJECT:
                     item.evaluation.decision = FilterDecision.REVIEW
-                    item.evaluation.risks = sorted(set(
-                        item.evaluation.risks + ["prefilter:" + route["reason_code"]]
-                    ))
-                    item.evaluation.bridge_role = False
-                    item.evaluation.fit_score = 0.0
-                    item.evaluation.deterministic_score = 0.0
-                    item.evaluation.fit_reason = "Preliminary filter: " + route["reason_code"]
-                    item.evaluation.audit_log.append(
-                        "Independent preliminary checks agree on a mismatch; "
-                        "full AI review skipped. Source retained for manual review."
-                    )
-                if (
-                    use_llm
-                    and self.config.llm.enabled
-                    and not suppressed
-                    and not (self.config.annotation.enabled and self.config.annotation.ai_enabled)
-                    and item.evaluation.decision != FilterDecision.REJECT
-                ):
-                    key = self._cache_key(record, stream)
-                    keys[stream.id] = key
-                    cached = cached_evaluations.get(stream.id)
-                    if (
-                        cached is not None
-                        and cached.semantic_score is not None
-                        and cached.llm_cache_key == key
-                    ):
-                        item.evaluation.semantic_score = cached.semantic_score
-                        item.evaluation.fit_score += cached.semantic_score
-                        item.evaluation.bridge_role |= cached.bridge_role
-                        item.evaluation.fit_reason = cached.fit_reason
-                        item.evaluation.risks = sorted(set(item.evaluation.risks + cached.risks))
-                        item.evaluation.audit_log.append("Semantic score reused for this profile.")
-                        stats["llm_cache_hits"] += 1
-                    elif self.config.llm.skip_high_confidence and should_skip_llm(
-                        item.evaluation,
-                        stream.scoring.threshold_a,
-                        stream.scoring.threshold_b,
-                        self.config.llm.high_confidence_margin,
-                    ):
-                        stats["llm_skipped"] += 1
-                        item.evaluation.audit_log.append("LLM skipped: deterministic confidence.")
-                    elif self.batch_reranker is not None:
-                        pending.append(item)
-                    else:
-                        if os.getenv(self.config.llm.api_key_env):
-                            stats["llm_calls"] += 1
-                        item = self.reranker.rerank(item)
-                else:
-                    item.evaluation.audit_log.append("Deterministic evaluation; no AI request.")
+                item.evaluation.risks.append("role_classification:needs_review")
+                item.evaluation.audit_log.append("Outside role taxonomy; relevance unscored.")
                 items.append(item)
+                self._finalize(items)
+                return items, keys, pending
+            stream.scorer.score(
+                record.source,
+                record.company,
+                record.title,
+                role_description(record),
+                item.evaluation,
+            )
+            if suppressed and item.evaluation.decision != FilterDecision.REJECT:
+                # Retain the source and CRM linkage; a routing verdict isn't an
+                # independently reviewed final rejection or a hiring fact.
+                item.evaluation.decision = FilterDecision.REVIEW
+                item.evaluation.risks = sorted(set(
+                    item.evaluation.risks + ["prefilter:" + route["reason_code"]]
+                ))
+                item.evaluation.bridge_role = False
+                item.evaluation.fit_score = 0.0
+                item.evaluation.deterministic_score = 0.0
+                item.evaluation.fit_reason = "Preliminary filter: " + route["reason_code"]
+                item.evaluation.audit_log.append(
+                    "Independent preliminary checks agree on a mismatch; "
+                    "full AI review skipped. Source retained for manual review."
+                )
+            if (
+                use_llm
+                and self.config.llm.enabled
+                and not suppressed
+                and not (self.config.annotation.enabled and self.config.annotation.ai_enabled)
+                and item.evaluation.decision != FilterDecision.REJECT
+            ):
+                key = self._cache_key(record, stream)
+                keys[stream.id] = key
+                cached = cached_evaluations.get(stream.id)
+                if (
+                    cached is not None
+                    and cached.semantic_score is not None
+                    and cached.llm_cache_key == key
+                ):
+                    item.evaluation.semantic_score = cached.semantic_score
+                    item.evaluation.fit_score += cached.semantic_score
+                    item.evaluation.bridge_role |= cached.bridge_role
+                    item.evaluation.fit_reason = cached.fit_reason
+                    item.evaluation.risks = sorted(set(item.evaluation.risks + cached.risks))
+                    item.evaluation.audit_log.append("Semantic score reused for this profile.")
+                    stats["llm_cache_hits"] += 1
+                elif self.config.llm.skip_high_confidence and should_skip_llm(
+                    item.evaluation,
+                    stream.scoring.threshold_a,
+                    stream.scoring.threshold_b,
+                    self.config.llm.high_confidence_margin,
+                ):
+                    stats["llm_skipped"] += 1
+                    item.evaluation.audit_log.append("LLM skipped: deterministic confidence.")
+                elif self.batch_reranker is not None:
+                    pending.append(item)
+                else:
+                    if os.getenv(self.config.llm.api_key_env):
+                        stats["llm_calls"] += 1
+                    item = self.reranker.rerank(item)
+            else:
+                item.evaluation.audit_log.append("Deterministic evaluation; no AI request.")
+            items.append(item)
         self._finalize(items)
         return items, keys, pending
 
@@ -369,6 +404,7 @@ class JobIntakePipeline:
                             p.profile_id == job.best_profile_id
                             and p.profile_version == self.profile_versions[p.profile_id]
                             and p.content_hash == job.content_hash
+                            and classification_is_current(job, p)
                             for p in job.profile_evaluations
                         )
                     ):
@@ -409,8 +445,10 @@ class JobIntakePipeline:
             raise ValueError("Use either selected job UIDs or limit, not both")
         previous_progress = self.annotator.progress
         previous_prefilter_progress = self.prefilter.progress
+        previous_classifier_progress = self.classifier.client.progress
         self.annotator.set_progress(progress)
         self.prefilter.set_progress(progress)
+        self.classifier.client.progress = progress
         started = time.monotonic()
         emit_progress(progress, "run_start")
         try:
@@ -427,6 +465,7 @@ class JobIntakePipeline:
         finally:
             self.annotator.set_progress(previous_progress)
             self.prefilter.set_progress(previous_prefilter_progress)
+            self.classifier.client.progress = previous_classifier_progress
 
     def _reevaluate_saved(
         self, *, use_ai: bool, limit: int | None, progress: ProgressCallback | None,

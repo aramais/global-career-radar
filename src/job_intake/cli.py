@@ -15,7 +15,6 @@ from job_intake.annotation.eval_runner import (
     run_evaluation,
     sqlite_path,
     write_report,
-    write_text_report,
 )
 from job_intake.annotation.progress import AnnotationProgressReporter
 from job_intake.config.settings import (
@@ -30,7 +29,9 @@ from job_intake.pipeline import JobIntakePipeline, build_pipeline
 from job_intake.profiles import load_streams
 from job_intake.storage.repository import validate_job_uids
 
-app = typer.Typer(add_completion=False, help="Personal multi-profile job search")
+app = typer.Typer(
+    add_completion=False, help="Personal job search with one role label and relevance score",
+)
 app.add_typer(crm_app, name="crm")
 eval_app = typer.Typer(no_args_is_help=False, help="Read-only integrity and accuracy evaluation")
 gold_app = typer.Typer(help="Prepare and validate human vacancy labels without API calls")
@@ -70,6 +71,9 @@ def run(config: str = typer.Option("config/settings.yaml", help="Path to app con
         f"evaluations={result['evaluations']} alerts={result['alerts']} "
         f"source_errors={result['source_errors']} record_errors={result['record_errors']} "
         f"annotation_errors={result['annotation_errors']} "
+        f"classification_calls={result.get('classification_calls', 0)} "
+        f"classification_cache_hits={result.get('classification_cache_hits', 0)} "
+        f"classification_errors={result.get('classification_errors', 0)} "
         f"prefilter_screen_calls={result.get('prefilter_screen_calls', 0)} "
         f"prefilter_verify_calls={result.get('prefilter_verify_calls', 0)} "
         f"prefilter_cache_hits={result.get('prefilter_cache_hits', 0)} "
@@ -85,6 +89,7 @@ def run(config: str = typer.Option("config/settings.yaml", help="Path to app con
     if (
         result["source_errors"] or result["record_errors"] or result["alert_errors"]
         or result["annotation_errors"] or result.get("prefilter_errors")
+        or result.get("classification_errors")
         or result.get("llm_batch_pending") or result.get("llm_batch_errors")
     ):
         raise typer.Exit(code=1)
@@ -110,7 +115,7 @@ def import_email(
     config: str = typer.Option("config/settings.yaml", help="App config YAML"),
     max_messages: int = typer.Option(100, min=1, max=1000, help="Maximum messages per import"),
 ) -> None:
-    """Import selected job emails offline and evaluate them in all enabled profiles."""
+    """Import selected job emails offline, classify each role, then score relevance."""
     _import_email_source(
         SourceDefinition(
             name="email-vacancies",
@@ -131,7 +136,7 @@ def import_gmail(
     ],
     config: str = typer.Option("config/settings.yaml", help="App config YAML"),
 ) -> None:
-    """Import a Gmail connector snapshot offline into all enabled search profiles."""
+    """Import a Gmail snapshot offline, classify each role, then score relevance."""
     _import_email_source(
         SourceDefinition(
             name="email-vacancies",
@@ -154,11 +159,12 @@ def _import_email_source(source: SourceDefinition, config: str) -> None:
     typer.echo(
         f"Email import completed: ingested={result['ingested']} persisted={result['persisted']} "
         f"evaluations={result['evaluations']} source_errors={result['source_errors']} "
-        f"record_errors={result['record_errors']}"
+        f"record_errors={result['record_errors']} "
+        f"classification_errors={result.get('classification_errors', 0)}"
     )
     for error in result["errors"]:
         typer.echo(error, err=True)
-    if result["source_errors"] or result["record_errors"]:
+    if result["source_errors"] or result["record_errors"] or result.get("classification_errors"):
         raise typer.Exit(code=1)
 
 
@@ -167,13 +173,19 @@ def reevaluate(config: str = typer.Option("config/settings.yaml", help="App conf
     """Re-score saved vacancies offline without fetching, AI calls or notifications."""
     result = build_pipeline(config).reevaluate_saved()
     typer.echo(
-        f"Reevaluated {result['persisted']} jobs, {result['evaluations']} profile evaluations. "
+        f"Reevaluated {result['persisted']} jobs, {result['evaluations']} relevance evaluations. "
+        f"classification_calls={result.get('classification_calls', 0)} "
+        f"classification_cache_hits={result.get('classification_cache_hits', 0)} "
+        f"classification_errors={result.get('classification_errors', 0)} "
         f"llm_batch_pending={result.get('llm_batch_pending', 0)} "
         f"llm_batch_errors={result.get('llm_batch_errors', 0)}"
     )
     for error in result["errors"]:
         typer.echo(error, err=True)
-    if result["record_errors"] or result.get("llm_batch_pending") or result.get("llm_batch_errors"):
+    if (
+        result["record_errors"] or result.get("classification_errors")
+        or result.get("llm_batch_pending") or result.get("llm_batch_errors")
+    ):
         raise typer.Exit(code=1)
 
 
@@ -210,7 +222,7 @@ def annotate(
         None, min=256, help="Review-only output budget, including model thinking",
     ),
 ) -> None:
-    """Annotate saved source texts and rescore profiles, without fetching or sending alerts."""
+    """Annotate source texts and score their selected role, without fetching or alerts."""
     try:
         selected_uids = validate_job_uids(job_uid)
         if selected_uids is not None and limit is not None:
@@ -335,7 +347,10 @@ def annotate(
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(
-        f"Annotated {result['persisted']} jobs, {result['evaluations']} profile evaluations. "
+        f"Annotated {result['persisted']} jobs, {result['evaluations']} relevance evaluations. "
+        f"classification_calls={result.get('classification_calls', 0)} "
+        f"classification_cache_hits={result.get('classification_cache_hits', 0)} "
+        f"classification_errors={result.get('classification_errors', 0)} "
         f"Extraction calls={result['annotation_extraction_calls']}, "
         f"review calls={result['annotation_review_calls']}, "
         f"cache hits={result['annotation_cache_hits']}, errors={result['annotation_errors']}. "
@@ -353,6 +368,7 @@ def annotate(
         typer.echo(error, err=True)
     if (
         result["record_errors"] or result["annotation_errors"] or result.get("prefilter_errors")
+        or result.get("classification_errors")
         or result.get("llm_batch_pending") or result.get("llm_batch_errors")
     ):
         raise typer.Exit(code=1)
@@ -481,7 +497,7 @@ def _eval_destinations(outputs: list[Path], protected: list[Path]) -> None:
 def gold_sample(
     config: str = typer.Option("config/settings.yaml", help="App config YAML"),
     out: Annotated[Path, typer.Option(help="Blind JSONL")] = Path(
-        "data/local/gold/vacancy-tags-v1.jsonl"
+        "data/local/gold/vacancy-tags-v2.jsonl"
     ),
     seed: int = typer.Option(20261013, help="Reproducible random sampling seed"),
     strata: Annotated[
@@ -493,20 +509,22 @@ def gold_sample(
 ) -> None:
     """Prepare unlabeled source snapshots and a separate sampling manifest, read-only."""
     from job_intake.annotation.gold import sample_gold
+    from job_intake.annotation.gold_workbook import ensure_new_outputs, write_new_text
 
     try:
         settings = load_app_config(config)
         manifest_path = out.with_suffix(".manifest.json")
         protected = _eval_inputs(settings, config, strata)
         _eval_destinations([out, manifest_path], protected)
+        ensure_new_outputs([out, manifest_path])
         counts = load_yaml_mapping(strata) if strata else None
         cases, manifest = sample_gold(
             settings, seed=seed, strata=counts, include_saved_rejects=include_saved_rejects,
         )
         content = "".join(json.dumps(case, ensure_ascii=False, allow_nan=False) + "\n"
                           for case in cases)
-        write_text_report(content, out, protected_paths=protected)
-        write_report(manifest, manifest_path, protected_paths=protected)
+        write_new_text(content, out)
+        write_new_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", manifest_path)
     except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(f"Sample: {len(cases)} unlabeled vacancies. API calls=0; database=read-only.")
@@ -517,7 +535,7 @@ def gold_sample(
 def gold_validate(
     config: str = typer.Option("config/settings.yaml", help="App config YAML"),
     gold: Annotated[Path, typer.Option(help="Gold JSONL")] = Path(
-        "data/local/gold/vacancy-tags-v1.jsonl"
+        "data/local/gold/vacancy-tags-v2.jsonl"
     ),
     output: Annotated[Path, typer.Option()] = Path("data/local/eval/gold-validation.json"),
 ) -> None:
@@ -550,6 +568,123 @@ def gold_validate(
     typer.echo(f"Report: {output.resolve()}")
     if not report["valid"]:
         raise typer.Exit(code=1)
+
+
+@gold_app.command("migrate")
+def gold_migrate(
+    source: Annotated[Path, typer.Option(help="Unanswered v1 JSONL to preserve")],
+    out: Annotated[Path, typer.Option(help="New v2 JSONL; existing paths are refused")],
+    config: str = typer.Option("config/settings.yaml", help="App config YAML"),
+) -> None:
+    """Migrate an unanswered v1 cohort without selecting or inventing human labels."""
+    from job_intake.annotation.benchmark import read_jsonl
+    from job_intake.annotation.gold_workbook import (
+        configured_roles,
+        ensure_new_outputs,
+        jsonl_content,
+        migrate_unlabeled_v1,
+        migration_companion_paths,
+        migration_companions,
+        validate_current_cases,
+        write_new_text,
+    )
+
+    try:
+        settings = load_app_config(config)
+        destinations = [out, *migration_companion_paths(out)]
+        protected = _eval_inputs(settings, config, source, *migration_companion_paths(source))
+        _eval_destinations(destinations, protected)
+        ensure_new_outputs(destinations)
+        cases = migrate_unlabeled_v1(read_jsonl(source))
+        validate_current_cases(settings, cases, configured_roles(settings))
+        companions = migration_companions(source, out, cases)
+        write_new_text(jsonl_content(cases), out)
+        for path, content in companions.items():
+            write_new_text(content, path)
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Migrated {len(cases)} unanswered cases; source preserved. "
+               "API calls=0; database=read-only.")
+    typer.echo(f"Gold v2: {out.resolve()}")
+    typer.echo("Migration provenance and blind reading: " + "; ".join(
+        str(path.resolve()) for path in companions
+    ))
+
+
+@gold_app.command("workbook-data")
+def gold_workbook_data(
+    gold: Annotated[Path, typer.Option(help="Canonical v2 JSONL")],
+    out: Annotated[Path, typer.Option(help="New JSON input for the workbook builder")],
+    selection_xlsx: Annotated[
+        Path | None, typer.Option(help="Existing workbook defining selected IDs and their order")
+    ] = None,
+    config: str = typer.Option("config/settings.yaml", help="App config YAML"),
+) -> None:
+    """Export source snapshots and human fields for an XLSX, without predictions."""
+    from job_intake.annotation.benchmark import read_jsonl
+    from job_intake.annotation.gold_workbook import (
+        configured_roles,
+        ensure_new_outputs,
+        validate_current_cases,
+        workbook_data,
+        write_new_text,
+    )
+
+    try:
+        settings = load_app_config(config)
+        _eval_destinations([out], _eval_inputs(settings, config, gold, selection_xlsx))
+        ensure_new_outputs([out])
+        cases = read_jsonl(gold)
+        roles = configured_roles(settings)
+        validate_current_cases(settings, cases, roles)
+        payload = workbook_data(cases, roles, selection_xlsx=selection_xlsx)
+        write_new_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", out)
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Workbook data: {len(payload['cases'])} cases; {out.resolve()}. "
+               "API calls=0; database=read-only.")
+
+
+@gold_app.command("import-xlsx")
+def gold_import_xlsx(
+    workbook: Annotated[Path, typer.Option(help="Completed v2 XLSX labeling workbook")],
+    gold: Annotated[Path, typer.Option(help="Canonical v2 JSONL to preserve")],
+    out: Annotated[Path, typer.Option(help="New merged JSONL; never overwrites inputs")],
+    method: Annotated[
+        str | None, typer.Option(help="Explicit human provenance: blind or assisted")
+    ] = None,
+    labeled_at: Annotated[
+        str | None, typer.Option(help="Explicit human label ISO date or RFC3339 timestamp")
+    ] = None,
+    config: str = typer.Option("config/settings.yaml", help="App config YAML"),
+) -> None:
+    """Import human answers by stable ID and source hash, preserving blank cells."""
+    from job_intake.annotation.benchmark import read_jsonl
+    from job_intake.annotation.gold_workbook import (
+        configured_roles,
+        ensure_new_outputs,
+        import_workbook,
+        jsonl_content,
+        validate_current_cases,
+        write_new_text,
+    )
+
+    try:
+        settings = load_app_config(config)
+        _eval_destinations([out], _eval_inputs(settings, config, gold, workbook))
+        ensure_new_outputs([out])
+        cases = read_jsonl(gold)
+        roles = configured_roles(settings)
+        validate_current_cases(settings, cases, roles)
+        result, changed = import_workbook(cases, workbook, roles,
+                                          method=method, labeled_at=labeled_at)
+        validate_current_cases(settings, result, roles)
+        write_new_text(jsonl_content(result), out)
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Imported answers for {changed} cases; preserved cohort={len(result)}. "
+               "API calls=0; database=read-only.")
+    typer.echo(f"Merged gold: {out.resolve()}")
 
 
 @eval_app.command("accuracy")
