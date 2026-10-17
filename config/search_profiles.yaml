@@ -2,14 +2,17 @@
 # Canon: ../aramais-vault/codex/projects/career-orientation/codex/00_INDEX.md
 # Stable IDs retain evaluation/CRM links. Changes invalidate saved profile versions.
 # Weights are operational ranking heuristics, not estimates of user skill or hiring odds.
-# Reuse the existing 3-point content weight and A/B thresholds; title alone is insufficient.
+# Reuse the existing 3-point content weight; title alone is insufficient for A.
 defaults:
+  # User confirmed 2026-10-17: A/B/C describe role fit; hiring is a separate decision.
+  scoring_policy: role_fit_v1
   company_priority: []
   source_weights:
     dailyremote-bridge: 1.0
     company-watchlist: 1.0
   bucket_c_signals: []
-  threshold_a: 14
+  # Calibrated on the first 30 gold cases after the role-fit score scale changed.
+  threshold_a: 19
   threshold_b: 6
   description_weights: &decision_weights
     pricing: 3
@@ -29,6 +32,8 @@ defaults:
     budget planning: 3
     commercial strategy: 3
     marketplace economics: 2
+    # Required project/people responsibility, grounded in actual duties, not title alone.
+    project leadership: 3
     two-sided marketplace: 2
     classifieds: 2
   bucket_a_signals: [pricing, monetization, experimentation, causal inference, decision science, decision support, strategic decisions, business decisions, unit economics, p&l, profit and loss, general manager]

@@ -47,7 +47,7 @@ def _evaluate(stream: SearchStream, record: JobRecord):
     item.profile_context = stream.context
     stream.scorer.score(
         record.source, record.company, record.title,
-        record.description_clean or record.description_raw, item.evaluation,
+        record.description_clean or record.description_raw, item.evaluation, record=record,
     )
     return finalize_tier(item, stream.scoring.threshold_a, stream.scoring.threshold_b)
 
@@ -80,7 +80,7 @@ def test_all_four_real_streams_share_broad_personal_constraints(streams) -> None
         ),
         (
             "business-analytics", "Business Analyst Manager",
-            "Lead decision support, budget planning and forecasting with Finance.",
+            "Lead decision support projects, budget planning and forecasting with Finance.",
         ),
         (
             "data-science-management", "Data Science Manager",
@@ -229,8 +229,9 @@ def test_confirmed_other_working_language_rejects_in_every_stream(streams) -> No
         item = _evaluate(stream, record)
         assert item.evaluation.decision == FilterDecision.REJECT
         assert "language:working_language:Portuguese" in item.evaluation.blocker_signals
-        assert item.evaluation.tier == JobTier.C
-        assert item.evaluation.fit_score == 0
+        same_role = _evaluate(stream, _job())
+        assert item.evaluation.fit_score == same_role.evaluation.fit_score
+        assert item.evaluation.tier == same_role.evaluation.tier
 
 
 def test_unknown_english_language_stays_reviewable_with_real_rules(streams) -> None:
@@ -240,7 +241,11 @@ def test_unknown_english_language_stays_reviewable_with_real_rules(streams) -> N
     assert all("language:working_language_unconfirmed" in item.evaluation.risks for item in items)
     product = next(item for item in items if item.profile_id == "product-management")
     assert product.evaluation.fit_score > 0
-    assert product.evaluation.tier == JobTier.B
+    passing = _evaluate(
+        next(stream for stream in streams if stream.id == "product-management"), _job(),
+    )
+    assert product.evaluation.fit_score == passing.evaluation.fit_score
+    assert product.evaluation.tier == passing.evaluation.tier
 
 
 @pytest.mark.parametrize("country", ["Brazil", "Brasil", "BR"])
@@ -288,7 +293,11 @@ def test_explicit_foreign_constraints_reject_in_every_stream(streams, requiremen
         item = _evaluate(stream, record)
         assert item.evaluation.decision == FilterDecision.REJECT
         assert item.evaluation.tier == JobTier.C
-        assert item.evaluation.fit_score == 0
+        same_role = _evaluate(stream, _job(
+            location_text="Worldwide", remote_text="Global remote",
+            description_clean="Contractor in an async distributed team.",
+        ))
+        assert item.evaluation.fit_score == same_role.evaluation.fit_score
 
 
 def test_explicit_other_office_city_is_rejected_in_every_stream(streams) -> None:

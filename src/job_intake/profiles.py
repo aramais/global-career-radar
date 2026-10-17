@@ -12,7 +12,7 @@ from job_intake.filtering import FilterRules, RuleEngine
 from job_intake.scoring.pre_score import DeterministicScorer, SearchProfiles
 from job_intake.utils.text import stable_hash
 
-ROLE_POLICY_VERSION = "role-first-v1"
+ROLE_POLICY_VERSION = "role-first-v2-title-occupations"
 
 
 @dataclass(slots=True)
@@ -31,7 +31,7 @@ class SearchStream:
 
     @property
     def scorer(self) -> DeterministicScorer:
-        return DeterministicScorer(self.scoring)
+        return DeterministicScorer(self.scoring, role_id=self.id)
 
 
 def load_streams(rules: dict[str, Any], config: dict[str, Any]) -> list[SearchStream]:

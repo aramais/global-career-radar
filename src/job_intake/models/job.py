@@ -65,6 +65,9 @@ class JobEvaluation:
     tier: JobTier = JobTier.C
     risks: list[str] = field(default_factory=list)
     audit_log: list[str] = field(default_factory=list)
+    # Relevance policy is independent of the separately persisted hiring decision.
+    fit_policy: str = "legacy"
+    fit_max_tier: JobTier | None = None
 
 
 @dataclass(slots=True)

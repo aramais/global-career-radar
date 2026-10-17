@@ -29,11 +29,14 @@ def serve(
     config: str = typer.Option("config/settings.yaml", help="Настройки проекта"),
     port: int = typer.Option(8765, min=1, max=65535, help="Локальный порт"),
     database: Annotated[Path | None, typer.Option(help="Отдельная локальная SQLite-база")] = None,
+    gold: Annotated[
+        Path | None, typer.Option(help="Gold JSONL для веб-разметки (по умолчанию рядом с базой)")
+    ] = None,
 ) -> None:
     """Открыть редактируемую CRM на http://127.0.0.1:8765."""
     settings = _config(config, database)
     typer.echo(f"CRM: http://127.0.0.1:{port} — Ctrl+C для остановки")
-    serve_crm(settings, port=port)
+    serve_crm(settings, port=port, gold_path=gold)
 
 
 @app.command("import-xlsx")

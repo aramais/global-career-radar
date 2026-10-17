@@ -10,7 +10,7 @@ from sqlalchemy.orm import aliased, selectinload
 
 from job_intake.alerts.digest import DigestJob
 from job_intake.annotation.text import source_hash
-from job_intake.models.job import EvaluatedJob, JobRecord, JobTier
+from job_intake.models.job import EvaluatedJob, FilterDecision, JobRecord, JobTier
 from job_intake.storage.dedup import JobDeduplicator
 from job_intake.storage.models import (
     AlertOutboxORM,
@@ -139,7 +139,8 @@ class JobRepository:
                 is_new=True,
                 changed=True,
                 tier_changed=True,
-                should_alert=item.evaluation.tier == JobTier.A,
+                should_alert=(item.evaluation.tier == JobTier.A
+                              and item.evaluation.decision != FilterDecision.REJECT),
             )
 
         previous_tier = existing.tier
@@ -199,9 +200,11 @@ class JobRepository:
                     },
                 )
             )
-        if tier_changed and item.evaluation.tier == JobTier.A and existing.archived_at is None:
+        alert_eligible = (existing.archived_at is None and item.evaluation.tier == JobTier.A
+                          and item.evaluation.decision != FilterDecision.REJECT)
+        if tier_changed and alert_eligible:
             existing.alert_pending = True
-        should_alert = existing.archived_at is None and item.evaluation.tier == JobTier.A and (
+        should_alert = alert_eligible and (
             existing.last_alerted_tier != JobTier.A.value or existing.alert_pending
         )
         if should_alert and not self._dedup_window_elapsed(existing.last_alerted_at, now):

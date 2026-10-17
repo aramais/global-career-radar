@@ -119,6 +119,37 @@ def test_single_classified_role_and_source_failure_preserve_committed_job(tmp_pa
         assert job.best_profile_id == "product"
 
 
+def test_role_fit_a_and_hiring_reject_are_saved_separately_without_alerts(tmp_path, monkeypatch):
+    config = _config(tmp_path, telegram=True)
+    data = yaml.safe_load(config.search_profiles_path.read_text())
+    data["streams"][0]["scoring"].update({
+        "scoring_policy": "role_fit_v1",
+        "description_weights": {"project leadership": 3, "experimentation": 3},
+        "bucket_a_signals": ["experimentation"],
+    })
+    config.search_profiles_path.write_text(yaml.safe_dump(data))
+    record = _record(
+        "Responsibilities:\nLead pricing analytics projects and manage a team. "
+        "Design experiments to inform business decisions. German is the working language."
+    )
+    record.source_metadata["working_language"] = "German"
+    _sources(monkeypatch, record, fail_second=False)
+    pipeline = JobIntakePipeline(config)
+    sent = []
+    pipeline.telegram.send = lambda message: sent.append(message) or True
+
+    result = pipeline.run()
+
+    assert result["alerts"] == 0
+    assert not sent
+    with pipeline.database.session() as session:
+        job = session.scalar(select(JobORM))
+        assert job.tier == "A"
+        assert job.filter_decision == "reject"
+        assert job.fit_score >= 6
+        assert session.scalar(select(func.count()).select_from(AlertOutboxORM)) == 0
+
+
 def test_reevaluate_new_criteria_and_disabled_winner_is_offline_and_preserves_dates(
     tmp_path, monkeypatch
 ):

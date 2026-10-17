@@ -20,6 +20,7 @@ from job_intake.annotation.text import (
 )
 from job_intake.config.settings import AnnotationConfig
 from job_intake.models.job import JobRecord
+from job_intake.occupation_titles import _title_matches, _title_text
 from job_intake.profiles import (
     SearchStream,
     role_taxonomy,
@@ -27,7 +28,7 @@ from job_intake.profiles import (
     with_other_stream,
 )
 from job_intake.storage.dedup import JobDeduplicator
-from job_intake.utils.text import matches_phrase, normalize_text, stable_hash
+from job_intake.utils.text import normalize_text, stable_hash
 
 
 def _duties(record: JobRecord) -> str:
@@ -57,23 +58,11 @@ class RoleClassifier:
         }, sort_keys=True)) if spec else None
         self.stats = {"calls": 0, "cache_hits": 0, "errors": 0}
 
+    def _title_matches(self, value: str) -> dict[str, list[str]]:
+        return _title_matches(value, self.taxonomy)
+
     def _local(self, record: JobRecord) -> tuple[str, str, str]:
-        title = normalize_text(record.title)
-        matches = {
-            row["id"]: [phrase for phrase in row["titles"] if matches_phrase(title, phrase)]
-            for row in self.taxonomy
-        }
-        original = {label: list(phrases) for label, phrases in matches.items()}
-        # Discard subsumed generic phrases, never compare relevance weights.
-        for label, phrases in original.items():
-            matches[label] = [
-                phrase for phrase in phrases if not any(
-                    normalize_text(phrase) != normalize_text(other)
-                    and matches_phrase(normalize_text(other), phrase)
-                    for other_label, others in original.items() if other_label != label
-                    for other in others
-                )
-            ]
+        matches = self._title_matches(record.title)
         found = [label for label, phrases in matches.items() if phrases]
         if len(found) == 1:
             return found[0], "title", "Advertised title: " + record.title
@@ -91,11 +80,11 @@ class RoleClassifier:
                     r"this (?:role|position) is (?:a|an)|^as (?:a|an|the))\s+([^.!?\n]+)",
                     unit["text"].strip(), re.I,
                 ))
-            declared = {
-                row["id"] for row in self.taxonomy
-                if any(asserted_phrase_hits(text.split(",", 1)[0], row["titles"])
-                       for text in declarations)
-            }
+            declared = set()
+            for text in declarations:
+                for label, phrases in self._title_matches(text.split(",", 1)[0]).items():
+                    if asserted_phrase_hits(_title_text(text), phrases):
+                        declared.add(label)
             if len(declared) == 1:
                 return declared.pop(), "duties", "Explicit role declaration in responsibilities."
         if len(self.taxonomy) == 1 and self.taxonomy[0]["id"] == "default":

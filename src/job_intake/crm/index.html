@@ -95,6 +95,17 @@ margin:7px 0;padding:6px 12px;border-left:3px solid #cbd9ea;color:var(--muted)}
 .annotation-focus-row:last-child{border-bottom:0}.annotation-focus-links{overflow-wrap:anywhere}
 .annotation-prefilter-evidence{padding:8px 0}.annotation-prefilter-evidence blockquote{
 white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0;padding-left:10px;border-left:3px solid var(--line)}
+.gold-controls{padding:18px;margin-bottom:15px}.gold-summary{display:flex;gap:12px;align-items:center;
+flex-wrap:wrap;margin-bottom:12px}.gold-progress{flex:1;min-width:140px;accent-color:var(--green);height:12px}
+.gold-filters{display:grid;grid-template-columns:2fr 1fr auto;gap:12px;align-items:end}.gold-message{
+white-space:pre-wrap;font-size:.86rem;line-height:1.5}.gold-message.error{color:var(--danger)}
+.gold-message.success{color:var(--green)}.gold-pagination{margin:12px 0}.gold-card{cursor:pointer}
+.gold-card:hover{border-color:#a9bed5}.gold-description{white-space:pre-wrap;overflow-wrap:anywhere;
+font-size:.88rem;line-height:1.65;max-height:65vh;overflow:auto;background:#f8fafc;
+border:1px solid var(--line);border-radius:8px;padding:16px}.gold-editor-grid{display:grid;
+grid-template-columns:minmax(0,1.35fr) minmax(270px,1fr);gap:24px}.gold-form label{margin-bottom:14px}
+.gold-nav{display:flex;gap:8px;justify-content:space-between;margin-top:18px;flex-wrap:wrap}
+.gold-saved-labels{margin-top:10px}.gold-editor-status{min-height:1.5em;margin:10px 0}
 @media(max-width:1050px){.filters{grid-template-columns:repeat(3,1fr)}
 .job-filter-grid{grid-template-columns:repeat(3,1fr)}.grid-cards{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:700px){.wrap{padding:18px 16px}.top{align-items:flex-start}.top .status{display:none}
@@ -103,6 +114,8 @@ h1{font-size:1.5rem}.metrics{grid-template-columns:repeat(2,1fr);gap:9px}.metric
 grid-column:1/-1}.filters button{width:100%}.detail-grid,.grid-cards{grid-template-columns:1fr}
 .job-controls{padding:12px}.job-filter-grid{grid-template-columns:repeat(2,1fr)}
 .job-filter-grid button{grid-column:1/-1}
+.gold-editor-grid{grid-template-columns:1fr}.gold-filters{grid-template-columns:1fr}
+.gold-description{max-height:45vh}
 .card{padding:14px}.card-head{gap:8px}.modal-shade{padding:12px 8px}.modal-header,.modal-body{
 padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-select{grid-template-columns:1fr}}
 </style>
@@ -130,6 +143,7 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
     <button class="tab" data-view="jobs">Найденные вакансии</button>
     <button class="tab" data-view="companies">Компании</button>
     <button class="tab" data-view="contacts">Контакты</button>
+    <button class="tab" data-view="gold">Разметка gold</button>
   </nav>
   <form class="panel filters" id="filters">
     <label class="search"><span>Поиск</span><input id="query" type="search"
@@ -178,6 +192,19 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
         Для метки other релевантность остаётся без балла до уточнения роли.</p>
     </details>
   </section>
+  <section class="panel gold-controls" id="goldControls" aria-label="Разметка gold" hidden>
+    <div class="gold-summary" id="goldSummary" aria-live="polite"></div>
+    <form class="gold-filters" id="goldFilters">
+      <label><span>Поиск по выборке</span><input id="goldQuery" type="search" placeholder="Компания или название вакансии"></label>
+      <label><span>Готовность разметки</span><select id="goldStatusFilter">
+        <option value="all">Все вакансии</option><option value="unlabeled">Без разметки</option>
+        <option value="partial">Частично размеченные</option><option value="complete">Решения заполнены</option></select></label>
+      <button type="submit">Найти</button>
+    </form>
+    <p id="goldMessage" class="gold-message" role="status" hidden></p>
+    <div class="row gold-pagination"><button type="button" id="previousGold">Предыдущая страница</button>
+      <span id="goldPageStatus" class="small muted"></span><button type="button" id="nextGold">Следующая страница</button></div>
+  </section>
   <section class="panel job-bulk" id="jobBulkActions" aria-label="Массовые действия с вакансиями" hidden>
     <label class="job-select"><input id="selectAllJobs" type="checkbox">
       <span id="selectAllJobsLabel">Выбрать все в списке</span></label>
@@ -201,7 +228,7 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
 <script>
 'use strict';
 let state = null;
-let view = 'applications';
+let view = typeof window !== 'undefined' && window.location?.hash === '#gold' ? 'gold' : 'applications';
 let activeId = null;
 let busy = false;
 let loading = false;
@@ -213,6 +240,13 @@ const jobDetails = new Map();
 let visibleJobs = [];
 let jobSelection = new Map();
 let priorFocus = null;
+let goldPage = null;
+let goldOffset = 0;
+let goldSequence = 0;
+let goldLoading = false;
+let goldEditor = null;
+let goldOpening = 0;
+let goldFilterTimer = null;
 const $ = (id) => document.getElementById(id);
 const defaults = {
   stages: [{value:'saved',label:'Сохранено'},{value:'contacted',label:'Связался с контактом'},
@@ -335,8 +369,10 @@ async function refresh(initial) {
     const latest = await api(initial ? '/api/state?include_jobs=false' : stateQuery());
     if (request !== refreshSequence) return;
     state = {...latest,jobs:state?.jobs || [],job_page:state?.job_page || latest.job_page};
-    if (initial) setupFilters();
+    if (initial) { setupFilters(); document.querySelectorAll('.tab').forEach((tab) =>
+      tab.classList.toggle('active',tab.dataset.view === view)); }
     if (view === 'jobs') await refreshJobs(false);
+    if (view === 'gold') await refreshGold(false);
     render(); $('saveStatus').textContent = 'Сохранено в локальной базе';
     $('createButton').disabled = false; $('importButton').disabled = false;
   } catch (error) { if (request === refreshSequence) showError(errorMessage(error)); }
@@ -648,24 +684,29 @@ function render() {
   if (!state) return;
   renderMetrics();
   const titles = {applications:'Отклики',actions:'Следующие шаги',jobs:'Найденные вакансии',
-    companies:'Компании',contacts:'Контакты'};
+    companies:'Компании',contacts:'Контакты',gold:'Разметка gold'};
   const notes = {
     applications:'Все этапы сохраняются в истории. Канал отклика и реферальный статус задаются отдельно.',
     actions:'Выберите конкретный следующий шаг: найти контакт, попросить рекомендацию, отправить отклик или подготовиться к интервью.',
     jobs:'Сохранённые вакансии из поиска. При добавлении в CRM выберите поток; низкая оценка не мешает откликнуться.',
     companies:'Ваш список компаний. Контакты и рекомендации помогают превратить широкий поиск в разговоры с командами.',
-    contacts:'Рекрутеры, рефералы и нанимающие менеджеры. Свяжите контакт с конкретным откликом в его карточке.'
+    contacts:'Рекрутеры, рефералы и нанимающие менеджеры. Свяжите контакт с конкретным откликом в его карточке.',
+    gold:'Оцените профессию, личную релевантность и условия найма независимо. Машинные оценки здесь скрыты.'
   };
   $('viewTitle').textContent = titles[view]; $('viewNote').textContent = notes[view];
   $('stageFilter').hidden = !['applications','actions'].includes(view);
   $('actionFilter').hidden = view !== 'actions';
   $('jobControls').hidden = view !== 'jobs';
-  $('createButton').hidden = view === 'actions' || view === 'jobs';
+  $('createButton').hidden = ['actions','jobs','gold'].includes(view);
+  $('filters').hidden = view === 'gold'; $('goldControls').hidden = view !== 'gold';
+  $('metrics').hidden = view === 'gold'; $('periodNote').parentElement.hidden = view === 'gold';
+  if (view === 'gold') $('channelPanel').hidden = true;
   $('createButton').textContent = view === 'companies' ? 'Добавить компанию'
     : view === 'contacts' ? 'Добавить контакт' : 'Добавить отклик';
   $('content').className = ['companies','contacts'].includes(view) ? 'grid-cards' : 'list';
   $('content').replaceChildren();
   if (view !== 'jobs') { visibleJobs = []; jobSelection.clear(); }
+  if (view === 'gold') { renderJobSelection(); renderGoldList(); return; }
   let records = [];
   if (view === 'applications' || view === 'actions') {
     records = currentApplications();
@@ -1037,9 +1078,12 @@ function showModal(title, subtitle) {
   $('modal').focus(); return body;
 }
 function closeModal() {
-  if (busy) return;
+  if (busy || (goldEditor && goldEditor.saving)) return false;
+  if (!discardGoldChanges()) return false;
+  goldEditor = null; goldOpening++;
   $('modalShade').hidden = true; activeId = null;
   if (priorFocus && priorFocus.isConnected) priorFocus.focus();
+  return true;
 }
 function formButtons(form, text) {
   const row = el('div',null,'form-actions'); const submit = el('button',text || 'Сохранить','primary');
@@ -1276,10 +1320,277 @@ function openImport() {
       previewButton.disabled = false; commitButton.disabled = false; }
   }); body.append(form);
 }
+function goldCaseStatus(item) {
+  return item.complete ? 'complete' : item.has_labels ? 'partial' : 'unlabeled';
+}
+function goldLabels(labels = {}) {
+  return {role_label:labels.role_label ?? null,relevance:labels.relevance ?? null,
+    gate_outcome:labels.gate_outcome ?? null,notes:labels.notes ?? ''};
+}
+function goldPayload(values, version) {
+  return {expected_version:version,role_label:values.role_label || null,
+    relevance:values.relevance === '' || values.relevance === null ? null : Number(values.relevance),
+    gate_outcome:values.gate_outcome || null,notes:values.notes ?? ''};
+}
+function goldFormValues(form) {
+  return Object.fromEntries(['role_label','relevance','gate_outcome','notes']
+    .map((name) => [name,form.elements.namedItem(name).value]));
+}
+function goldDescription(source) {
+  const raw = String(source.description_raw || '');
+  const structured = /<(?:p|div|h[1-6]|li|ul|ol|section|article)\b/i.test(raw);
+  const readable = raw.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi,'')
+    .replace(/<li\b[^>]*>/gi,'\n• ')
+    .replace(/<\/?(?:p|h[1-6]|section|article)\b[^>]*>/gi,'\n\n')
+    .replace(/<\/?(?:div|li|ul|ol|br)\b[^>]*>/gi,'\n')
+    .replace(/<[^>]*>/g,'').replace(/&(?:amp|lt|gt|quot|apos|nbsp);/g,(entity) =>
+      ({'&amp;':'&','&lt;':'<','&gt;':'>','&quot;':'"','&apos;':"'",'&nbsp;':' '})[entity])
+    .replace(/&#(x[0-9a-f]+|\d+);/gi,(entity,code) => {
+      const value = code[0].toLowerCase() === 'x' ? parseInt(code.slice(1),16) : Number(code);
+      return value > 0 && value <= 0x10ffff ? String.fromCodePoint(value) : entity;
+    }).replace(/\n[ \t]+/g,'\n').replace(/[ \t]+\n/g,'\n')
+    .replace(/•[ \t]*\n+[ \t]*/g,'• ').replace(/\n{3,}/g,'\n\n').trim();
+  // Structured source preserves headings and lists lost by flattened clean text.
+  if (structured && readable) return readable;
+  if (source.description_clean && String(source.description_clean).trim()) return String(source.description_clean);
+  return readable;
+}
+function goldQuery(offset = goldOffset) {
+  return '/api/gold?' + new URLSearchParams({status:$('goldStatusFilter').value || 'all',
+    q:$('goldQuery').value.trim(),offset:String(offset),limit:'100'}).toString();
+}
+function goldMessage(message, kind = '') {
+  $('goldMessage').textContent = message; $('goldMessage').hidden = !message;
+  $('goldMessage').className = 'gold-message ' + kind;
+}
+async function refreshGold(reset = true) {
+  if (reset && goldEditor && !closeModal()) return false;
+  if (reset) goldOffset = 0;
+  const request = ++goldSequence; goldLoading = true;
+  goldMessage('Загрузка выборки…'); renderGoldPagination();
+  try {
+    const page = await api(goldQuery());
+    if (request !== goldSequence) return false;
+    if (!page.cases.length && page.offset > 0 && page.total > 0) {
+      goldOffset = Math.floor((page.total - 1) / 100) * 100;
+      return await refreshGold(false);
+    }
+    goldPage = page; goldOffset = page.offset; goldMessage('');
+    if (view === 'gold') renderGoldList();
+    return true;
+  } catch (error) { if (request === goldSequence) goldMessage(errorMessage(error),'error'); return false; }
+  finally { if (request === goldSequence) { goldLoading = false; renderGoldPagination(); } }
+}
+function renderGoldPagination() {
+  $('previousGold').disabled = goldLoading || goldOffset === 0;
+  $('nextGold').disabled = goldLoading || !goldPage?.has_more;
+  const count = goldPage?.cases.length || 0, total = goldPage?.total || 0;
+  $('goldPageStatus').textContent = goldPage ? (count ? (goldPage.offset + 1) + '–' +
+    (goldPage.offset + count) : '0') + ' из ' + total : '';
+}
+function renderGoldList() {
+  if (view !== 'gold') return;
+  const summary = $('goldSummary'); summary.replaceChildren();
+  const stats = goldPage?.stats;
+  if (stats) {
+    summary.append(el('strong','Решения заполнены: ' + stats.labeled + ' из ' + stats.total));
+    const progress = el('progress',null,'gold-progress'); progress.max = stats.total || 1;
+    progress.value = stats.labeled || 0; progress.setAttribute('aria-label','Вакансии с тремя заполненными решениями');
+    summary.append(progress,el('span','Частично: ' + stats.partial + ' · Без разметки: ' + stats.unlabeled,'small muted'),
+      el('span','Оценка 2–3: ' + stats.relevant + ' · Оценка 3: ' + stats.strong,'small muted'));
+  }
+  $('content').replaceChildren();
+  const cases = goldPage?.cases || [];
+  $('itemCount').textContent = goldPage ? goldPage.total + ' вакансий в выборке' : '';
+  cases.forEach((item) => {
+    const card = el('article',null,'card gold-card'); card.dataset.goldUid = item.job_uid;
+    const head = el('div',null,'card-head'); const title = el('div');
+    title.append(el('h3',item.title || 'Название не указано'),el('p',item.company || 'Компания не указана','card-company'));
+    head.append(title,button('Разметить',() => openGold(item.job_uid),'inline-button'));
+    const status = goldCaseStatus(item), tags = el('div',null,'tags');
+    tags.append(badge({complete:'Решения заполнены',partial:'Частично',unlabeled:'Без разметки'}[status],
+      status === 'complete' ? 'green' : status === 'partial' ? 'amber' : ''));
+    if (item.relevance !== null && item.relevance !== undefined) tags.append(badge('Ваша релевантность: ' + item.relevance,'blue'));
+    if (item.role_label) tags.append(badge((goldPage.profiles || []).find((profile) => profile.value === item.role_label)?.label || item.role_label));
+    card.append(head,tags);
+    if (item.notes) card.append(el('p',item.notes,'card-notes'));
+    card.addEventListener('click',(event) => { if (!event.target.closest('button,a')) openGold(item.job_uid); });
+    $('content').append(card);
+  });
+  if (!cases.length) {
+    const empty = el('div',null,'empty'); empty.append(el('h3',goldPage ? 'Вакансий по этим фильтрам нет' : 'Выборка загружается'),
+      el('p',goldPage ? 'Выберите другую готовность разметки или измените поисковый запрос.' : 'Подождите загрузки локальной выборки.'));
+    $('content').append(empty);
+  }
+  renderGoldPagination(); updateGoldNavigation();
+}
+function goldIsDirty() {
+  return Boolean(goldEditor?.form && JSON.stringify(goldLabels(goldPayload(goldFormValues(goldEditor.form),'')))
+    !== JSON.stringify(goldEditor.savedLabels));
+}
+function discardGoldChanges() {
+  return !goldIsDirty() || window.confirm('Есть несохранённая разметка. Отменить изменения и продолжить?');
+}
+async function openGold(uid, discardConfirmed = false) {
+  if (goldEditor?.saving || (!discardConfirmed && !discardGoldChanges())) return false;
+  const request = ++goldOpening;
+  goldMessage('Загрузка вакансии…');
+  try {
+    const detail = await api('/api/gold/' + encodeURIComponent(uid));
+    if (request !== goldOpening || view !== 'gold') return false;
+    goldMessage(''); renderGoldEditor(detail); return true;
+  } catch (error) { if (request === goldOpening) goldMessage(errorMessage(error),'error'); return false; }
+}
+function goldEditorMessage(message, kind = '') {
+  if (!goldEditor?.message) return;
+  goldEditor.message.textContent = message;
+  goldEditor.message.className = 'gold-message gold-editor-status ' + kind;
+}
+function renderGoldEditor(detail, message = '') {
+  activeId = null;
+  goldEditor = {detail,savedLabels:goldLabels(detail.labels),saving:false,form:null,message:null,
+    anchorIndex:(goldPage?.cases || []).findIndex((item) => item.job_uid === detail.job_uid),pageOffset:goldOffset};
+  const source = detail.source || {};
+  const body = showModal(source.title || 'Разметка вакансии',source.company || 'Компания не указана');
+  const layout = el('div',null,'gold-editor-grid'), original = el('section'), form = el('form',null,'gold-form');
+  form.setAttribute('aria-label','Ваша разметка вакансии');
+  original.append(sourceLink(source.original_url || source.apply_url,'Открыть исходную вакансию'));
+  const location = [source.location_text,source.remote_text].filter(Boolean).join(' · ');
+  if (location) original.append(el('p',location,'small muted'));
+  original.append(el('h3','Исходное описание'),el('div',goldDescription(source) || 'Текст источника недоступен. Откройте исходную ссылку.', 'gold-description'));
+  const roles = [{value:'',label:'Пока не размечено'},...(goldPage?.profiles || [])];
+  const labels = goldLabels(detail.labels);
+  if (labels.role_label && !roles.some((item) => item.value === labels.role_label)) roles.push({value:labels.role_label,label:labels.role_label});
+  form.append(field('Профессия',select(roles,labels.role_label || '','role_label')),
+    field('Личная релевантность',select([
+      {value:'',label:'Пока не размечено'}, {value:'0',label:'0 — Не подходит'},
+      {value:'1',label:'1 — Сомнительно, нужны уточнения'}, {value:'2',label:'2 — Стоит рассмотреть'},
+      {value:'3',label:'3 — Сильное совпадение'}],labels.relevance === null ? '' : String(labels.relevance),'relevance')),
+    field('Условия найма',select([{value:'',label:'Пока не размечено'},
+      {value:'eligible',label:'Подходят'}, {value:'ineligible',label:'Не подходят'},
+      {value:'unknown',label:'Неясно из описания'}],labels.gate_outcome || '','gate_outcome')),
+    field('Комментарий: что подходит или мешает',textArea(labels.notes,'notes')),
+    el('p','Релевантность — про саму роль. Ограничения по стране, языку и формату найма отмечайте отдельно. Можно сохранить часть полей.','help'));
+  const status = el('p',message,'gold-message gold-editor-status'); status.setAttribute('role','status');
+  const conflicts = el('div',null,'row'); conflicts.hidden = true;
+  const reload = button('Загрузить актуальную версию',() => openGold(detail.job_uid),'inline-button'); conflicts.append(reload);
+  const save = el('button','Сохранить','primary'); save.type = 'submit';
+  const saveNext = button('Сохранить и следующая',() => saveGold(true),'primary');
+  const actions = el('div',null,'row'); actions.append(save,saveNext);
+  const navigation = el('div',null,'gold-nav');
+  const index = (goldPage?.cases || []).findIndex((item) => item.job_uid === detail.job_uid);
+  const previous = button('← Предыдущая',() => moveGold(-1));
+  const next = button('Следующая →',() => moveGold(1));
+  previous.disabled = index <= 0 && goldOffset === 0;
+  next.disabled = index === (goldPage?.cases.length || 0) - 1 && !goldPage?.has_more;
+  navigation.append(previous,next,button('Закрыть',closeModal));
+  form.append(status,conflicts,actions,navigation);
+  const warnings = detail.warnings || [];
+  if (warnings.length) { const list = el('ul',null,'help'); warnings.forEach((warning) => list.append(el('li',warning))); original.append(list); }
+  if (!detail.can_save) {
+    save.disabled = true; saveNext.disabled = true;
+    status.textContent = 'Сохранение недоступно: проверьте замечания к источнику.'; status.classList.add('error');
+  }
+  layout.append(original,form); body.append(layout);
+  goldEditor.form = form; goldEditor.message = status; goldEditor.conflicts = conflicts;
+  goldEditor.saveButtons = [save,saveNext]; goldEditor.navButtons = [previous,next];
+  updateGoldNavigation();
+  form.addEventListener('submit',(event) => { event.preventDefault(); saveGold(false); });
+}
+function goldNeighborIndex(direction) {
+  const cases = goldPage?.cases || [];
+  const index = cases.findIndex((item) => item.job_uid === goldEditor?.detail.job_uid);
+  if (index >= 0) return index + direction;
+  if (goldEditor?.pageOffset === goldOffset && goldEditor.anchorIndex >= 0)
+    return goldEditor.anchorIndex + (direction < 0 ? -1 : 0);
+  return -1;
+}
+function updateGoldNavigation() {
+  if (!goldEditor?.navButtons) return;
+  const index = (goldPage?.cases || []).findIndex((item) => item.job_uid === goldEditor.detail.job_uid);
+  if (index >= 0) { goldEditor.anchorIndex = index; goldEditor.pageOffset = goldOffset; }
+  const cases = goldPage?.cases || [];
+  goldEditor.navButtons[0].disabled = goldEditor.saving || (!cases[goldNeighborIndex(-1)] && goldOffset === 0);
+  goldEditor.navButtons[1].disabled = goldEditor.saving || (!cases[goldNeighborIndex(1)] && !goldPage?.has_more);
+}
+async function goldNeighborUID(direction) {
+  const cases = goldPage?.cases || [];
+  const candidate = cases[goldNeighborIndex(direction)];
+  if (candidate) return {uid:candidate.job_uid,page:null};
+  const offset = goldOffset + direction * 100;
+  if (offset < 0 || (direction > 0 && !goldPage?.has_more)) return null;
+  const page = await api(goldQuery(offset));
+  const target = direction > 0 ? page.cases[0] : page.cases[page.cases.length - 1];
+  return target ? {uid:target.job_uid,page} : null;
+}
+async function moveGold(direction) {
+  if (!goldEditor || goldEditor.saving || !discardGoldChanges()) return;
+  try {
+    const next = await goldNeighborUID(direction);
+    if (!next) { goldEditorMessage('В этом направлении больше нет вакансий.'); return; }
+    if (await openGold(next.uid,true) && next.page) {
+      goldPage = next.page; goldOffset = next.page.offset; renderGoldList();
+    }
+  } catch (error) { goldEditorMessage(errorMessage(error),'error'); }
+}
+async function saveGold(andNext = false) {
+  const editor = goldEditor;
+  if (!editor || editor.saving || !editor.detail.can_save) return false;
+  const payload = goldPayload(goldFormValues(editor.form),editor.detail.version);
+  editor.saving = true;
+  editor.form.querySelectorAll('button,input,select,textarea').forEach((node) => node.disabled = true);
+  goldEditorMessage('Сохранение…'); editor.conflicts.hidden = true;
+  try {
+    let next = null, nextError = false;
+    if (andNext) { try { next = await goldNeighborUID(1); } catch (_) { nextError = true; } }
+    const result = await api('/api/gold/' + encodeURIComponent(editor.detail.job_uid),'PATCH',payload);
+    if (goldEditor !== editor) return false;
+    renderGoldEditor(result,'Разметка сохранена.'); goldEditor.message.classList.add('success');
+    await refreshGold(false);
+    if (andNext && next) {
+      // A saved row can leave the filter and shift the successor across a page boundary.
+      // Use the refreshed queue; a prefetched page only provides an offset hint.
+      if (!goldPage.cases.some((item) => item.job_uid === next.uid) && next.page) {
+        const page = await api(goldQuery(next.page.offset));
+        goldPage = page; goldOffset = page.offset; renderGoldList();
+      }
+      await openGold(next.uid);
+    } else if (andNext) goldEditorMessage(nextError ? 'Разметка сохранена. Не удалось загрузить следующую вакансию; попробуйте навигацию ещё раз.'
+      : 'Разметка сохранена. Это последняя вакансия в текущей выборке.','success');
+    return true;
+  } catch (error) {
+    if (error.status === 409) {
+      goldEditorMessage('Запись изменена в другом окне. Ваши изменения остаются в форме. Загрузите актуальную версию перед повторным сохранением.','error');
+      editor.conflicts.hidden = false;
+    } else goldEditorMessage(errorMessage(error),'error');
+    return false;
+  } finally {
+    editor.saving = false;
+    if (goldEditor === editor) {
+      editor.form.querySelectorAll('button,input,select,textarea').forEach((node) => node.disabled = false);
+      editor.saveButtons.forEach((node) => node.disabled = !editor.detail.can_save);
+      updateGoldNavigation();
+    }
+  }
+}
+
 document.querySelectorAll('.tab').forEach((tab) => tab.addEventListener('click',() => {
+  if (goldEditor && !closeModal()) return;
+  goldOpening++;
   view = tab.dataset.view; document.querySelectorAll('.tab').forEach((other) => other.classList.toggle('active',other === tab));
+  if (view === 'gold' || window.location.hash === '#gold')
+    window.history.replaceState(null,'',window.location.pathname + window.location.search + (view === 'gold' ? '#gold' : ''));
   render(); if (view === 'jobs') refreshJobs();
+  if (view === 'gold') refreshGold();
 }));
+$('goldFilters').addEventListener('submit',(event) => { event.preventDefault(); clearTimeout(goldFilterTimer); refreshGold(); });
+$('goldStatusFilter').addEventListener('change',() => { clearTimeout(goldFilterTimer); refreshGold(); });
+$('goldQuery').addEventListener('input',() => { clearTimeout(goldFilterTimer); goldFilterTimer = setTimeout(() => refreshGold(),250); });
+$('previousGold').addEventListener('click',() => { goldOffset = Math.max(0,goldOffset - 100); refreshGold(false); });
+$('nextGold').addEventListener('click',() => { goldOffset += 100; refreshGold(false); });
+window.addEventListener('beforeunload',(event) => {
+  if (goldIsDirty()) { event.preventDefault(); event.returnValue = ''; }
+});
 $('filters').addEventListener('submit',(event) => { event.preventDefault(); refresh(false); });
 $('query').addEventListener('input',queueJobRefresh); $('stageFilter').addEventListener('change',render);
 $('actionFilter').addEventListener('change',render);

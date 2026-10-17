@@ -12,16 +12,18 @@ def finalize_tier(
 
     Runs after both deterministic scoring and (optional) LLM reranking, so it sees
     the final ``fit_score``. Thresholds come from the search-profile config
-    (``threshold_a``/``threshold_b``) — no hardcoded cutoffs. A-tier additionally
-    requires a passing decision and a detected bridge-role signal.
+    (``threshold_a``/``threshold_b``). A requires a detected decision mandate.
+    ``role_fit_v1`` keeps hiring decisions separate and enforces source scope caps;
+    the legacy policy additionally requires PASS for A and assigns REJECT to C.
     """
-    if job.evaluation.decision == FilterDecision.REJECT:
+    role_fit = job.evaluation.fit_policy == "role_fit_v1"
+    if job.evaluation.decision == FilterDecision.REJECT and not role_fit:
         job.evaluation.tier = JobTier.C
         job.evaluation.bucket = "Bucket C"
         return job
 
     if (
-        job.evaluation.decision == FilterDecision.PASS
+        (role_fit or job.evaluation.decision == FilterDecision.PASS)
         and job.evaluation.fit_score >= threshold_a
         and job.evaluation.bridge_role
     ):
@@ -33,4 +35,10 @@ def finalize_tier(
     else:
         job.evaluation.tier = JobTier.C
         job.evaluation.bucket = "Bucket C"
+    if job.evaluation.fit_max_tier is not None:
+        cap = JobTier(job.evaluation.fit_max_tier)
+        order = {JobTier.A: 0, JobTier.B: 1, JobTier.C: 2}
+        if order[job.evaluation.tier] < order[cap]:
+            job.evaluation.tier = cap
+            job.evaluation.bucket = "Bucket " + job.evaluation.tier.value
     return job

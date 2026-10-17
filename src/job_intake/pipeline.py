@@ -299,6 +299,7 @@ class JobIntakePipeline:
                 record.title,
                 role_description(record),
                 item.evaluation,
+                record=record,
             )
             if suppressed and item.evaluation.decision != FilterDecision.REJECT:
                 # Retain the source and CRM linkage; a routing verdict isn't an
@@ -399,6 +400,7 @@ class JobIntakePipeline:
                     if (
                         job.archived_at is not None
                         or job.tier != "A"
+                        or job.filter_decision == "reject"
                         or job.best_profile_id not in self.profile_versions
                         or not any(
                             p.profile_id == job.best_profile_id

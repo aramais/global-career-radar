@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.exc import StaleDataError
 
+from job_intake.annotation.gold_ui import GoldLabelStore, GoldUIError
 from job_intake.config.settings import AppConfig, load_yaml_mapping
 from job_intake.crm.jobs import JOB_QUERY_FIELDS, job_detail, list_job_page
 from job_intake.crm.repository import CRMRepository, serialize_application
@@ -237,7 +238,7 @@ def csv_export(applications: list[dict]) -> bytes:
 
 
 class CRMService:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, *, gold_path: Path | None = None) -> None:
         self.config = config
         rules = load_yaml_mapping(config.rules_path)
         self.streams = with_other_stream(
@@ -246,6 +247,7 @@ class CRMService:
         self.database = Database(config.database_url)
         self.database.create_schema()
         self.csrf_token = secrets.token_urlsafe(32)
+        self.gold_store = GoldLabelStore(config, path=gold_path)
 
     def validate_profile(self, value: object, *, existing: str | None = None) -> str | None:
         if value in (None, ""):
@@ -343,6 +345,12 @@ class CRMService:
         with self.database.session() as session:
             return list_job_page(session, {s.id: s.version for s in self.streams}, query)
 
+    def gold_cases(self, query: dict[str, str]) -> dict:
+        return self.gold_store.list_cases(query)
+
+    def gold_case(self, uid: str) -> dict:
+        return self.gold_store.detail(uid)
+
     def metrics(self, query: dict[str, str]) -> dict:
         _fields(query, {"profile_id", "channel", "since", "until"})
         result = self.state({**query, "include_jobs": "false", "include_entities": "false"})
@@ -375,6 +383,8 @@ class CRMService:
             raise RequestError("Ожидается JSON-объект")
         payload = dict(payload)
         parts = path.strip("/").split("/")
+        if method == "PATCH" and len(parts) == 3 and parts[:2] == ["api", "gold"]:
+            return self.gold_store.save(unquote(parts[2]), payload)
         with self.database.session() as session:
             repo = CRMRepository(session)
             if method == "PATCH" and path == "/api/jobs/archive":
@@ -592,8 +602,15 @@ class CRMRequestHandler(BaseHTTPRequestHandler):
             if method == "GET" and parsed_url.path == "/api/jobs":
                 self._json(200, self.server.service.jobs(query))
                 return
+            if method == "GET" and parsed_url.path == "/api/gold":
+                self._json(200, self.server.service.gold_cases(query))
+                return
             get_parts = parsed_url.path.strip("/").split("/")
             if method == "GET" and len(get_parts) == 3:
+                if get_parts[:2] == ["api", "gold"]:
+                    _fields(query, set())
+                    self._json(200, self.server.service.gold_case(unquote(get_parts[2])))
+                    return
                 if get_parts[:2] == ["api", "jobs"]:
                     _fields(query, set())
                     self._json(200, self.server.service.job(unquote(get_parts[2])))
@@ -634,7 +651,7 @@ class CRMRequestHandler(BaseHTTPRequestHandler):
                     raise RequestError("Некорректный JSON") from exc
                 result = self.server.service.mutate(method, parsed_url.path, payload)
             self._json(200, result)
-        except RequestError as exc:
+        except (RequestError, GoldUIError) as exc:
             self._json(exc.status, {"error": str(exc)})
         except CRMConflictError:
             self._json(409, {"error": "Карточка изменена. Обновите её перед сохранением"})
@@ -661,8 +678,8 @@ class CRMRequestHandler(BaseHTTPRequestHandler):
         self._dispatch("DELETE")
 
 
-def serve_crm(config: AppConfig, *, port: int = 8765) -> None:
-    server = CRMHTTPServer(CRMService(config), port)
+def serve_crm(config: AppConfig, *, port: int = 8765, gold_path: Path | None = None) -> None:
+    server = CRMHTTPServer(CRMService(config, gold_path=gold_path), port)
     LOGGER.info("crm_started url=%s", server.origin)
     try:
         server.serve_forever()

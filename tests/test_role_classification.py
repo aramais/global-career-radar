@@ -91,6 +91,121 @@ def test_specific_product_analytics_title_beats_generic_product_descriptor():
     assert selected.id == decision["label"] == "analytics-leadership"
 
 
+@pytest.mark.parametrize(("title", "expected"), [
+    ("Manager, Analytics", "analytics-leadership"),
+    ("Manager: Analytics", "analytics-leadership"),
+    ("Manager/ Senior Manager - Analytics Consulting", "analytics-leadership"),
+    ("Head of Commercial Analytics & Insights", "analytics-leadership"),
+    ("Head of Marketing Analytics", "analytics-leadership"),
+    ("Manager, Business Reporting & Analytics", "analytics-leadership"),
+    ("Manager, Analytics, Customer Experience", "analytics-leadership"),
+    ("Analytics & Insights Manager", "analytics-leadership"),
+    ("Product Analytics Chapter Lead", "analytics-leadership"),
+    ("Head of Product Analytics", "analytics-leadership"),
+    ("Senior Manager, Data Science", "data-science-management"),
+    ("Director of Applied Data Science", "data-science-management"),
+    ("Director: Data Science", "data-science-management"),
+    ("Senior Manager, Product Data Science & Analytics", "data-science-management"),
+    ("Data Science & Analytics Manager", "data-science-management"),
+    ("Head of Business Performance Analytics", "business-analytics"),
+    ("Senior Manager, Business Performance Analytics", "business-analytics"),
+    ("Business Analytics Manager", "business-analytics"),
+])
+def test_occupation_syntax_recognizes_reordered_titles_and_domain_modifiers(title, expected):
+    config = configuration()
+    config["streams"][0]["keywords"].append("Head of Product")
+    config["streams"][1]["keywords"].append("Head of Data")
+    # Candidate suitability and attractive business words must not resolve the role.
+    selected, decision = RoleClassifier(load_streams({}, config)).classify(record(
+        title=title, description_clean="Requirements:\nNo industry experience is required.",
+    ))
+    assert selected.id == decision["label"] == expected
+    assert decision["status"] == "title"
+    assert decision["method"] == "local"
+
+
+@pytest.mark.parametrize("title", [
+    "Head of Product Design",
+    "Head of Product Marketing",
+    "Head of Product Engineering",
+    "Product Lead Designer",
+    "Head of Data Products",
+    "Head of Data Engineering",
+    "Head of Data Platform",
+    "Manager, Analytics Engineering",
+    "Manager, Business Analytics Engineering",
+    "Head of Business Analytics Engineering",
+    "Business Analytics Platform Manager",
+    "Manager of Data Science Production Engineering, Data Engineering & Delivery",
+    "Analytics Engineer",
+    "Commercial Analytics Specialist",
+    "Manager of Sales with Analytics Experience",
+    "Engineering Manager - Commercial Analytics",
+    "Marketing Manager, Analytics",
+])
+def test_generic_prefix_and_analytics_mentions_do_not_define_a_different_occupation(title):
+    config = configuration()
+    config["streams"][0]["keywords"].append("Head of Product")
+    config["streams"][1]["keywords"].append("Head of Data")
+    selected, decision = RoleClassifier(load_streams({}, config)).classify(record(title=title))
+    assert selected.id == decision["label"] == "other"
+
+
+@pytest.mark.parametrize("title", [
+    "Head of Product Design / Product Manager",
+    "Head of Product Design and Product Manager",
+])
+def test_blocked_prefix_does_not_erase_a_separate_explicit_occupation(title):
+    config = configuration()
+    config["streams"][0]["keywords"].append("Head of Product")
+    selected, _ = RoleClassifier(load_streams({}, config)).classify(record(title=title))
+    assert selected.id == "product-management"
+
+
+def test_analytics_domain_does_not_replace_an_explicit_product_manager_occupation():
+    selected, _ = RoleClassifier(load_streams({}, configuration())).classify(record(
+        title="Product Manager, Analytics",
+    ))
+    assert selected.id == "product-management"
+
+
+@pytest.mark.parametrize("title", [
+    "Analytics Manager / Business Analytics Manager",
+    "Business Analytics Manager / Analytics Manager",
+    "Head of Analytics / Business Analytics Manager",
+])
+def test_specific_occupation_does_not_erase_an_independent_generic_occupation(title):
+    config = configuration()
+    config["streams"][1]["keywords"].append("Head of Analytics")
+    selected, decision = RoleClassifier(load_streams({}, config)).classify(record(title=title))
+    assert selected.id == "other" and decision["status"] == "uncertain"
+
+
+def test_title_syntax_only_returns_enabled_taxonomy_labels():
+    config = configuration()
+    config["streams"][1]["enabled"] = False
+    selected, _ = RoleClassifier(load_streams({}, config)).classify(record(
+        title="Head of Commercial Analytics",
+    ))
+    assert selected.id == "other"
+
+
+def test_occupation_syntax_applies_to_current_role_declarations_without_collaborator_leakage():
+    classifier = RoleClassifier(load_streams({}, configuration()))
+    selected, decision = classifier.classify(record(
+        title="Team Lead", description_clean=(
+            "Responsibilities:\nAs a Head of Marketing Analytics, you will lead analysts."
+        ),
+    ))
+    assert selected.id == "analytics-leadership" and decision["status"] == "duties"
+    selected, _ = classifier.classify(record(
+        title="Specialist", description_clean=(
+            "Responsibilities:\nYou will collaborate with the Head of Marketing Analytics."
+        ),
+    ))
+    assert selected.id == "other"
+
+
 @pytest.mark.parametrize(("title", "status"), [
     ("Data Science Manager / Product Manager", "uncertain"),
     ("Senior Tax Lawyer", "outside_taxonomy"),

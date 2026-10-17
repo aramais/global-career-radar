@@ -109,9 +109,12 @@ try:
                     item.evaluation.decision = FilterDecision.REVIEW
                 item.evaluation.risks.append("role_classification:needs_review")
             else:
+                score_options = {"record": record} if hasattr(
+                    stream.scoring, "scoring_policy"
+                ) else {}
                 scorer.score(
                     record.source, record.company, record.title,
-                    role_text, item.evaluation,
+                    role_text, item.evaluation, **score_options,
                 )
             finalize_tier(item, stream.scoring.threshold_a, stream.scoring.threshold_b)
             result = item.evaluation

@@ -99,3 +99,17 @@ def test_alert_fires_again_after_window() -> None:
     session.flush()
     back_to_a = repo.upsert_evaluated_job(_evaluated("Bridge role", JobTier.A))
     assert back_to_a.should_alert is True  # dedup window has elapsed
+
+
+def test_rejected_high_fit_role_does_not_generate_or_queue_an_alert() -> None:
+    session = _session()
+    repo = JobRepository(session)
+    item = _evaluated("High fit but hiring blocked", JobTier.A, FilterDecision.REJECT)
+    first = repo.upsert_evaluations([item], queue_alert=True)
+    assert first.should_alert is False
+    session.flush()
+    again = repo.upsert_evaluations([item], queue_alert=True)
+    assert again.should_alert is False
+    assert repo.recent_jobs_for_digest() == []
+    from job_intake.storage.models import AlertOutboxORM
+    assert session.scalars(select(AlertOutboxORM)).all() == []
