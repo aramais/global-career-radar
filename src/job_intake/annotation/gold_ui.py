@@ -215,14 +215,16 @@ class GoldLabelStore:
                 "offset": offset, "limit": limit, "total": len(selected),
                 "has_more": offset + limit < len(selected), "profiles": self._roles()}
 
+    def _source_records(self, uid: str) -> tuple:
+        """Resolve immutable source facts; discovery can supply its own artifact."""
+        return read_saved_records(self.config.database_url, limit=None, job_uids=[uid])
+
     def _detail(self, case: dict, line: bytes) -> dict:
         uid, warnings, can_save, state = case["job_uid"], [], True, "current"
         try:
-            _, rows, problems = read_saved_records(
-                self.config.database_url, limit=None, job_uids=[uid],
-            )
+            _, rows, problems = self._source_records(uid)
         except (OSError, ValueError, sqlite3.Error) as error:
-            warnings.append("Источник недоступен в текущей базе: " + str(error))
+            warnings.append("Источник недоступен: " + str(error))
             can_save = False
             state = "missing" if "Requested jobs" in str(error) else "unavailable"
         else:

@@ -32,11 +32,17 @@ def serve(
     gold: Annotated[
         Path | None, typer.Option(help="Gold JSONL для веб-разметки (по умолчанию рядом с базой)")
     ] = None,
+    discovery: Annotated[
+        Path | None, typer.Option(exists=True, file_okay=False,
+                                 help="Каталог discovery-запуска для слепой разметки кандидатов")
+    ] = None,
 ) -> None:
     """Открыть редактируемую CRM на http://127.0.0.1:8765."""
+    if gold is not None and discovery is not None:
+        raise typer.BadParameter("--gold и --discovery нельзя использовать одновременно")
     settings = _config(config, database)
     typer.echo(f"CRM: http://127.0.0.1:{port} — Ctrl+C для остановки")
-    serve_crm(settings, port=port, gold_path=gold)
+    serve_crm(settings, port=port, gold_path=gold, discovery_path=discovery)
 
 
 @app.command("import-xlsx")

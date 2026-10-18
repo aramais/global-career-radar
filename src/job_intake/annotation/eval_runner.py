@@ -86,6 +86,7 @@ def _object_json(value: object, field: str) -> dict:
 
 def read_saved_records(
     database_url: str, *, limit: int | None = 10, job_uids: list[str] | None = None,
+    include_archived: bool = False,
 ) -> tuple[Path, list[tuple[str, JobRecord]], dict[str, list[dict]]]:
     """Schema-first SELECT, mode=ro and query_only; a missing DB cannot be created."""
     if limit is not None and (type(limit) is not int or limit < 1):
@@ -105,7 +106,7 @@ def read_saved_records(
         fields = ["job_uid", *[field for field in _RECORD_COLUMNS if field in columns]]
         query = "SELECT " + ", ".join(fields) + " FROM jobs"
         conditions, parameters = [], []
-        if "archived_at" in columns:
+        if "archived_at" in columns and not include_archived:
             conditions.append("archived_at IS NULL")
         if job_uids:
             conditions.append("job_uid IN (" + ",".join("?" for _ in job_uids) + ")")

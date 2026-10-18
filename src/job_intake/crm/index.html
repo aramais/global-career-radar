@@ -202,6 +202,7 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
       <button type="submit">Найти</button>
     </form>
     <p id="goldMessage" class="gold-message" role="status" hidden></p>
+    <button type="button" id="discoveryReportButton" hidden>Стоимость и время поиска</button>
     <div class="row gold-pagination"><button type="button" id="previousGold">Предыдущая страница</button>
       <span id="goldPageStatus" class="small muted"></span><button type="button" id="nextGold">Следующая страница</button></div>
   </section>
@@ -369,6 +370,7 @@ async function refresh(initial) {
     const latest = await api(initial ? '/api/state?include_jobs=false' : stateQuery());
     if (request !== refreshSequence) return;
     state = {...latest,jobs:state?.jobs || [],job_page:state?.job_page || latest.job_page};
+    if (initial && state.labeling_mode === 'discovery' && !window.location.hash) view = 'gold';
     if (initial) { setupFilters(); document.querySelectorAll('.tab').forEach((tab) =>
       tab.classList.toggle('active',tab.dataset.view === view)); }
     if (view === 'jobs') await refreshJobs(false);
@@ -684,7 +686,7 @@ function render() {
   if (!state) return;
   renderMetrics();
   const titles = {applications:'Отклики',actions:'Следующие шаги',jobs:'Найденные вакансии',
-    companies:'Компании',contacts:'Контакты',gold:'Разметка gold'};
+    companies:'Компании',contacts:'Контакты',gold:state.labeling_mode === 'discovery' ? 'Разметка кандидатов' : 'Разметка gold'};
   const notes = {
     applications:'Все этапы сохраняются в истории. Канал отклика и реферальный статус задаются отдельно.',
     actions:'Выберите конкретный следующий шаг: найти контакт, попросить рекомендацию, отправить отклик или подготовиться к интервью.',
@@ -694,6 +696,9 @@ function render() {
     gold:'Оцените профессию, личную релевантность и условия найма независимо. Машинные оценки здесь скрыты.'
   };
   $('viewTitle').textContent = titles[view]; $('viewNote').textContent = notes[view];
+  document.querySelectorAll('.tab[data-view="gold"]').forEach((tab) => tab.textContent = titles.gold);
+  $('discoveryReportButton').hidden = state.labeling_mode !== 'discovery';
+  $('goldControls').setAttribute('aria-label',titles.gold);
   $('stageFilter').hidden = !['applications','actions'].includes(view);
   $('actionFilter').hidden = view !== 'actions';
   $('jobControls').hidden = view !== 'jobs';
@@ -1323,6 +1328,28 @@ function openImport() {
 function goldCaseStatus(item) {
   return item.complete ? 'complete' : item.has_labels ? 'partial' : 'unlabeled';
 }
+function reviewNow() {
+  return typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+}
+function newReviewClock(now = reviewNow()) {
+  return {last:now,activeUntil:now + 60000,seconds:0};
+}
+function tickReviewClock(clock, now, visible = true, activity = false) {
+  // Ignore suspended tabs and long event-loop pauses; stop counting after a minute idle.
+  const gap = Math.max(0,now - clock.last);
+  if (visible && gap <= 5000)
+    clock.seconds = Math.min(1800,clock.seconds + Math.max(0,Math.min(now,clock.activeUntil) - clock.last) / 1000);
+  clock.last = now;
+  if (activity) clock.activeUntil = now + 60000;
+  return Math.round(clock.seconds * 1000) / 1000;
+}
+function tickGoldReview(activity = false, visible = null) {
+  const editor = goldEditor;
+  if (!editor?.reviewClock || editor.saving) return 0;
+  const isVisible = visible ?? (document.visibilityState !== 'hidden'
+    && (typeof document.hasFocus !== 'function' || document.hasFocus()));
+  return tickReviewClock(editor.reviewClock,reviewNow(),isVisible,activity);
+}
 function goldLabels(labels = {}) {
   return {role_label:labels.role_label ?? null,relevance:labels.relevance ?? null,
     gate_outcome:labels.gate_outcome ?? null,notes:labels.notes ?? ''};
@@ -1449,6 +1476,7 @@ function goldEditorMessage(message, kind = '') {
 function renderGoldEditor(detail, message = '') {
   activeId = null;
   goldEditor = {detail,savedLabels:goldLabels(detail.labels),saving:false,form:null,message:null,
+    reviewClock:detail.mode === 'discovery' ? newReviewClock() : null,
     anchorIndex:(goldPage?.cases || []).findIndex((item) => item.job_uid === detail.job_uid),pageOffset:goldOffset};
   const source = detail.source || {};
   const body = showModal(source.title || 'Разметка вакансии',source.company || 'Компания не указана');
@@ -1537,6 +1565,7 @@ async function saveGold(andNext = false) {
   const editor = goldEditor;
   if (!editor || editor.saving || !editor.detail.can_save) return false;
   const payload = goldPayload(goldFormValues(editor.form),editor.detail.version);
+  if (editor.reviewClock) payload.review_seconds = tickGoldReview();
   editor.saving = true;
   editor.form.querySelectorAll('button,input,select,textarea').forEach((node) => node.disabled = true);
   goldEditorMessage('Сохранение…'); editor.conflicts.hidden = true;
@@ -1574,6 +1603,39 @@ async function saveGold(andNext = false) {
   }
 }
 
+async function openDiscoveryReport() {
+  if (!closeModal()) return;
+  try {
+    const report = await api('/api/discovery/report');
+    const body = showModal('Стоимость и время поиска','Успех — новая вакансия с вашей релевантностью 2 или 3.');
+    renderDiscoveryReport(body,report);
+  } catch (error) { goldMessage(errorMessage(error),'error'); }
+}
+function renderDiscoveryReport(body,report) {
+  // Only aggregate measurements belong here. Never expose ranking or seed data.
+  const format = (number, suffix = '') => typeof number === 'number' && Number.isFinite(number)
+    ? new Intl.NumberFormat('ru-RU',{maximumFractionDigits:3}).format(number) + suffix : 'Пока нет данных';
+  const rows = discoveryReportRows(report);
+  rows.forEach(([label,value,suffix]) => {
+    const row = el('p'); row.append(el('strong',label + ': '),el('span',format(value,suffix))); body.append(row);
+  });
+  body.append(el('p','Человеческое время учитывает активный просмотр до сохранения решения: скрытая вкладка, потеря фокуса и простой исключаются.','help'));
+  body.append(el('p','Стоимость рассчитана по тарифам API. Подписки, инфраструктура, разработка и стоимость вашего часа в неё не включены.','help'));
+}
+function discoveryReportRows(report) {
+  return [
+    ['Подтверждено релевантных',report.counts?.relevant],
+    ['Просмотрено с человеческой меткой релевантности',report.counts?.reviewed],
+    ['Сильных совпадений',report.counts?.strong],
+    ['Машинные расходы по тарифу',report.cost?.total_usd,' USD'],
+    ['Расходы на релевантную вакансию',report.cost?.usd_per_relevant,' USD'],
+    ['Время поиска',report.time?.machine_wall_seconds,' сек.'],
+    ['Время поиска на релевантную вакансию',report.time?.machine_seconds_per_relevant,' сек.'],
+    ['Активное время разметки',report.time?.human_active_seconds,' сек.'],
+    ['Время разметки на релевантную вакансию',report.time?.human_seconds_per_relevant,' сек.']
+  ];
+}
+
 document.querySelectorAll('.tab').forEach((tab) => tab.addEventListener('click',() => {
   if (goldEditor && !closeModal()) return;
   goldOpening++;
@@ -1583,6 +1645,11 @@ document.querySelectorAll('.tab').forEach((tab) => tab.addEventListener('click',
   render(); if (view === 'jobs') refreshJobs();
   if (view === 'gold') refreshGold();
 }));
+$('discoveryReportButton').addEventListener('click',openDiscoveryReport);
+setInterval(() => tickGoldReview(),1000);
+['pointerdown','keydown','wheel','touchstart'].forEach((name) =>
+  document.addEventListener(name,() => tickGoldReview(true),{passive:true}));
+document.addEventListener('visibilitychange',() => tickGoldReview(false,false));
 $('goldFilters').addEventListener('submit',(event) => { event.preventDefault(); clearTimeout(goldFilterTimer); refreshGold(); });
 $('goldStatusFilter').addEventListener('change',() => { clearTimeout(goldFilterTimer); refreshGold(); });
 $('goldQuery').addEventListener('input',() => { clearTimeout(goldFilterTimer); goldFilterTimer = setTimeout(() => refreshGold(),250); });

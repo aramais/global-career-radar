@@ -25,6 +25,7 @@ from job_intake.config.settings import (
     load_yaml_mapping,
 )
 from job_intake.crm.cli import app as crm_app
+from job_intake.discovery.cli import app as discovery_app
 from job_intake.pipeline import JobIntakePipeline, build_pipeline
 from job_intake.profiles import load_streams
 from job_intake.storage.repository import validate_job_uids
@@ -33,6 +34,7 @@ app = typer.Typer(
     add_completion=False, help="Personal job search with one role label and relevance score",
 )
 app.add_typer(crm_app, name="crm")
+app.add_typer(discovery_app, name="discovery")
 eval_app = typer.Typer(no_args_is_help=False, help="Read-only integrity and accuracy evaluation")
 gold_app = typer.Typer(help="Prepare and validate human vacancy labels without API calls")
 app.add_typer(eval_app, name="eval")

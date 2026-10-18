@@ -238,7 +238,10 @@ def csv_export(applications: list[dict]) -> bytes:
 
 
 class CRMService:
-    def __init__(self, config: AppConfig, *, gold_path: Path | None = None) -> None:
+    def __init__(self, config: AppConfig, *, gold_path: Path | None = None,
+                 discovery_path: Path | None = None) -> None:
+        if gold_path is not None and discovery_path is not None:
+            raise ValueError("--gold и --discovery нельзя использовать одновременно")
         self.config = config
         rules = load_yaml_mapping(config.rules_path)
         self.streams = with_other_stream(
@@ -247,7 +250,13 @@ class CRMService:
         self.database = Database(config.database_url)
         self.database.create_schema()
         self.csrf_token = secrets.token_urlsafe(32)
-        self.gold_store = GoldLabelStore(config, path=gold_path)
+        self.discovery_path = discovery_path.expanduser().resolve() if discovery_path else None
+        if self.discovery_path is not None:
+            from job_intake.discovery.review import DiscoveryLabelStore
+
+            self.gold_store = DiscoveryLabelStore(config, self.discovery_path)
+        else:
+            self.gold_store = GoldLabelStore(config, path=gold_path)
 
     def validate_profile(self, value: object, *, existing: str | None = None) -> str | None:
         if value in (None, ""):
@@ -336,6 +345,7 @@ class CRMService:
                 "period": {"since": since_text, "until": until_text},
                 "options": OPTIONS,
                 "csrf_token": self.csrf_token,
+                "labeling_mode": "discovery" if self.discovery_path is not None else "gold",
             }
 
     def jobs(self, query: dict[str, str]) -> dict:
@@ -350,6 +360,13 @@ class CRMService:
 
     def gold_case(self, uid: str) -> dict:
         return self.gold_store.detail(uid)
+
+    def discovery_report(self) -> dict:
+        if self.discovery_path is None:
+            raise RequestError("CRM запущена без --discovery", 404)
+        from job_intake.discovery.report import build_report
+
+        return build_report(self.discovery_path)
 
     def metrics(self, query: dict[str, str]) -> dict:
         _fields(query, {"profile_id", "channel", "since", "until"})
@@ -605,6 +622,10 @@ class CRMRequestHandler(BaseHTTPRequestHandler):
             if method == "GET" and parsed_url.path == "/api/gold":
                 self._json(200, self.server.service.gold_cases(query))
                 return
+            if method == "GET" and parsed_url.path == "/api/discovery/report":
+                _fields(query, set())
+                self._json(200, self.server.service.discovery_report())
+                return
             get_parts = parsed_url.path.strip("/").split("/")
             if method == "GET" and len(get_parts) == 3:
                 if get_parts[:2] == ["api", "gold"]:
@@ -678,8 +699,10 @@ class CRMRequestHandler(BaseHTTPRequestHandler):
         self._dispatch("DELETE")
 
 
-def serve_crm(config: AppConfig, *, port: int = 8765, gold_path: Path | None = None) -> None:
-    server = CRMHTTPServer(CRMService(config, gold_path=gold_path), port)
+def serve_crm(config: AppConfig, *, port: int = 8765, gold_path: Path | None = None,
+              discovery_path: Path | None = None) -> None:
+    server = CRMHTTPServer(CRMService(config, gold_path=gold_path,
+                                    discovery_path=discovery_path), port)
     LOGGER.info("crm_started url=%s", server.origin)
     try:
         server.serve_forever()
