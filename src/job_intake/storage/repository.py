@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,7 +11,9 @@ from sqlalchemy.orm import aliased, selectinload
 
 from job_intake.alerts.digest import DigestJob
 from job_intake.annotation.text import source_hash
+from job_intake.filtering import refresh_eligibility_status
 from job_intake.models.job import EvaluatedJob, FilterDecision, JobRecord, JobTier
+from job_intake.storage.aliases import register_aliases, resolve_alias
 from job_intake.storage.dedup import JobDeduplicator
 from job_intake.storage.models import (
     AlertOutboxORM,
@@ -18,8 +21,14 @@ from job_intake.storage.models import (
     JobEventORM,
     JobORM,
     JobProfileEvaluationORM,
+    JobPurposeAssessmentORM,
 )
 from job_intake.storage.queries import classification_is_current, ranked_profile_evaluations
+from job_intake.storage.source_state import (
+    record_from_saved,
+    source_snapshot,
+    would_discard_source,
+)
 from job_intake.utils.csv import spreadsheet_safe_value
 
 
@@ -34,6 +43,10 @@ class UpsertResult:
 
 class JobArchiveConflictError(ValueError):
     """The archive state changed after the caller loaded the vacancy."""
+
+
+class JobSourceConflictError(ValueError):
+    """The evaluated source is incomplete or changed while it was being evaluated."""
 
 
 def validate_job_uids(job_uids: list[str] | None) -> list[str] | None:
@@ -62,6 +75,8 @@ class JobRepository:
         self.alert_dedup_hours = alert_dedup_hours
 
     def upsert_evaluated_job(self, item: EvaluatedJob, *, observed: bool = True) -> UpsertResult:
+        refresh_eligibility_status(item.evaluation)
+        self.find_by_record(item.record)
         identity = self.deduplicator.build_identity(item.record)
         classification = dict(getattr(item, "role_classification", None) or {
             "label": item.profile_id,
@@ -82,6 +97,12 @@ class JobRepository:
             raise ValueError("Role classification must match the evaluation and source content")
         existing = self.session.scalar(select(JobORM).where(JobORM.job_uid == identity.job_uid))
         now = datetime.now(UTC)
+
+        if item.record._source_reconciled and (
+            (existing.source_revision if existing is not None else None)
+            != item.record._expected_source_revision
+        ):
+            raise JobSourceConflictError("Source changed after reconciliation; evaluate it again")
 
         if existing is None:
             existing = JobORM(
@@ -126,6 +147,7 @@ class JobRepository:
                 best_profile_name=item.profile_name or item.profile_id,
             )
             self.session.add(existing)
+            self._assessment_fields(existing, item)
             self.session.add(
                 JobEventORM(
                     job_uid=identity.job_uid,
@@ -134,6 +156,7 @@ class JobRepository:
                 )
             )
             self.session.flush()
+            register_aliases(self.session, item.record, identity.job_uid)
             return UpsertResult(
                 job_uid=identity.job_uid,
                 is_new=True,
@@ -143,6 +166,45 @@ class JobRepository:
                               and item.evaluation.decision != FilterDecision.REJECT),
             )
 
+        if would_discard_source(item.record, existing):
+            raise JobSourceConflictError("Reconcile the incomplete source before evaluating it")
+        previous_revision = existing.source_revision
+        claimed = self.session.execute(
+            update(JobORM).where(
+                JobORM.job_uid == identity.job_uid,
+                JobORM.source_revision == previous_revision,
+            ).values(source_revision=previous_revision + 1),
+            execution_options={"synchronize_session": False},
+        )
+        if claimed.rowcount != 1:
+            raise JobSourceConflictError("Source changed before save; evaluate it again")
+        existing.source_revision = previous_revision + 1
+        previous_source = record_from_saved(existing)
+        if existing.annotation.get("method") == "two_pass" and (
+            existing.annotation != item.record.annotation
+        ):
+            self.session.add(JobEventORM(
+                job_uid=identity.job_uid, event_type="annotation_superseded",
+                payload={
+                    "reason": (
+                        "source_changed" if source_hash(previous_source) != source_hash(item.record)
+                        else "annotation_replaced"
+                    ),
+                    "source_revision": previous_revision,
+                    "source_snapshot": source_snapshot(previous_source),
+                    "annotation": deepcopy(existing.annotation),
+                    "active": False,
+                },
+            ))
+        if source_snapshot(previous_source) != source_snapshot(item.record):
+            self.session.add(JobEventORM(
+                job_uid=identity.job_uid, event_type="source_superseded",
+                payload={
+                    "source_revision": previous_revision,
+                    "source_hash": source_hash(previous_source),
+                    "source_snapshot": source_snapshot(previous_source),
+                },
+            ))
         previous_tier = existing.tier
         previous_hash = existing.content_hash
         existing.content_hash = identity.content_hash
@@ -177,12 +239,14 @@ class JobRepository:
         existing.risks = item.evaluation.risks
         existing.audit_log = item.evaluation.audit_log
         existing.bridge_role = item.evaluation.bridge_role
+        self._assessment_fields(existing, item)
         existing.source_metadata = item.record.source_metadata
         existing.annotation = item.record.annotation
         existing.role_label = item.profile_id
         existing.role_classification = classification
         existing.best_profile_id = item.profile_id
         existing.best_profile_name = item.profile_name or item.profile_id
+        register_aliases(self.session, item.record, identity.job_uid)
         if observed:
             existing.last_seen_at = now
 
@@ -202,7 +266,7 @@ class JobRepository:
             )
         alert_eligible = (existing.archived_at is None and item.evaluation.tier == JobTier.A
                           and item.evaluation.decision != FilterDecision.REJECT)
-        if tier_changed and alert_eligible:
+        if observed and tier_changed and alert_eligible:
             existing.alert_pending = True
         should_alert = alert_eligible and (
             existing.last_alerted_tier != JobTier.A.value or existing.alert_pending
@@ -216,6 +280,13 @@ class JobRepository:
             tier_changed=tier_changed,
             should_alert=should_alert,
         )
+
+    @staticmethod
+    def _assessment_fields(row, item: EvaluatedJob) -> None:
+        for name in ("raw_fit_score", "score_cap_reasons", "eligibility_status",
+                     "eligibility_evidence_status"):
+            setattr(row, name, deepcopy(getattr(item.evaluation, name)))
+        row.version_components = dict(item.version_components)
 
     def upsert_evaluations(
         self,
@@ -249,6 +320,7 @@ class JobRepository:
             row.classification_version = job.role_classification["version"]
             row.classification_source_hash = job.role_classification["source_hash"]
             row.llm_cache_key = (cache_keys or {}).get(item.profile_id)
+            self._assessment_fields(row, item)
             for name in (
                 "deterministic_score",
                 "semantic_score",
@@ -267,6 +339,9 @@ class JobRepository:
             row.decision = item.evaluation.decision.value
             row.tier = item.evaluation.tier.value
         self.session.flush()
+        from job_intake.purpose import save_prediction
+
+        save_prediction(self.session, result.job_uid, best)
         if queue_alert and result.should_alert:
             from job_intake.alerts.digest import build_instant_alert
 
@@ -316,7 +391,14 @@ class JobRepository:
 
     def find_by_record(self, record: JobRecord) -> JobORM | None:
         identity = self.deduplicator.build_identity(record)
-        return self.session.scalar(select(JobORM).where(JobORM.job_uid == identity.job_uid))
+        found = self.session.scalar(select(JobORM).where(JobORM.job_uid == identity.job_uid))
+        if found is None:
+            alias = resolve_alias(self.session, record)
+            if alias is not None:
+                found = self.session.scalar(select(JobORM).where(JobORM.job_uid == alias))
+                if found is not None:
+                    record._canonical_job_uid = found.job_uid
+        return found
 
     def mark_alert_sent(self, job_uid: str, tier: JobTier, channel: str, message: str) -> None:
         job = self.session.scalar(select(JobORM).where(JobORM.job_uid == job_uid))
@@ -458,6 +540,11 @@ class JobRepository:
             JobORM.last_seen_at < cutoff,
             JobORM.tier.in_(list(tiers)),
             JobORM.archived_at.is_(None),
+            ~select(JobPurposeAssessmentORM.job_uid).where(
+                JobPurposeAssessmentORM.job_uid == JobORM.job_uid,
+                or_(JobPurposeAssessmentORM.human_p1 != "unknown",
+                    JobPurposeAssessmentORM.human_p2 != "unknown"),
+            ).exists(),
         )
         targets = select(JobORM.job_uid).where(*conditions)
         # Historical profile matrices retain their original non-cascading FK.
@@ -466,7 +553,8 @@ class JobRepository:
         if inspect(self.session.connection()).has_table("job_profile_evaluations"):
             legacy = table("job_profile_evaluations", column("job_uid"))
             self.session.execute(delete(legacy).where(legacy.c.job_uid.in_(targets)))
-        for model in (JobEventORM, FeedbackORM, JobProfileEvaluationORM, AlertOutboxORM):
+        for model in (JobEventORM, FeedbackORM, JobProfileEvaluationORM, AlertOutboxORM,
+                      JobPurposeAssessmentORM):
             self.session.execute(
                 delete(model).where(model.job_uid.in_(targets))
                 .execution_options(synchronize_session="fetch")

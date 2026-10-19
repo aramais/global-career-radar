@@ -52,7 +52,8 @@ streams:
       Search internationally from Sao Paulo; verify hiring from Brazil, working language,
       contract, work mode and readiness. English working language is required. The role
       must involve managing projects and interacting with people; direct reports are optional.
-    keywords: [Product Manager, Monetization Product Manager, Pricing Product Manager, Analytics Product Manager, Data Product Manager]
+    search_queries: [Product Manager, Monetization Product Manager, Pricing Product Manager, Analytics Product Manager, Data Product Manager]
+    titles: [Product Manager, Monetization Product Manager, Pricing Product Manager, Analytics Product Manager, Data Product Manager]
     rules:
       positive_title_signals: [product manager, product lead, head of product, product owner]
     scoring:
@@ -76,7 +77,8 @@ streams:
       contract, work mode and readiness. English working language is required. Project
       management and people interaction are required; direct reports are optional.
       Prolonged individual analysis without people interaction is outside the search.
-    keywords: [Head of Analytics, Analytics Manager, Product Analytics Lead, Lead Product Analyst, Analytics Project Manager, Monetization Analytics Manager, Pricing Analytics Manager]
+    search_queries: [Head of Analytics, Analytics Manager, Product Analytics Lead, Lead Product Analyst, Analytics Project Manager, Monetization Analytics Manager, Pricing Analytics Manager]
+    titles: [Head of Analytics, Analytics Manager, Product Analytics Lead, Lead Product Analyst, Analytics Project Manager, Monetization Analytics Manager, Pricing Analytics Manager]
     rules:
       positive_title_signals: [head of analytics, head of data, analytics manager, product analytics, lead product analyst, analytics project manager]
     scoring:
@@ -99,11 +101,12 @@ streams:
       contract, work mode and readiness. English working language and project management
       with people interaction are required; direct reports are optional. Prolonged solo
       analyst work is outside the search regardless of its title.
-    keywords: [Business Analytics Manager, Business Analytics Lead, Head of Business Analytics, Strategic Analytics, Decision Science Lead, Unit Economics, Strategic Finance]
+    search_queries: [Business Analytics Manager, Business Analytics Lead, Head of Business Analytics, Strategic Analytics, Decision Science Lead, Unit Economics, Strategic Finance]
+    titles: [Business Analytics Manager, Business Analytics Lead, Head of Business Analytics, Strategic Analytics, Unit Economics, Strategic Finance]
     rules:
-      positive_title_signals: [business analytics, business analyst manager, business analysis manager, strategic analytics, decision science, strategic finance]
+      positive_title_signals: [business analytics, business analyst manager, business analysis manager, strategic analytics, strategic finance]
     scoring:
-      title_weights: {business analytics manager: 8, business analyst manager: 8, head of business analytics: 8, business analytics lead: 8, business analytics: 2, strategic analytics: 7, strategic finance: 7, decision science lead: 8, business operations: 2}
+      title_weights: {business analytics manager: 8, business analyst manager: 8, head of business analytics: 8, business analytics lead: 8, business analytics: 2, strategic analytics: 7, strategic finance: 7, business operations: 2}
       description_weights:
         <<: *decision_weights
         business strategy: 3
@@ -124,7 +127,8 @@ streams:
       hiring from Brazil, working language, contract and work mode. English working language
       and project management with people interaction are required; direct reports are
       optional. Prolonged solo analysis is outside the search regardless of its title.
-    keywords: [Data Science Manager, Product Data Science Manager, Head of Data Science, Data Science Lead, Decision Science Manager, Decision Science Lead, Causal Inference Lead]
+    search_queries: [Data Science Manager, Product Data Science Manager, Head of Data Science, Data Science Lead, Decision Science Manager, Decision Science Lead, Causal Inference Lead]
+    titles: [Data Science Manager, Product Data Science Manager, Head of Data Science, Data Science Lead, Decision Science Manager, Decision Science Lead, Causal Inference Lead]
     rules:
       positive_title_signals: [data science manager, head of data science, data scientist, data science lead, decision science]
     scoring:

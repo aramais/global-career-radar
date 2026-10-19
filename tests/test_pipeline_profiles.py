@@ -388,7 +388,7 @@ def test_profile_queries_follow_enabled_streams(tmp_path):
 def test_parser_policy_upgrade_invalidates_old_profile_verdicts(tmp_path, monkeypatch):
     config = _config(tmp_path)
     current = JobIntakePipeline(config)
-    monkeypatch.setattr("job_intake.profiles.TEXT_VERSION", "source-units-previous")
+    monkeypatch.setattr("job_intake.profiles.SOURCE_UNITS_VERSION", "source-units-previous")
     previous = JobIntakePipeline(config)
     assert current.profile_versions.keys() == previous.profile_versions.keys()
     assert all(

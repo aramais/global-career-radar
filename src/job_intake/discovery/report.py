@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections import Counter
 from pathlib import Path
 
 from job_intake.annotation.gold import GOLD_SCHEMA
@@ -70,6 +71,8 @@ def build_report(run_dir: Path) -> dict:
     active, event_ids, timed_ids = 0.0, set(), set()
     events_path = run_dir / "review-events.jsonl"
     events = read_jsonl(events_path) if events_path.exists() else []
+    discoveries_path = run_dir / "discoveries.jsonl"
+    discoveries = read_jsonl(discoveries_path) if discoveries_path.exists() else []
     pending_path = run_dir / ".review-pending.json"
     if pending_path.exists():
         pending = read_json(pending_path)
@@ -101,6 +104,21 @@ def build_report(run_dir: Path) -> dict:
     return {
         "schema": "discovery-report-v1", "run_id": manifest["run_id"],
         "run_status": manifest["status"],
+        "objective": manifest.get("objective", "training"),
+        "retrieval": {
+            "observations": len(discoveries),
+            "unique_urls": len({row["url"] for row in discoveries}),
+            "vacancy_fetch_attempts": manifest.get("counts", {}).get("fetch_attempts", 0),
+            "original_fetch_attempts": manifest.get("counts", {}).get("fetch_original_attempts"),
+            "http_attempts_including_robots": manifest.get("counts", {}).get("fetch_http_attempts"),
+            "fetch_cache_hits": manifest.get("counts", {}).get("fetch_cache_hits", 0),
+            "search_cache_hits": manifest.get("counts", {}).get("search_cache_hits", 0),
+            "outcomes_by_observation": dict(Counter(row.get("outcome", "unprocessed")
+                                                    for row in discoveries)),
+            "errors_by_attempt": dict(Counter(row.get("code", "unknown")
+                                               for row in manifest.get("errors", [])
+                                               if row.get("stage") == "fetch")),
+        },
         "counts": {"candidates": len(candidates), "queued": len(labels),
                    "reviewed": len(human), "relevant": len(relevant), "strong": len(strong),
                    "complete": complete, "unlabeled": len(labels) - len(human),
@@ -108,6 +126,11 @@ def build_report(run_dir: Path) -> dict:
                                                  and human[uid].get("gate_outcome"))
                                             for uid in relevant)},
         "cost": {"total_usd": total, "usd_per_relevant": _ratio(total, len(relevant)),
+                 "by_stage": {stage: sum(_number(row.get("cost_usd"), "expense")
+                                        for row in expense_rows
+                                        if (row.get("stage") or "unspecified") == stage)
+                              for stage in sorted({row.get("stage") or "unspecified"
+                                                   for row in expense_rows})},
                  "basis": "tariff_estimate", "uncertain_requests": sum(
                      row.get("status") in ("uncertain", "pending") for row in expense_rows),
                  "includes": "All recorded search and model attempts, including failures",
@@ -119,6 +142,12 @@ def build_report(run_dir: Path) -> dict:
                  "reviewed_with_timing": len(timed_ids & human.keys()),
                  "relevant_per_machine_hour": _ratio(3600 * len(relevant), elapsed)},
         "precision": _ratio(len(relevant), len(human)),
+        "selection": {"enabled": manifest.get("selection", {}).get("enabled", False),
+                      "accepted": manifest.get("counts", {}).get("selection_accepted", 0),
+                      "rejected": manifest.get("counts", {}).get("selection_rejected", 0),
+                      "uncertain": manifest.get("counts", {}).get("selection_uncertain", 0),
+                      "failed": manifest.get("counts", {}).get("selection_failed", 0),
+                      "review_duplicates": manifest.get("counts", {}).get("review_duplicates", 0)},
         "cohorts": {"top": cohort(batch.get("top_ids", [])),
                     "random": cohort(batch.get("random_ids", []))},
         "hiring_among_relevant": {name: sum(human[uid].get("gate_outcome") == gate

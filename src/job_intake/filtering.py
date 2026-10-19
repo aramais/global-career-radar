@@ -58,6 +58,32 @@ _REGION_EXCLUSION = re.compile(
 )
 
 
+def refresh_eligibility_status(evaluation: JobEvaluation) -> None:
+    """Keep hiring evidence independent of relevance, occupation and REVIEW routing."""
+    hiring_blockers = (
+        "status:", "status_phrase:", "company_blacklist:", "geo_blocker:",
+        "timezone_blocker:", "phrase_blocker:", "language:",
+        "annotation:hiring_", "annotation:working_language:", "annotation:status:",
+    )
+    hiring_unknowns = (
+        "geography:", "language:", "incomplete_description", "source_update_unverified",
+        "authorization:",
+        "annotation:work_authorization", "annotation:timezone_", "annotation:work_mode_",
+        "annotation:incomplete_source_review", "annotation:conflicting_requirements",
+    )
+    if any(signal.startswith(hiring_blockers) for signal in evaluation.blocker_signals):
+        evaluation.eligibility_status = "ineligible"
+        evaluation.eligibility_evidence_status = "blocked"
+    elif any(risk.startswith(hiring_unknowns) for risk in evaluation.risks):
+        evaluation.eligibility_status = "unknown"
+        evaluation.eligibility_evidence_status = "unconfirmed"
+    elif evaluation.eligibility_status == "eligible":
+        evaluation.eligibility_evidence_status = "confirmed"
+    else:
+        evaluation.eligibility_status = "unknown"
+        evaluation.eligibility_evidence_status = "unconfirmed"
+
+
 def _candidate_exclusion_matches(clause: str) -> list[re.Match[str]]:
     return [match for pattern in _CANDIDATE_EXCLUSIONS for match in pattern.finditer(clause)]
 
@@ -183,6 +209,16 @@ class RuleEngine:
             blockers.extend([f"phrase_blocker:{hit}" for hit in blocker_hits])
             reasons.append("Description contains explicit hard blockers.")
 
+        authorization = self._authorization_blockers(job)
+        if authorization:
+            blockers.extend(f"phrase_blocker:{hit}" for hit in authorization)
+            reasons.append("The role explicitly requires incompatible work authorization.")
+        permission_risks, permission_evidence = self._authorization_uncertainty(job)
+        risks.extend(permission_risks)
+        audit.extend(permission_evidence)
+        if permission_risks:
+            reasons.append("Mandatory work permission must be verified for the applicant.")
+
         language_blockers, language_risks = self._language_signals(job, text_blob)
         blockers.extend(language_blockers)
         risks.extend(language_risks)
@@ -225,6 +261,7 @@ class RuleEngine:
             decision = FilterDecision.REJECT
         elif risks and (
             self.rules.recall_first or "role:required_scope_unconfirmed" in risks
+            or any(risk.startswith("authorization:") for risk in risks)
         ):
             reasons.append("Keep this opportunity for manual review of the flagged conditions.")
             decision = FilterDecision.REVIEW
@@ -243,7 +280,7 @@ class RuleEngine:
         bucket = "Bucket C" if decision == FilterDecision.REJECT else "Bucket B"
 
         audit.extend(reasons)
-        return JobEvaluation(
+        evaluation = JobEvaluation(
             decision=decision,
             matched_signals=sorted(set(matched)),
             blocker_signals=sorted(set(blockers)),
@@ -255,6 +292,10 @@ class RuleEngine:
             risks=sorted(set(risks)),
             audit_log=audit,
         )
+        if self._hiring_location_confirmed(job) and not language_risks:
+            evaluation.eligibility_status = "eligible"
+        refresh_eligibility_status(evaluation)
+        return evaluation
 
     def apply(self, job: JobRecord) -> EvaluatedJob:
         return EvaluatedJob(record=job, evaluation=self.evaluate(job))
@@ -286,6 +327,14 @@ class RuleEngine:
             for match in _REGION_EXCLUSION.finditer(text)
         ):
             return False
+        restricted = re.search(
+            r"\banywhere\s+(?:in|within|across)\s+(?:the\s+)?([^;!?|\n]+)",
+            self._geo_text(text),
+        )
+        if restricted and not self._target_residency(restricted[1]) and not re.search(
+            r"\b(?:world|worldwide|globe)\b", restricted[1],
+        ):
+            return False
         return bool(asserted_phrase_hits(
             self._geo_text(text), [
                 self._geo_text(place)
@@ -298,6 +347,7 @@ class RuleEngine:
         remote_policies = {
             "worldwide", "global remote", "globally remote", "remote anywhere", "anywhere",
             "work from anywhere",
+            "global",
         }
         places = [
             self._geo_text(place)
@@ -398,6 +448,15 @@ class RuleEngine:
             eligibility_description(job),
         ]))
         text = self._geo_text(geography_text)
+        for clause in assertion_clauses(text):
+            match = re.search(
+                r"\banywhere\s+(?:in|within|across)\s+(?:the\s+)?([^;!?|\n]+)", clause,
+            )
+            if (
+                match and not self._target_location(match[0])
+                and asserted_phrase_hits(clause, [match[0].rstrip(". ")], required=True)
+            ):
+                blockers.append(match[0].rstrip(". "))
         location_requirements = job.source_metadata.get("applicant_location_requirements")
         structured_eligibility = False
         if isinstance(location_requirements, list) and location_requirements:
@@ -415,12 +474,18 @@ class RuleEngine:
             r"(?:applicants|candidates) (?:must )?(?:be based|reside|live)) in\s+"
             r"([^;!?\n|]+)"
         )
+        role_location = re.compile(
+            r"\b(?:(?:this|the) (?:role|position|job) (?:is|will be)|"
+            r"(?:the )?(?:successful|selected) candidate (?:must be|will be))\s+"
+            r"(?:based|located) in\s+([^;!?\n|]+)", re.I,
+        )
         # Extract from sentence-aware clauses: a dot inside U.S./U.K. must not
         # truncate an allowed alternative such as "the U.S. or Brazil".
         # Split before case-folding so "U.S. Brazil ..." remains two sentences.
         residency_matches = [
             match for clause in assertion_clauses(geography_text)
-            for match in residency.finditer(self._geo_text(clause))
+            for pattern in (residency, role_location)
+            for match in pattern.finditer(self._geo_text(clause))
         ]
         asserted_residency = []
         for match in residency_matches:
@@ -432,7 +497,8 @@ class RuleEngine:
             asserted_residency.append(match)
             location = re.split(
                 r"\b(?:and (?:have|be|work)|with|for this role|as|where|because|but|however|"
-                r"although|while|contractor|async|distributed|remote|remotely|we|our)\b", match[1]
+                r"although|while|contractor|async|distributed|remote|remotely|we|our|"
+                r"and (?:involves|requires|includes|is|will))\b", match[1]
             )[0]
             if self.rules.recall_first and re.search(
                 r"\b(?:eligible|approved|supported|listed|certain|these|office|one of|"
@@ -513,7 +579,85 @@ class RuleEngine:
             permitted = permitted or self._description_confirms_eligibility(job)
             if not permitted:
                 risks.append("geography:eligibility_unconfirmed")
-        return sorted(set(blockers)), risks
+        # One missing office/country fact should not create several independent
+        # REVIEW reasons or an apparent probability of hiring.
+        if any(risk.startswith("geography:") and risk != "geography:eligibility_unconfirmed"
+               for risk in risks):
+            risks = [risk for risk in risks if risk != "geography:eligibility_unconfirmed"]
+        return sorted(set(blockers)), sorted(set(risks))
+
+    def _hiring_location_confirmed(self, job: JobRecord) -> bool:
+        requirements = job.source_metadata.get("applicant_location_requirements")
+        structured = isinstance(requirements, list) and any(
+            isinstance(place, str) and self._target_location(place) for place in requirements
+        )
+        return bool(structured or self._target_location(" | ".join(filter(None, [
+            job.location_text, job.remote_text,
+        ]))) or self._description_confirms_eligibility(job))
+
+    def _authorization_blockers(self, job: JobRecord) -> list[str]:
+        # Extend the configured US authorization policy to spelling variants;
+        # this grammar does not invent the applicant's actual immigration status.
+        if not any(re.search(r"authorization|authorized to work", phrase, re.I)
+                   for phrase in self.rules.blocker_phrases):
+            return []
+        country = r"(?:u\.?s\.?(?:a\.?)?|united states(?: of america)?)"
+        pattern = re.compile(
+            rf"\b(?:legally\s+)?authori[sz]ed\s+to\s+work\s+"
+            rf"(?:for\s+any\s+employer\s+)?in\s+(?:the\s+)?{country}(?!\w)", re.I,
+        )
+        hits = []
+        clauses = assertion_clauses(eligibility_description(job))
+        for index, clause in enumerate(clauses):
+            if "?" in clause or (
+                index + 1 < len(clauses) and clauses[index + 1].strip() == "?"
+            ):
+                continue
+            for match in pattern.finditer(clause):
+                if asserted_phrase_hits(clause, [match[0]], required=True):
+                    hits.append(match[0])
+        return sorted(set(hits))
+
+    def _authorization_uncertainty(self, job: JobRecord) -> tuple[list[str], list[str]]:
+        """A required permission is a job fact; the applicant's permission is unknown.
+
+        This never turns a Brazil/Ireland permission into a personal legal verdict.
+        The separately configured hard authorization blockers retain their policy.
+        """
+        permission = re.compile(
+            r"\b(?:must|need to|have to|are required to)\s+"
+            r"(?:(?:have|hold|possess|obtain)\s+(?:the\s+)?(?:legal\s+)?"
+            r"(?:right|permission|authori[sz]ation|permit)\s+to\s+(?:live\s+and\s+)?work|"
+            r"be\s+(?:legally\s+)?authori[sz]ed\s+to\s+work)|"
+            r"\b(?:as long as|provided that|only if)\b[^.;!?\n|]{0,100}"
+            r"\bauthori[sz]ed to work\b", re.I,
+        )
+        sponsorship = re.compile(
+            r"\b(?:will not|do not|does not|cannot|can not|unable to)\s+"
+            r"(?:provide\s+)?sponsor(?:ship)?\b[^.;!?\n|]{0,50}"
+            r"\b(?:applicants?|candidates?|work visas?|visas?|work permits?)\b|"
+            r"\bno\s+(?:visa\s+)?sponsorship\s+(?:is\s+)?(?:provided|available|offered)\b",
+            re.I,
+        )
+        risks, evidence = [], []
+        for clause in assertion_clauses(eligibility_description(job)):
+            if re.search(r"\b(?:customers?|clients?|users?)\b", clause, re.I) and not re.search(
+                r"\b(?:you|applicants?|candidates?)\b", clause, re.I,
+            ):
+                continue
+            for match in permission.finditer(clause):
+                if not re.search(r"\b(?:may|might|could|possibly|whether)\b", clause, re.I) and (
+                    asserted_phrase_hits(clause, [match[0]], required=True)
+                ):
+                    risks.append("authorization:work_permission_unconfirmed")
+                    evidence.append("Source work permission requirement: " + clause.strip())
+            # Optional visa benefits and quoted questions do not establish a restriction.
+            if ("?" not in clause and sponsorship.search(clause) and not re.search(
+                r"\b(?:may|might|could|optional|possibly|whether)\b", clause, re.I,
+            )):
+                risks.append("authorization:sponsorship_unconfirmed")
+                evidence.append("Source sponsorship restriction: " + clause.strip())
+        return sorted(set(risks)), sorted(set(evidence))
 
     def _description_confirms_eligibility(self, job: JobRecord) -> bool:
         for clause in assertion_clauses(eligibility_description(job)):
@@ -536,12 +680,40 @@ class RuleEngine:
                 r"not permitted|not allowed)\b", clause, re.I,
             ):
                 continue
-            if not re.search(
-                r"\b(?:remote|remotely|work from|work anywhere|hire|hiring|eligible|"
-                r"eligibility|applicants?|candidates?|this role|role|position|contractor|"
-                r"location|based|reside|live)\b", clause, re.I,
+            normalized = self._geo_text(clause)
+            # A regional label must modify where this vacancy can hire/work.
+            # Global teams, worldwide customers and LATAM benefits are footprint,
+            # rather than an employer's hiring permission for this applicant.
+            hiring_context = re.search(
+                r"\b(?:remote(?:ly)?(?:\s+(?:work|role|position|job|working))?\s+"
+                r"(?:in|from|across|throughout)|"
+                r"(?:global(?:ly)?|worldwide|latam|americas)\s+remote|"
+                r"remote\s+(?:worldwide|globally|anywhere)|"
+                r"work(?:ing)?\s+(?:from\s+)?(?:anywhere|worldwide|globally)|"
+                r"(?:hire|hiring|recruit|recruiting|accept|accepting)\b[^.;!?\n|]{0,60}"
+                r"\b(?:in|from|across)|"
+                r"(?:role|position|job)\s+(?:is\s+)?(?:open|available)\s+to|"
+                r"(?:role|position|job)\s+(?:is\s+)?(?:based|located)\s+in|"
+                r"location(?:\s*(?:&|and)\s*language)?\s*[:\-]?\s*(?:based|located)\s+in|"
+                r"(?:candidates?|applicants?)\b[^.;!?\n|]{0,40}\b(?:based|located|reside|live)\s+in|"
+                r"must\s+(?:reside|live|be based|be located)\s+in)\b", normalized,
+            )
+            if not hiring_context:
+                continue
+            if re.search(r"\bremote$", hiring_context[0]) and re.match(
+                r"\s*(?:team|network|operations|company|culture|collaboration)\b",
+                normalized[hiring_context.end():],
             ):
                 continue
+            global_policy = contains_any(" ".join(self.rules.target_geographies), [
+                "worldwide", "global remote", "globally remote", "global",
+            ])
+            if global_policy and asserted_phrase_hits(normalized, [
+                "work from anywhere", "remote anywhere", "work anywhere",
+            ], required=True) and not re.search(
+                r"\banywhere\s+(?:in|within|across)\b", normalized,
+            ):
+                return True
             targets = self.rules.target_geographies + (self.rules.onsite_locations or [])
             if asserted_phrase_hits(
                 self._geo_text(clause), [self._geo_text(place) for place in targets]

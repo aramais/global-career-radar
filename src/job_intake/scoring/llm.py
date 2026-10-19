@@ -97,6 +97,8 @@ def _apply_semantic_payload(
     explanation = explanation.strip()
 
     evaluation.semantic_score = semantic_score
+    if evaluation.raw_fit_score is not None:
+        evaluation.raw_fit_score += semantic_score
     evaluation.fit_score += semantic_score
     evaluation.bridge_role = evaluation.bridge_role or bridge_role
     if explanation:

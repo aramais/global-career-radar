@@ -14,6 +14,7 @@ from job_intake.annotation.accuracy import (
     operational_metrics,
     proportion,
     read_saved_predictions,
+    readiness_report,
     run_accuracy,
     write_accuracy_report,
 )
@@ -69,6 +70,25 @@ def test_wilson_interval_and_zero_denominator_are_explicit():
     assert proportion(0, 40)["ci95"][1] > 0
     with pytest.raises(ValueError):
         proportion(3, 2)
+
+
+def test_route_coverage_is_independent_of_decision_tier_and_profession():
+    cases = [case("a", 3), case("b", 2), case("c", 0)]
+    predictions = {"a": {**prediction(tier="A", decision="pass"), "route": "full_review"},
+                   "b": {**prediction(tier="B", decision="review"), "route": None},
+                   "c": {**prediction(tier="C", decision="reject"), "route": "invalid_route"}}
+    report = evaluate_vacancies(cases, predictions)
+    assert report["task_prediction_coverage"]["decision"]["value"] == 1
+    assert report["task_prediction_coverage"]["route"]["numerator"] == 1
+    assert report["task_prediction_coverage"]["route"]["denominator"] == 3
+    assert report["routing"]["status"] == "partial"
+    assert report["routing"]["missing_N"] == 2
+    assert report["routing"]["missing_job_uids"] == ["b", "c"]
+    assert readiness_report(report)["tasks"]["route"]["status"] == "partial"
+    assert evaluate_vacancies([], {})["routing"]["status"] == "not_applicable"
+    missing = evaluate_vacancies([case("a", 3)], {"a": prediction(decision="pass", tier="A")})
+    assert missing["routing"]["status"] == "unmeasured"
+    assert missing["routing"]["missing_N"] == 1
 
 
 def test_saved_adapter_maps_focus_restrictions_and_prefilter_without_title_guessing():
@@ -239,6 +259,63 @@ def test_unlabeled_templates_produce_null_accuracy_not_zero():
     assert report["tags"]["project_management"]["accuracy"]["value"] is None
 
 
+def test_labels_alone_cannot_claim_a_measured_baseline_or_pass_acceptance():
+    evaluation = evaluate_vacancies(
+        [case(str(index), 2, tags={"project_management": {"value": "duty"}})
+         for index in range(160)], {},
+    )
+    readiness = readiness_report(evaluation)
+    assert readiness["labels_present"] and readiness["human_labels_ready"]
+    assert not readiness["baseline_measured"]
+    assert not readiness["gold_ready"]
+    assert readiness["status"] == "pending_predictions"
+    assert readiness["tasks"]["decision"]["status"] == "unmeasured"
+    assert readiness["tasks"]["role_classification"]["status"] == "unmeasured"
+    assert readiness["tasks"]["ranking"]["status"] == "unmeasured"
+    assert readiness["tasks"]["tags.project_management"]["status"] == "unmeasured"
+    assert readiness["acceptance_passed"] is False
+    assert all(gate["status"] == "insufficient_evidence" and not gate["passed"]
+               for gate in readiness["gates"])
+
+
+def test_partial_task_coverage_is_not_a_complete_baseline():
+    cases = [case(uid, 2, tags={"project_management": {"value": "duty"}})
+             for uid in ("a", "b")]
+    predictions = {"a": {**prediction(tags={"project_management": "duty"}),
+                         "role_label": "analytics-leadership"}}
+    readiness = readiness_report(evaluate_vacancies(cases, predictions))
+    assert not readiness["baseline_measured"] and not readiness["prediction_complete"]
+    for name in ("decision", "role_classification", "ranking", "tags.project_management"):
+        assert readiness["tasks"][name]["status"] == "partial"
+        assert readiness["tasks"][name]["coverage"]["value"] == 0.5
+
+
+def test_correct_other_role_has_measured_decision_and_no_ranking_task():
+    evaluation = evaluate_vacancies(
+        [{**case("other", 0), "role_label": "other"}],
+        {"other": {"role_label": "other", "decision": "review", "tier": None,
+                   "fit_score": None, "tags": {}, "gate_outcome": "eligible",
+                   "route": "full_review"}},
+    )
+    readiness = readiness_report(evaluation)
+    assert readiness["tasks"]["decision"]["prediction_complete"]
+    assert readiness["tasks"]["role_classification"]["prediction_complete"]
+    assert readiness["tasks"]["ranking"]["status"] == "not_applicable"
+    assert readiness["baseline_measured"]
+    assert readiness["acceptance_status"] == "insufficient_evidence"
+
+
+def test_eligibility_is_measured_separately_without_deriving_it_from_role_or_relevance():
+    evaluation = evaluate_vacancies(
+        [case("explicit", 0, gate="ineligible"), case("absent", 3, gate="eligible")],
+        {"explicit": {**prediction(tier="A", decision="pass"), "gate_outcome": "ineligible"},
+         "absent": prediction(tier="A", decision="pass")},
+    )
+    assert evaluation["eligibility"]["accuracy"]["value"] == 0.5
+    assert evaluation["eligibility"]["prediction_coverage"]["value"] == 0.5
+    assert evaluation["eligibility"]["confusion"]["eligible"] == {"__abstained__": 1}
+
+
 def test_operational_unknowns_stay_null_and_partial_usage_is_visible():
     report = operational_metrics(
         [
@@ -365,7 +442,8 @@ def test_stability_kappa_uses_pairs_and_explicit_missingness():
     assert scope["missing"] == 1
     assert scope["sample_ready"] is False
     assert report["tags"]["working_language"]["kappa"] is None
-    assert report["acceptance_passed"] is None
+    assert report["acceptance_passed"] is False
+    assert report["acceptance_status"] == "insufficient_evidence"
 
 
 def test_stability_single_category_kappa_is_undefined():
@@ -432,6 +510,51 @@ def stored(tmp_path):
     return path, settings, record
 
 
+@pytest.mark.parametrize("role,tier,score", [("analytics-leadership", "B", 10),
+                                           ("other", None, None)])
+def test_new_saved_eligibility_is_independent_and_other_needs_no_rank(stored, role, tier, score):
+    path, settings, record = stored
+    with sqlite3.connect(path) as connection:
+        for name, kind in (("eligibility_status", "TEXT"), ("eligibility_evidence_status", "TEXT"),
+                           ("raw_fit_score", "REAL"), ("score_cap_reasons", "TEXT"),
+                           ("version_components", "TEXT")):
+            connection.execute(f"ALTER TABLE job_relevance_evaluations ADD COLUMN {name} {kind}")
+        connection.execute("UPDATE jobs SET role_label=?,role_classification=?", (role, json.dumps({
+            "label": role, "version": "test", "source_hash": source_hash(record),
+            "content_hash": "content",
+        })))
+        connection.execute("UPDATE job_relevance_evaluations SET profile_id=?,tier=?,fit_score=?,"
+                           "eligibility_status='ineligible',eligibility_evidence_status='blocked',"
+                           "raw_fit_score=21.5,score_cap_reasons=?,version_components=?",
+                           (role, tier, score, '["hiring_block"]', '{"scoring":"new"}'))
+    before = path.read_bytes()
+    result = read_saved_predictions(settings.database_url, [("uid", record)])["uid"]
+    assert result["gate_outcome"] == "ineligible"
+    assert result["decision"] == "review"
+    assert result["eligibility_evidence_status"] == "blocked"
+    assert result["score_cap_reasons"] == ["hiring_block"]
+    assert result["version_components"] == {"scoring": "new"}
+    assert result["raw_fit_score"] == (None if role == "other" else 21.5)
+    assert result["tier"] == (None if role == "other" else "B")
+    assert path.read_bytes() == before
+
+
+def test_legacy_missing_eligibility_and_stale_new_assessments_abstain(stored):
+    path, settings, record = stored
+    old = read_saved_predictions(settings.database_url, [("uid", record)])["uid"]
+    assert old["gate_outcome"] is None
+    assert old["eligibility_provenance"]["source"] == "missing_column"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "ALTER TABLE job_relevance_evaluations ADD COLUMN eligibility_status TEXT"
+        )
+        connection.execute("UPDATE job_relevance_evaluations SET eligibility_status='eligible',"
+                           "content_hash='older-source'")
+    stale = read_saved_predictions(settings.database_url, [("uid", record)])["uid"]
+    assert stale["gate_outcome"] is None
+    assert stale["eligibility_provenance"]["column_present"]
+
+
 def test_saved_relevance_with_stale_version_is_withheld(stored):
     path, settings, record = stored
     with sqlite3.connect(path) as connection:
@@ -477,7 +600,7 @@ def test_complete_decision_labels_without_tags_or_blind_sample_are_not_ready(sto
     assert report["evaluation"]["counts"]["decision_labeled"] == 160
     assert report["readiness"]["gold_ready"] is False
     assert report["readiness"]["status"] == "pending_tag_or_blind_labels"
-    assert report["readiness"]["acceptance_passed"] is None
+    assert report["readiness"]["acceptance_passed"] is False
 
 
 def test_run_accuracy_on_templates_writes_readonly_json_and_markdown(stored, tmp_path, monkeypatch):
@@ -517,6 +640,52 @@ def test_run_accuracy_on_templates_writes_readonly_json_and_markdown(stored, tmp
     assert json.loads(output.read_text())["evaluation"]["metrics"]["precision_A"]["value"] is None
     assert "unknown" in output.with_suffix(".md").read_text()
     assert path.read_bytes() == before
+
+
+def test_archived_gold_member_is_evaluated_readonly_and_not_silently_dropped(stored, tmp_path):
+    path, settings, record = stored
+    with sqlite3.connect(path) as connection:
+        connection.execute("ALTER TABLE jobs ADD COLUMN archived_at TEXT")
+        connection.execute("UPDATE jobs SET archived_at='2026-10-19'")
+    gold = tmp_path / "archived-gold.jsonl"
+    gold.write_text(json.dumps({
+        **case("uid", 2), "source_hash": source_hash(record), "text_version": TEXT_VERSION,
+        "labeled_at": "2026-10-19", "method": "blind", "tags": {}, "notes": "",
+    }) + "\n")
+    before = path.read_bytes()
+    report = run_accuracy(
+        settings, gold=gold, prices=Path(__file__).parents[1] / "config/eval_prices.yaml",
+    )
+    assert report["selection"]["include_archived"] is True
+    assert report["evaluation"]["counts"]["decision_labeled"] == 1
+    assert report["evaluation"]["task_prediction_coverage"]["decision"]["value"] == 1
+    assert path.read_bytes() == before
+
+
+def test_blind_label_sample_without_predictions_is_not_ready(stored, tmp_path):
+    path, settings, record = stored
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE jobs SET role_classification='{}'")
+        for index in range(1, 44):
+            connection.execute(
+                "INSERT INTO jobs SELECT ?, source, company, title, original_url, description_raw, "
+                "description_clean, source_metadata, annotation, updated_at, content_hash, status, "
+                "role_label, role_classification FROM jobs WHERE job_uid='uid'",
+                (f"uid-{index}",),
+            )
+    gold = tmp_path / "blind-gold.jsonl"
+    gold.write_text("".join(json.dumps({
+        **case("uid" if index == 0 else f"uid-{index}", 2),
+        "source_hash": source_hash(record), "text_version": TEXT_VERSION,
+        "labeled_at": "2026-10-19", "method": "blind", "tags": {}, "notes": "",
+    }) + "\n" for index in range(44)))
+    report = run_accuracy(
+        settings, gold=gold, prices=Path(__file__).parents[1] / "config/eval_prices.yaml",
+    )
+    assert report["readiness"]["blind_label_sample_ready"] is True
+    assert report["readiness"]["blind_sample_ready"] is False
+    assert report["readiness"]["baseline_measured"] is False
+    assert report["readiness"]["blind_tasks"]["decision"]["coverage"]["numerator"] == 0
 
 
 def test_outputs_protect_both_sibling_inputs_before_any_write(stored, tmp_path):

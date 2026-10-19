@@ -246,21 +246,30 @@ def test_source_drift_blocks_rebinding_and_leaves_snapshot_visible(labeling):
     assert not (path.parent / "backups").exists()
 
 
-@pytest.mark.parametrize("source_state", ["missing", "archived", "malformed"])
-def test_missing_archived_or_malformed_database_still_displays_snapshot(labeling, source_state):
+@pytest.mark.parametrize("source_state", ["missing", "malformed"])
+def test_missing_or_malformed_database_still_displays_snapshot(labeling, source_state):
     config, path, database, cases = labeling
     if source_state == "malformed":
         database.write_bytes(b"Not a SQLite database")
     else:
         with sqlite3.connect(database) as connection:
-            if source_state == "missing":
-                connection.execute("DELETE FROM jobs WHERE job_uid='uid-1'")
-            else:
-                connection.execute("UPDATE jobs SET archived_at='2026-10-17' WHERE job_uid='uid-1'")
+            connection.execute("DELETE FROM jobs WHERE job_uid='uid-1'")
     detail = GoldLabelStore(config, path).detail("uid-1")
     assert not detail["can_save"]
     assert detail["source"] == cases[1]["source"]
     assert detail["source_state"] == ("unavailable" if source_state == "malformed" else "missing")
+
+
+def test_archived_cohort_member_stays_available_for_gold_labels_readonly(labeling):
+    config, path, database, cases = labeling
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE jobs SET archived_at='2026-10-17' WHERE job_uid='uid-1'")
+    before = database.read_bytes()
+    detail = GoldLabelStore(config, path).detail("uid-1")
+    assert detail["can_save"]
+    assert detail["source_state"] == "current"
+    assert detail["source"] == cases[1]["source"]
+    assert database.read_bytes() == before
 
 
 def test_missing_gold_and_memory_constructor_are_lazy(labeling, tmp_path):

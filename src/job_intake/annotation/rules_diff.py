@@ -332,12 +332,14 @@ def _snapshot_baseline(path: Path, source_fingerprint: str, job_uids: set[str]) 
 def run_rules_diff(
     config: AppConfig, *, baseline: str, repository: Path | None = None,
     limit: int | None = None, job_uids: list[str] | None = None,
+    include_archived: bool = False,
 ) -> dict:
     """Return free drift diagnostics, including a reusable current-result snapshot.
 
     ``baseline`` accepts a local Git commit ref or a previous rules-diff JSON
     report. Snapshot baselines must match these exact source and annotation inputs.
-    Only active vacancies are selected, using ``read_saved_records(mode=ro)``.
+    Active vacancies are selected by default, using ``read_saved_records(mode=ro)``.
+    Gold comparisons can explicitly include archived cohort members.
     """
     repository = (repository or Path.cwd()).expanduser().resolve()
     root = Path(_git(repository, "rev-parse", "--show-toplevel").decode().strip())
@@ -351,11 +353,12 @@ def run_rules_diff(
         raise ValueError("rules-diff requires configs inside the Git repository") from None
     database, selected, problems = read_saved_records(
         config.database_url, limit=limit, job_uids=job_uids,
+        include_archived=include_archived,
     )
     if problems:
         raise ValueError("rules-diff requires valid saved source and annotation records")
     if not selected:
-        raise ValueError("No active vacancies selected for rules-diff")
+        raise ValueError("No vacancies selected for rules-diff")
     records = []
     for uid, record in selected:
         saved = {
@@ -418,7 +421,8 @@ def run_rules_diff(
             "saved_annotation_facts": "fixed", "paid_prefilter": "excluded",
             "semantic_reranking": "excluded", "annotation_refresh": "excluded",
         },
-        "selection": {"limit": limit, "job_uids": job_uids or [], "archived": False},
+        "selection": {"limit": limit, "job_uids": job_uids or [],
+                      "include_archived": include_archived},
         "source_snapshot": {"fingerprint": source_fingerprint, "jobs": len(records)},
         "baseline": previous, "current": current,
         "counts": {

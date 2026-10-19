@@ -23,6 +23,7 @@ from job_intake.crm.jobs import JOB_QUERY_FIELDS, job_detail, list_job_page
 from job_intake.crm.repository import CRMRepository, serialize_application
 from job_intake.crm.schemas import CRMConflictError
 from job_intake.profiles import load_streams, with_other_stream
+from job_intake.purpose import PurposeConflictError, update_human_purpose
 from job_intake.storage.database import Database
 from job_intake.storage.models import JobORM
 from job_intake.storage.repository import JobArchiveConflictError, JobRepository
@@ -303,7 +304,7 @@ class CRMService:
             if query.get("include_jobs", "true") == "true":
                 page = list_job_page(session, versions, {
                     key: value for key, value in query.items() if key in JOB_QUERY_FIELDS
-                })
+                }, {stream.id: stream.version_components for stream in self.streams})
             raw = metrics
             metrics = {
                 **raw,
@@ -353,7 +354,8 @@ class CRMService:
         if query.get("profile_id"):
             self.validate_profile(query["profile_id"])
         with self.database.session() as session:
-            return list_job_page(session, {s.id: s.version for s in self.streams}, query)
+            return list_job_page(session, {s.id: s.version for s in self.streams}, query,
+                                 {s.id: s.version_components for s in self.streams})
 
     def gold_cases(self, query: dict[str, str]) -> dict:
         return self.gold_store.list_cases(query)
@@ -375,7 +377,8 @@ class CRMService:
 
     def job(self, uid: str) -> dict:
         with self.database.session() as session:
-            result = job_detail(session, {s.id: s.version for s in self.streams}, uid)
+            result = job_detail(session, {s.id: s.version for s in self.streams}, uid,
+                                {s.id: s.version_components for s in self.streams})
             if result is None:
                 raise RequestError("Вакансия не найдена", 404)
             return result
@@ -404,7 +407,23 @@ class CRMService:
             return self.gold_store.save(unquote(parts[2]), payload)
         with self.database.session() as session:
             repo = CRMRepository(session)
-            if method == "PATCH" and path == "/api/jobs/archive":
+            if (method == "PATCH" and len(parts) == 4 and parts[:2] == ["api", "jobs"]
+                    and parts[3] == "purpose"):
+                uid = unquote(parts[2])
+                if not uid or len(uid) > 100:
+                    raise RequestError("Некорректный ID вакансии")
+                if session.scalar(select(JobORM.id).where(JobORM.job_uid == uid)) is None:
+                    raise RequestError("Вакансия не найдена", 404)
+                try:
+                    purpose = update_human_purpose(session, uid, payload)
+                except PurposeConflictError as exc:
+                    raise RequestError(
+                        "Назначение или исходник изменён. Обновите карточку перед сохранением", 409,
+                    ) from exc
+                except ValueError as exc:
+                    raise RequestError(str(exc)) from exc
+                result = {"job_uid": uid, "purpose": purpose}
+            elif method == "PATCH" and path == "/api/jobs/archive":
                 archived, requests = _archive_batch(payload)
                 jobs = JobRepository(session)
                 results = []

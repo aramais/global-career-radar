@@ -180,5 +180,6 @@ def test_other_is_unscored_and_preserves_mandatory_gate(tmp_path):
     blocked_detail = job_detail(repo.session, {"other": "v1"}, blocked_result.job_uid)
     assert blocked_detail["relevance"] is None
     assert blocked_detail["eligibility"] == {"decision": "reject",
+                                              "status": "ineligible", "evidence_status": "blocked",
                                               "blocker_signals": ["status:closed"], "risks": []}
     assert len(_export(repo, tmp_path, wide=True, include_rejected=True)) == 2

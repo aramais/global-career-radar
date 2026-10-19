@@ -83,6 +83,21 @@ def _run(fixture, baseline=None):
     return run_rules_diff(config, baseline=baseline or commit, repository=repository)
 
 
+def test_gold_comparison_can_explicitly_include_archived_cohort(policy_repository):
+    repository, config, commit = policy_repository
+    database = repository / "jobs.db"
+    before = database.read_bytes()
+    with pytest.raises(ValueError, match="Requested jobs"):
+        run_rules_diff(config, baseline=commit, repository=repository,
+                       job_uids=["archived-job"])
+    report = run_rules_diff(config, baseline=commit, repository=repository,
+                            job_uids=["archived-job"], include_archived=True)
+    assert report["selection"]["include_archived"] is True
+    assert report["counts"]["jobs"] == 1
+    assert {row["job_uid"] for row in report["current"]["evaluations"]} == {"archived-job"}
+    assert database.read_bytes() == before
+
+
 def test_identical_git_revision_has_parity_and_keeps_database_read_only(policy_repository):
     repository, config, commit = policy_repository
     database = repository / "jobs.db"

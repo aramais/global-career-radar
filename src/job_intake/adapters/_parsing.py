@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from html import unescape
 from urllib.parse import urljoin, urlparse
@@ -9,6 +10,15 @@ from bs4 import BeautifulSoup
 
 from job_intake.models.job import JobRecord, JobStatus
 from job_intake.utils.text import compact_text
+
+
+def description_text(value: str | None) -> str:
+    """Normalize horizontal spacing while retaining source assertion boundaries."""
+    if not value:
+        return ""
+    return "\n".join(
+        line for raw_line in str(value).splitlines() if (line := compact_text(raw_line))
+    )
 
 
 def html_text(value: str | None) -> str:
@@ -25,7 +35,20 @@ def html_text(value: str | None) -> str:
     soup = BeautifulSoup(decoded, "html.parser")
     for node in soup.select("script, style, noscript"):
         node.decompose()
-    return compact_text(soup.get_text(" ", strip=True))
+    # Inline formatting cannot join two independent eligibility assertions.
+    # Conversely, inserting a separator around every span/bold node would split
+    # an assertion such as "No <b>US work authorization</b> required".
+    for node in soup.find_all([
+        "address", "article", "aside", "blockquote", "dd", "div", "dl", "dt",
+        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
+        "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre",
+        "section", "table", "tbody", "td", "th", "thead", "tr", "ul",
+    ]):
+        node.insert_before("\n")
+        node.insert_after("\n")
+    for node in soup.find_all("br"):
+        node.replace_with("\n")
+    return description_text(soup.get_text())
 
 
 def parse_date(value: object) -> datetime | None:
@@ -36,6 +59,20 @@ def parse_date(value: object) -> datetime | None:
         return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
     except ValueError:
         return None
+
+
+def publication_metadata(value: object, source: str) -> dict:
+    """A source timestamp is exact only to its advertised precision, never collection time."""
+    label = value.strip() if isinstance(value, str) else None
+    date = parse_date(value)
+    precision = (
+        "day" if date and re.fullmatch(r"\d{4}-\d{2}-\d{2}", label or "") else
+        "timestamp" if date else "unknown"
+    )
+    return {
+        "published_label": label, "date_precision": precision,
+        "date_source": source if label else None, "publication_date_estimated": False,
+    }
 
 
 def same_origin_url(base_url: str, candidate_url: str) -> bool:
@@ -173,6 +210,7 @@ def enrich_from_detail(job: JobRecord, soup: BeautifulSoup, selector: str | None
                 description_complete=True,
                 description_source="json_ld",
                 applicant_location_requirements=eligibility,
+                **publication_metadata(posting.get("datePosted"), "json_ld:datePosted"),
             )
             return True
 

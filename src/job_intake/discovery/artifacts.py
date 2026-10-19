@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import os
+import re
 import tempfile
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -128,9 +131,72 @@ def candidate_keys(record: JobRecord) -> set[str]:
     body = normalize_text(record.description_clean or record.description_raw)
     if body:
         basis = "|".join((normalize_text(record.company), normalize_text(record.title),
-                          normalize_text(record.source_job_id), body))
+                          normalize_text(record.source_job_id),
+                          regional_context(record), body))
         keys.add("body:" + stable_hash(basis))
     return keys
+
+
+def _review_text(value: str | None) -> str:
+    """Normalize presentation without dropping negation, numbers, or non-Latin text."""
+    text = unicodedata.normalize("NFKC", html.unescape(value or "")).casefold()
+    text = text.translate(str.maketrans({"–": "-", "—": "-", "’": "'", "‘": "'"}))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+_SALARY_CURRENCY = re.compile(
+    r"(\b(?:salary|compensation|pay)\b(?:(?![.!?](?:\s|$)).){0,160}?\d[\d,.]*\s+)"
+    r"(?:usd|cad|aud|nzd|eur|gbp|brl)\b"
+)
+
+
+def review_content_keys(record: JobRecord) -> set[str]:
+    """Identify repeated descriptions for review, independently of requisition identity.
+
+    A regional copy can have a different ATS ID, URL, location or pay currency while
+    asking the reviewer to read the same responsibilities again. These fingerprints
+    only suppress that repeated review; they must never merge source records, alter
+    ``candidate_uid`` or transfer human relevance/eligibility labels between records.
+
+    Exact normalized bodies are grouped only within the same named company and title.
+    For substantial descriptions, a second key ignores a currency code immediately
+    after an amount in an explicit salary statement. Everything else, including pay
+    amounts and hiring restrictions written in the description, remains significant.
+    There is deliberately no fuzzy similarity threshold or broad boilerplate removal.
+    """
+    company, title = _review_text(record.company), _review_text(record.title)
+    body = _review_text(record.description_clean or record.description_raw)
+    if not company or not title or not body:
+        return set()
+    basis = "|".join((company, title, body))
+    keys = {"review-body-v1:" + stable_hash(basis)}
+    if len(body) >= 500 and len(body.split()) >= 60:
+        currency_neutral = _SALARY_CURRENCY.sub(r"\1[currency]", body)
+        if currency_neutral != body:
+            basis = "|".join((company, title, currency_neutral))
+            keys.add("review-salary-currency-v1:" + stable_hash(basis))
+    return keys
+
+
+def regional_context(record: JobRecord) -> str:
+    """An unknown region is distinct from a proven country or hiring condition."""
+    facts = {field: getattr(record, field, None) for field in (
+        "location_text", "remote_text", "timezone_text", "employment_type",
+    )}
+    facts["hiring"] = {key: value for key, value in record.source_metadata.items()
+                       if any(term in key.lower() for term in (
+                           "eligib", "applicant", "location", "country", "authoriz", "visa"))}
+    return stable_hash(json.dumps(facts, sort_keys=True, ensure_ascii=False, default=str))
+
+
+def review_queue_keys(record: JobRecord) -> set[str]:
+    """Suppress a repeated review only within an identical regional context.
+
+    ``review_content_keys`` remains a cluster relationship; it never transfers
+    source identity, eligibility or human labels between regional variants.
+    """
+    context = regional_context(record)
+    return {key + ":region:" + context for key in review_content_keys(record)}
 
 
 def candidate_uid(record: JobRecord) -> str:

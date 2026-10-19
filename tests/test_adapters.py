@@ -215,7 +215,7 @@ def test_dailyremote_current_next_page_link_collects_unique_jobs_within_limit(mo
     jobs = adapter.fetch_jobs()
     assert [job.original_url for job in jobs] == [first_detail, second_detail]
     assert all(job.source_metadata["description_complete"] for job in jobs)
-    assert calls == [page1, first_detail, page2, second_detail]
+    assert calls == [page1, page2, first_detail, second_detail]
     assert len(adapter.errors) == 1
     assert "pagination limit" in adapter.errors[0]
 
@@ -331,7 +331,7 @@ def test_dailyremote_visible_prose_excludes_summary_and_promotion(monkeypatch):
         },
     )
     job = DailyRemoteAdapter("dailyremote", {"search_urls": [LISTING_URL]}).fetch_jobs()[0]
-    assert job.description_clean == "Lead analytics for product teams. Must live in Brazil."
+    assert job.description_clean == "Lead analytics for product teams.\nMust live in Brazil."
     assert job.source_metadata["description_complete"] is True
     assert "AI short summary" not in job.description_clean
     assert "worldwide" not in job.description_clean
@@ -405,7 +405,7 @@ def test_greenhouse_decodes_full_body_and_does_not_use_edit_date_as_posting_date
     assert len(jobs) == 1
     job = jobs[0]
     assert urls == ["https://boards-api.greenhouse.io/v1/boards/example/jobs?content=true"]
-    assert job.description_clean == "Lead analytics. Must reside in Brazil."
+    assert job.description_clean == "Lead analytics.\nMust reside in Brazil."
     assert job.company == "Example"
     assert job.posted_at is None
     assert job.source_metadata["updated_at"] == "2026-09-29T00:00:00Z"
@@ -444,7 +444,7 @@ def test_ashby_keeps_multiple_locations_compensation_and_publication_date(monkey
     assert job.location_text == "São Paulo, Brazil; Remote, Brazil"
     assert job.remote_text == "Hybrid"
     assert job.posted_at == datetime(2026, 9, 25, 12, 30, tzinfo=UTC)
-    assert job.description_clean == "Own the roadmap. English required."
+    assert job.description_clean == "Own the roadmap.\nEnglish required."
     assert job.salary_text == "$100K – $150K"
     assert job.apply_url.endswith("/apply")
 
@@ -481,7 +481,9 @@ def test_lever_full_description_includes_requirements_and_closing_restrictions(m
         "lever", {"site": "example", "company": "Example", "region": "eu"}
     ).fetch_jobs()[0]
     assert urls == ["https://api.eu.lever.co/v0/postings/example?mode=json&skip=0&limit=100"]
-    assert job.description_clean == "Lead DS. Requirements English required. Must reside in Brazil."
+    assert job.description_clean == (
+        "Lead DS.\nRequirements\nEnglish required.\nMust reside in Brazil."
+    )
     assert job.location_text == "Brazil; São Paulo"
     assert job.salary_text == "USD 100000–150000 year"
     assert job.posted_at is None

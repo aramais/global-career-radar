@@ -114,19 +114,20 @@ _COLLABORATOR = re.compile(
     r"\b(?:partner|collaborate|work|coordinate|interact|interface|liaise)\w*\s+"
     r"(?:closely\s+)?with\b", re.I,
 )
-_REPORT_OUTPUT = re.compile(r"\b(?:reports?|reporting|dashboards?)\b", re.I)
+_REPORT_OUTPUT = re.compile(r"(?<!direct )\b(?:reports?|reporting|dashboards?)\b", re.I)
 _REPORT_OWNERSHIP = re.compile(
     r"\b(?:own(?:s|ing)?|build(?:s|ing)?|deliver(?:s|ing)?|"
     r"develop(?:s|ing)?|design(?:s|ing)?|lead(?:s|ing)?)\b"
     r"(?:\s+[\w'-]+|\s*[,/&–—-]\s*){0,10}\s+"
-    r"(?:reports?|reporting|dashboards?)\b", re.I,
+    r"(?<!direct )(?:reports?|reporting|dashboards?)\b", re.I,
 )
 _ANALYTICAL_WORK = re.compile(
     r"\b(?:analy[sz](?:e[sd]?|ing)|analytics|analysis|analytical work|"
     r"experiments?|experimentation|experiment design|causal inference|"
     r"algorithms?|(?:predictive |statistical |machine learning |ltv )?models?|"
     r"pricing|monetization|unit economics|profit and loss|p&l|measurement|"
-    r"decision support|budget planning|forecasting)\b", re.I,
+    r"decision support|budget planning|forecasting|incrementality|causal lift|"
+    r"ltv model(?:ing|ling)?)\b", re.I,
 )
 _ANALYSIS_OWNERSHIP = re.compile(
     r"\b(?:own(?:s|ing)?|lead(?:s|ing)?|driv(?:e[sd]?|ing)|"
@@ -136,7 +137,7 @@ _ANALYSIS_OWNERSHIP = re.compile(
     re.I,
 )
 _DECISION = re.compile(
-    r"\b(?:business|commercial|strategic|product|budget|operational)\s+"
+    r"\b(?:(?:business|commercial|strategic|product|budget|operational)\s+)?"
     r"decision(?:s|[ -]making)?\b", re.I,
 )
 _DECISION_ACTION = re.compile(
@@ -163,10 +164,12 @@ _TECHNICAL_OUTPUT = re.compile(
 _INDEPENDENT_ANALYSIS_OBJECT = re.compile(
     r"\b(?:experiments?|experimentation|experiment design|causal inference|"
     r"(?:predictive |statistical |machine learning |ltv )models?|algorithms?|"
-    r"pricing|monetization|unit economics|budget planning|forecasting)\b", re.I,
+    r"pricing|monetization|unit economics|budget planning|forecasting|"
+    r"incrementality|causal lift|ltv model(?:ing|ling)?)\b", re.I,
 )
 _SHARED_ECONOMIC_DUTY = re.compile(
-    r"\bwork(?:s|ing)?\s+(?:closely\s+)?with\s+(?:the\s+)?"
+    r"\b(?:work(?:s|ing)?|partner(?:s|ing)?|collaborat(?:e[sd]?|ing))\s+"
+    r"(?:closely\s+)?with\s+(?:the\s+)?"
     r"(?:general manager|finance|(?:unit|business|executive) leadership)\b"
     r"(?:\s+[\w&'-]+){0,6}\s+on\s+(?:[\w&'-]+\s+){0,5}"
     r"(?:p&l|profit and loss|pricing|monetization|unit economics|budget planning|"
@@ -178,6 +181,7 @@ _SHARED_ECONOMIC_DUTY = re.compile(
 def _asserted(text: str, match: re.Match[str]) -> bool:
     """Check local negation without treating 'without direct reports' as no scope."""
     prefix, suffix = text[:match.start()], text[match.end():]
+    prefix = re.sub(r"\bwithout (?:any )?direct reports?(?:\s+and)?\s*", "", prefix, flags=re.I)
     negated = re.search(
         r"\b(?:no|not|never|without|don't|doesn't|isn't|aren't|won't)\b"
         r"(?:\s+\w+){0,5}\s*$", prefix, re.I,

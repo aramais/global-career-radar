@@ -243,19 +243,33 @@ def validate_current_cases(
         raise ValueError("Gold must contain vacancy rows with job_uid")
     _, rows, problems = read_saved_records(
         settings.database_url, limit=None, job_uids=[case["job_uid"] for case in cases],
+        include_archived=True,
     )
     if any(item["severity"] == "error" and item["code"] != "invalid_annotation_json"
            for items in problems.values() for item in items):
         raise ValueError("Gold sources contain invalid saved records")
-    report = validate_gold(rows, cases, profile_ids=[role["id"] for role in roles])
+    from job_intake.annotation.source_compat import check_source_compatibility, read_source_history
+
+    records = dict(rows)
+    history = read_source_history(settings.database_url, [
+        case for case in cases if case["source_hash"] != source_hash(records[case["job_uid"]])
+        and case.get("source") in (None, _snapshot(records[case["job_uid"]]))
+    ])
+    report = validate_gold(rows, cases, profile_ids=[role["id"] for role in roles],
+                           source_history=history)
     if not report["valid"]:
         raise ValueError("Invalid gold: " + "; ".join(
             error["code"] + ": " + error["message"] for error in report["errors"]
         ))
     records = dict(rows)
-    if any(case["source_hash"] != source_hash(records[case["job_uid"]]) for case in cases):
+    proofs = {case["job_uid"]: check_source_compatibility(
+        case, records[case["job_uid"]], history=history.get(case["job_uid"]),
+    ) for case in cases}
+    if any(not proof["compatible"] for proof in proofs.values()):
         raise ValueError("Gold source hash is stale; review source drift before importing answers")
-    if any(case.get("source") != _snapshot(records[case["job_uid"]]) for case in cases):
+    if any(case.get("source") != _snapshot(records[case["job_uid"]]) and (
+        proofs[case["job_uid"]]["method"] == "exact_public_hash"
+    ) for case in cases):
         raise ValueError("Gold source snapshot is missing or differs from the current source")
 
 

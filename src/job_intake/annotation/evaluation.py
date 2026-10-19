@@ -12,6 +12,7 @@ from dataclasses import replace
 from typing import Any
 
 from job_intake.annotation.ai import _ERROR_CODES, _FINISH_REASONS
+from job_intake.annotation.input_contract import annotation_input_hash
 from job_intake.annotation.prefilter import (
     PREFILTER_VERSION,
     VacancyPrefilter,
@@ -262,7 +263,13 @@ def _prefilter(
         )
         return "local_reject", True
     helper = _pure_helper(VacancyPrefilter, config)
-    expected = helper._result(source_hash(record))
+    input_hash = annotation_input_hash(record, units)
+    saved_input_hash = saved.get("annotation_input_hash")
+    if saved_input_hash is not None and saved_input_hash != input_hash:
+        _finding(findings, "prefilter_source_mismatch", "Prefilter model input has changed.",
+                 stage="prefilter")
+        return "invalid", False
+    expected = helper._result(source_hash(record), saved_input_hash)
     current_policy = config.enabled
     for name in ("version", "focus_version", "cache_key", "routing_policy_version"):
         if saved.get(name) != expected[name]:
@@ -342,7 +349,14 @@ def _prefilter(
                 stage="prefilter_" + stage,
             )
             continue
-        key = helper._stage_key(stage, source_hash(record), proposed if stage == "verify" else None)
+        key = helper._stage_key(
+            stage, source_hash(record), proposed if stage == "verify" else None,
+            input_hash=row.get("annotation_input_hash"),
+        )
+        if row.get("annotation_input_hash") not in (None, input_hash):
+            _finding(findings, "invalid_prefilter_stage", "Prefilter stage input has changed.",
+                     stage="prefilter_" + stage)
+            continue
         if row.get("stage") != stage or not isinstance(row.get("usage"), dict):
             _finding(
                 findings,
@@ -425,7 +439,7 @@ def _prefilter(
             stage="prefilter",
         )
         return "fallback" if fallback else "invalid", False
-    rebuilt = helper._result(source_hash(record))
+    rebuilt = helper._result(source_hash(record), saved_input_hash)
     rebuilt["stages"] = checked
     helper._apply_stages(rebuilt, units=units)
     if not fallback and any(
@@ -606,6 +620,8 @@ def evaluate_annotation(
     if annotation.get("cache_key") not in (
         helper._cache_key(record),
         enabled_helper._cache_key(record),
+        helper._legacy_cache_key(source_hash(record)),
+        enabled_helper._legacy_cache_key(source_hash(record)),
     ):
         _finding(
             findings,

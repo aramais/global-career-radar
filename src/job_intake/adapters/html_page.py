@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -8,16 +8,19 @@ from job_intake.adapters._parsing import (
     bounded_int,
     enrich_from_detail,
     fetch_detail_text,
+    html_text,
     parse_date,
+    publication_metadata,
     same_origin_url,
 )
-from job_intake.adapters.base import JobSourceAdapter
+from job_intake.adapters.base import JobSourceAdapter, source_snapshot
 from job_intake.models.job import JobRecord
 from job_intake.utils.http import build_session, fetch_text
 from job_intake.utils.text import compact_text
 
 
 class HtmlPageAdapter(JobSourceAdapter):
+    @source_snapshot("page")
     def fetch_jobs(self) -> list[JobRecord]:
         self.errors.clear()
         session = build_session(headers=self.params.get("headers"))
@@ -38,23 +41,32 @@ class HtmlPageAdapter(JobSourceAdapter):
                 compact_text(company_node.get_text(" ", strip=True)) if company_node else None
             )
             if title_node is None or not company:
+                self.errors.append("HTML listing card has no title or company")
                 continue
 
             title = compact_text(title_node.get_text(" ", strip=True))
             job_url = urljoin(self.params["url"], title_node.get("href") or "")
+            if (not title or not title_node.get("href")
+                    or urlparse(job_url).scheme not in {"http", "https"}):
+                self.errors.append("HTML listing card has no valid title/URL")
+                continue
             apply_selector = self.params.get("apply_selector")
             apply_url = None
             if apply_selector:
                 apply_node = card.select_one(apply_selector)
                 if apply_node and apply_node.get("href"):
-                    apply_url = urljoin(self.params["url"], apply_node["href"])
+                    candidate = urljoin(self.params["url"], apply_node["href"])
+                    if urlparse(candidate).scheme in {"http", "https"}:
+                        apply_url = candidate
 
             description_selector = self.params.get("description_selector")
             description = ""
+            description_raw = ""
             if description_selector:
                 desc_node = card.select_one(description_selector)
                 if desc_node:
-                    description = compact_text(desc_node.get_text(" ", strip=True))
+                    description_raw = str(desc_node)
+                    description = html_text(description_raw)
 
             location = self._read_optional_text(card, "location_selector")
             remote = self._read_optional_text(card, "remote_selector")
@@ -64,10 +76,14 @@ class HtmlPageAdapter(JobSourceAdapter):
             source_job_id = card.get(self.params.get("job_id_attribute", "data-job-id"))
 
             posted_at = None
+            published_label = None
             date_selector = self.params.get("posted_at_selector")
             if date_selector:
                 date_node = card.select_one(date_selector)
                 if date_node:
+                    published_label = (
+                        date_node.get("datetime") or date_node.get_text(" ", strip=True)
+                    )
                     posted_at = parse_date(
                         date_node.get("datetime") or date_node.get_text(" ", strip=True)
                     )
@@ -84,7 +100,7 @@ class HtmlPageAdapter(JobSourceAdapter):
                 salary_text=salary,
                 employment_type=employment_type,
                 timezone_text=timezone_text,
-                description_raw=description,
+                description_raw=description_raw,
                 description_clean=description,
                 source_metadata={
                     "source_url": self.params["url"],
@@ -92,6 +108,7 @@ class HtmlPageAdapter(JobSourceAdapter):
                         description and self.params.get("listing_description_complete", False)
                     ),
                     "description_source": "listing_card",
+                    **publication_metadata(published_label, "listing_selector"),
                 },
             )
             if fetch_details and detail_count < max_details:
@@ -99,7 +116,12 @@ class HtmlPageAdapter(JobSourceAdapter):
                 self._fetch_detail(session, job)
             elif fetch_details:
                 job.source_metadata["detail_error"] = "Detail fetch limit reached"
+                job.source_metadata["detail_outcome"] = "quota_deferred"
             jobs.append(job)
+        if not jobs and not self.errors:
+            self.errors.append(
+                "HTML listing returned no vacancy cards; verify source selector/access"
+            )
         return jobs
 
     def _fetch_detail(self, session, job: JobRecord) -> None:
@@ -112,8 +134,13 @@ class HtmlPageAdapter(JobSourceAdapter):
             )
             if not enrich_from_detail(job, soup, self.params.get("detail_description_selector")):
                 job.source_metadata["detail_error"] = "No JobPosting or description selector found"
+                job.source_metadata["detail_outcome"] = "parse_missing_description"
+                self.errors.append("HTML detail has no supported vacancy description")
+            else:
+                job.source_metadata["detail_outcome"] = "success"
         except Exception as exc:
             job.source_metadata["detail_error"] = str(exc)
+            job.source_metadata["detail_outcome"] = "request_error"
             self.errors.append(f"HTML detail {job.original_url}: {exc}")
 
     def _read_optional_text(self, card, key: str) -> str | None:

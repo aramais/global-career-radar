@@ -330,7 +330,7 @@ def test_adapter_reads_authenticated_listing_and_full_visible_description(tmp_pa
     jobs = adapter.fetch_jobs()
 
     assert len(jobs) == 1
-    assert jobs[0].description_clean == "Lead analytics. Must reside in Brazil."
+    assert jobs[0].description_clean == "Lead analytics.\nMust reside in Brazil."
     assert jobs[0].source_metadata["description_complete"] is True
     assert not adapter.errors
     assert [call[0] for call in session.calls] == [LISTING_URL, DETAIL_URL]

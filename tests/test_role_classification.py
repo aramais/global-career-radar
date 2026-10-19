@@ -6,13 +6,14 @@ from dataclasses import replace
 
 import pytest
 
-from job_intake import profiles
+from job_intake import classification, profiles
 from job_intake.annotation.ai import (
     ROLE_CLASSIFICATION_PROMPT,
     AnnotationModelClient,
     _anthropic_schema,
     _gemini_schema,
 )
+from job_intake.annotation.text import source_hash
 from job_intake.classification import RoleClassifier
 from job_intake.config.settings import AnnotationConfig
 from job_intake.models.job import JobRecord
@@ -330,11 +331,130 @@ def test_offline_classification_reuses_current_model_decision_without_a_provider
     assert len(calls) == 1 and classifier.stats["cache_hits"] == 1
 
 
+@pytest.mark.parametrize("use_ai", [False, True])
+@pytest.mark.parametrize("timeout", [None, 120.0])
+def test_observation_and_timeout_changes_rebind_exact_input_without_repeated_call(
+    monkeypatch, use_ai, timeout,
+):
+    classifier, calls = model_classifier(monkeypatch)
+    original = record(source_metadata={"listing_observed_at": "2026-10-18"})
+    _, previous = classifier.classify(original, use_ai=True)
+    changed_record = replace(original, source_metadata={"listing_observed_at": "2026-10-19"})
+    changed = RoleClassifier(load_streams({}, configuration()), replace(
+        classifier.config, request_timeout=timeout or classifier.config.request_timeout,
+    ))
+    selected, decision = changed.classify(changed_record, previous=previous, use_ai=use_ai)
+    assert selected.id == "data-science-management" and decision["method"] == "model"
+    assert changed.model_signature == classifier.model_signature
+    assert decision["classification_input_hash"] == previous["classification_input_hash"]
+    assert decision["source_hash"] == source_hash(changed_record) != previous["source_hash"]
+    assert decision["content_hash"] != previous["content_hash"]
+    assert changed.stats["cache_hits"] == 1 and len(calls) == 1
+    assert previous["source_hash"] == source_hash(original)
+
+
+def test_legacy_classification_only_reuses_identical_public_source_without_guessing_input(
+    monkeypatch,
+):
+    classifier, calls = model_classifier(monkeypatch)
+    original = record()
+    _, legacy = classifier.classify(original, use_ai=True)
+    legacy.pop("classification_input_hash")
+    legacy.pop("classification_input_version")
+    _, same = classifier.classify(original, previous=legacy)
+    assert same == legacy and "classification_input_hash" not in same
+    selected, changed = classifier.classify(
+        replace(original, source_metadata={"listing_observed_at": "2026-10-19"}),
+        previous=legacy,
+    )
+    assert selected.id == "other" and changed["method"] == "local"
+    assert classifier.stats["cache_hits"] == 1 and len(calls) == 1
+
+
+@pytest.mark.parametrize("change", [
+    {"source": "another-source"}, {"source_job_id": "another-source-id"},
+    {"original_url": "https://example.test/jobs/another-role"},
+])
+def test_exact_classification_input_is_isolated_by_source_identity(monkeypatch, change):
+    classifier, calls = model_classifier(monkeypatch)
+    _, previous = classifier.classify(record(), use_ai=True)
+    selected, decision = classifier.classify(record(**change), previous=previous)
+    assert selected.id == "other" and decision["method"] == "local"
+    assert classifier.stats["cache_hits"] == 0 and len(calls) == 1
+
+
+def test_exact_classification_input_invalidates_changed_prompt_even_with_same_taxonomy(monkeypatch):
+    classifier, calls = model_classifier(monkeypatch)
+    _, previous = classifier.classify(record(), use_ai=True)
+    monkeypatch.setattr(
+        classification, "ROLE_CLASSIFICATION_PROMPT",
+        classification.ROLE_CLASSIFICATION_PROMPT + "\n",
+    )
+    selected, decision = classifier.classify(record(), previous=previous, use_ai=True)
+    assert selected.id == "data-science-management"
+    assert decision["classification_input_hash"] != previous["classification_input_hash"]
+    assert classifier.stats["cache_hits"] == 0 and len(calls) == 2
+
+
+def test_classification_input_hashes_exact_duties_without_whitespace_normalization(monkeypatch):
+    classifier, calls = model_classifier(monkeypatch)
+    original = record()
+    _, previous = classifier.classify(original, use_ai=True)
+    changed = replace(
+        original, description_clean=original.description_clean.replace("lead a", "lead  a"),
+    )
+    selected, decision = classifier.classify(changed, previous=previous, use_ai=True)
+    assert selected.id == "data-science-management"
+    assert decision["classification_input_hash"] != previous["classification_input_hash"]
+    assert classifier.stats["cache_hits"] == 0 and len(calls) == 2
+
+
+def test_classification_input_matches_actual_truncated_model_payload(monkeypatch):
+    classifier, calls = model_classifier(monkeypatch)
+    original = record(description_clean=(
+        "Responsibilities:\nYou will lead a team of data scientists.\n" + "Original duty " * 2500
+    ))
+    _, previous = classifier.classify(original, use_ai=True)
+    changed = replace(
+        original, description_clean=original.description_clean + "\nUnsent final tail",
+    )
+    selected, decision = classifier.classify(changed, previous=previous, use_ai=True)
+    assert selected.id == "data-science-management"
+    assert decision["classification_input_hash"] == previous["classification_input_hash"]
+    assert decision["source_hash"] != previous["source_hash"]
+    assert classifier.stats["cache_hits"] == 1 and len(calls) == 1
+
+
+@pytest.mark.parametrize("label", ["data-science-management", "other"])
+def test_changed_parser_contract_invalidates_model_classification_without_rewriting_source(
+    monkeypatch, label,
+):
+    monkeypatch.setattr(profiles, "SOURCE_UNITS_VERSION", "legacy-unit-contract")
+    monkeypatch.setattr(classification, "SOURCE_UNITS_VERSION", "legacy-unit-contract")
+    classifier, calls = model_classifier(monkeypatch, payload={
+        "role_label": label, "reason": "Previous parser-dependent decision.",
+        "quote": "You will lead a team of data scientists." if label != "other" else "",
+    })
+    original = record()
+    digest = source_hash(original)
+    _, previous = classifier.classify(original, use_ai=True)
+    monkeypatch.setattr(profiles, "SOURCE_UNITS_VERSION", "corrected-unit-contract")
+    monkeypatch.setattr(classification, "SOURCE_UNITS_VERSION", "corrected-unit-contract")
+    changed = RoleClassifier(load_streams({}, configuration()), AnnotationConfig())
+    selected, decision = changed.classify(original, previous=previous)
+    assert selected.id == "other" and decision["method"] == "local"
+    assert changed.version != classifier.version
+    assert changed.model_signature != classifier.model_signature
+    assert changed.stats["cache_hits"] == 0 and len(calls) == 1
+    assert source_hash(original) == digest
+
+
 @pytest.mark.parametrize("model_change", [
     {"extract_model": "gemini-test-updated"},
     {"extract_provider": "openai", "extract_model": "gpt-6-luna"},
     {"extract_base_url": "https://gateway.example.test/v1"},
     {"extract_reasoning_effort": "high"},
+    {"max_output_tokens": 2048},
 ])
 @pytest.mark.parametrize("use_ai", [True, False])
 def test_changed_model_config_cannot_reuse_an_old_model_decision(
@@ -364,7 +484,6 @@ def test_changed_model_config_cannot_reuse_an_old_model_decision(
 @pytest.mark.parametrize("change", [
     {"description_clean": "Responsibilities:\nYou will coordinate product delivery."},
     {"title": "Delivery Lead"},
-    {"source_metadata": {"source_revision": "new"}},
 ])
 def test_changed_source_or_content_cannot_reuse_previous_model_classification(monkeypatch, change):
     classifier, calls = model_classifier(monkeypatch)
@@ -444,7 +563,7 @@ def test_taxonomy_and_versions_are_independent_of_stream_and_example_order():
     assert taxonomy_version(original) == taxonomy_version(load_streams({}, config))
 
 
-@pytest.mark.parametrize("change", ["disable", "new_descriptor", "policy", "prompt"])
+@pytest.mark.parametrize("change", ["disable", "new_descriptor", "policy"])
 def test_taxonomy_changes_invalidate_every_remaining_label_version(monkeypatch, change):
     config = configuration()
     original = {stream.id: stream.version for stream in load_streams({}, config)}
@@ -454,10 +573,6 @@ def test_taxonomy_changes_invalidate_every_remaining_label_version(monkeypatch, 
         config["streams"][0]["keywords"].append("Technical Product Director")
     elif change == "policy":
         monkeypatch.setattr(profiles, "ROLE_POLICY_VERSION", "new-test-policy")
-    else:
-        monkeypatch.setattr(
-            profiles, "ROLE_CLASSIFICATION_PROMPT", "Updated classification prompt.",
-        )
     changed = {stream.id: stream.version for stream in load_streams({}, config)}
     assert changed
     assert all(version != original[label] for label, version in changed.items())
@@ -490,3 +605,41 @@ def test_original_single_label_configuration_still_classifies_without_external_m
     streams = load_streams({}, {"title_weights": {"Analyst": 8}})
     selected, decision = RoleClassifier(streams).classify(record(title="Analyst"))
     assert selected.id == "default" and decision["status"] == "single_label"
+
+
+@pytest.mark.parametrize(("title", "expected"), [
+    ("Manager, Data Analytics", "analytics-leadership"),
+    ("Manager/Data Analytics", "analytics-leadership"),
+    ("Data Analytics Manager", "analytics-leadership"),
+    ("Product Lead (Analytics & ML)", "product-management"),
+    ("Product Lead [Analytics & ML]", "product-management"),
+    ("Director of Product", "product-management"),
+    ("VP of Product", "product-management"),
+    ("Chief Product Officer (CPO)", "product-management"),
+    ("CPO", "other"),
+    ("VP of Product Engineering", "other"),
+    ("Product Lead Designer (Analytics)", "other"),
+    ("Manager, Data Analytics Engineering", "other"),
+])
+def test_audit_title_boundary_matrix(title, expected):
+    selected, decision = RoleClassifier(load_streams({}, configuration())).classify(
+        record(title=title),
+    )
+    assert selected.id == expected
+    assert decision["method"] == "local"
+
+
+def test_explicit_query_edit_reuses_model_classification_without_provider_call(monkeypatch):
+    config = configuration()
+    for definition in config["streams"]:
+        definition["titles"] = definition["keywords"].copy()
+        definition["search_queries"] = definition.pop("keywords")
+    previous_classifier, calls = model_classifier(monkeypatch, config=config)
+    _, previous = previous_classifier.classify(record(), use_ai=True)
+    config["streams"][0]["search_queries"].append("new remote product jobs Brazil")
+    changed, _ = model_classifier(monkeypatch, config=config)
+    selected, decision = changed.classify(record(), use_ai=True, previous=previous)
+    assert selected.id == "data-science-management"
+    assert decision["method"] == "model"
+    assert changed.stats["cache_hits"] == 1 and changed.stats["calls"] == 0
+    assert len(calls) == 1

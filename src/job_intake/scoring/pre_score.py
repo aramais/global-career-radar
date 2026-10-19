@@ -59,6 +59,8 @@ class DeterministicScorer:
         if self.profiles.scoring_policy == "role_fit_v1":
             return self._role_fit(source, company, title, description, evaluation, record)
         if evaluation.decision == FilterDecision.REJECT:
+            evaluation.raw_fit_score = None
+            evaluation.score_cap_reasons = ["legacy:hard_reject"]
             evaluation.fit_score = 0.0
             evaluation.bucket = "Bucket C"
             evaluation.tier = JobTier.C
@@ -94,8 +96,11 @@ class DeterministicScorer:
         if asserted_phrase_hits(description_text, self.profiles.bucket_b_signals):
             score += 1.5
 
+        evaluation.raw_fit_score = score
+        evaluation.score_cap_reasons = []
         if evaluation.decision == FilterDecision.REVIEW:
             score = max(score - 3.0, 0.0)
+            evaluation.score_cap_reasons.append("legacy:review_penalty")
 
         evaluation.deterministic_score = score
         evaluation.fit_score = score
@@ -118,10 +123,11 @@ class DeterministicScorer:
         evidence = description_evidence(record)
         evaluation.fit_policy = "role_fit_v1"
         evaluation.fit_max_tier = None
+        evaluation.score_cap_reasons = []
         score = self._source_weight(source)
         titles = title_weight_matches(title, self.profiles.title_weights, self.role_id)
         if titles:
-            phrase, weight = max(titles, key=lambda item: (item[1], len(item[0]), item[0]))
+            phrase, weight = max(titles, key=lambda item: (item[1], -len(item[0]), item[0]))
             score += weight
             evaluation.matched_signals.append(f"title_weight:{phrase}")
 
@@ -154,12 +160,17 @@ class DeterministicScorer:
         if contains_any(normalize_text(title), self.profiles.bucket_c_signals):
             score -= 8.0
 
+        evaluation.raw_fit_score = score
+
         evaluation.bridge_role = bool(bucket_a) and evidence.substantive_decision
         role_blocked = any(
             signal.startswith(("desc_blocker:", "title_blocker:"))
             for signal in (*evaluation.risks, *evaluation.blocker_signals)
         )
-        if role_blocked or evidence.reporting_core or not evidence.analytical_mandate:
+        incomplete = record.source_metadata.get("description_complete") is False
+        if role_blocked or evidence.reporting_core or (
+            not evidence.analytical_mandate and not incomplete
+        ):
             evaluation.fit_max_tier = JobTier.C
             score = min(score, max(0.0, self.profiles.threshold_b - 0.5))
             reason = (
@@ -167,12 +178,15 @@ class DeterministicScorer:
                 "explicit_role_mismatch" if role_blocked else "analytical_mandate_unconfirmed"
             )
             evaluation.risks.append("fit:" + reason)
-        elif record.source_metadata.get("description_complete") is False:
+            evaluation.score_cap_reasons.append(reason)
+        elif incomplete:
             evaluation.fit_max_tier = JobTier.B
             evaluation.risks.append("fit:incomplete_description")
+            evaluation.score_cap_reasons.append("incomplete_description")
         elif not evidence.project_leadership:
             evaluation.fit_max_tier = JobTier.B
             evaluation.risks.append("fit:project_leadership_unconfirmed")
+            evaluation.score_cap_reasons.append("project_leadership_unconfirmed")
         evaluation.deterministic_score = evaluation.fit_score = max(score, 0.0)
         for signal in evidence.signals:
             evaluation.audit_log.append(

@@ -21,6 +21,7 @@ class JobORM(Base):
     job_uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     fingerprint: Mapped[str] = mapped_column(String(64), index=True)
     content_hash: Mapped[str] = mapped_column(String(64))
+    source_revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     source: Mapped[str] = mapped_column(String(100), index=True)
     source_job_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     company: Mapped[str] = mapped_column(String(255), index=True)
@@ -40,6 +41,11 @@ class JobORM(Base):
     matched_signals: Mapped[list[str]] = mapped_column(JSON, default=list)
     filter_decision: Mapped[str] = mapped_column(String(32), index=True)
     fit_score: Mapped[float] = mapped_column(Float, default=0.0)
+    raw_fit_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    score_cap_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+    eligibility_status: Mapped[str] = mapped_column(String(32), default="unknown")
+    eligibility_evidence_status: Mapped[str] = mapped_column(String(32), default="unconfirmed")
+    version_components: Mapped[dict] = mapped_column(JSON, default=dict)
     semantic_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     fit_reason: Mapped[str] = mapped_column(Text, default="")
     tier: Mapped[str] = mapped_column(String(4), default="C", index=True)
@@ -57,6 +63,15 @@ class JobORM(Base):
     archive_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    missing_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    missing_successes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    missing_verified_seconds: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
+    missing_last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    last_complete_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -73,6 +88,9 @@ class JobORM(Base):
 
     events: Mapped[list[JobEventORM]] = relationship(back_populates="job", cascade="all, delete")
     feedback: Mapped[list[FeedbackORM]] = relationship(back_populates="job", cascade="all, delete")
+    purpose_assessment: Mapped[JobPurposeAssessmentORM | None] = relationship(
+        cascade="all, delete-orphan", uselist=False,
+    )
 
 
 class JobProfileEvaluationORM(Base):
@@ -94,6 +112,11 @@ class JobProfileEvaluationORM(Base):
     deterministic_score: Mapped[float] = mapped_column(Float)
     semantic_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     fit_score: Mapped[float] = mapped_column(Float)
+    raw_fit_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    score_cap_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+    eligibility_status: Mapped[str] = mapped_column(String(32), default="unknown")
+    eligibility_evidence_status: Mapped[str] = mapped_column(String(32), default="unconfirmed")
+    version_components: Mapped[dict] = mapped_column(JSON, default=dict)
     tier: Mapped[str] = mapped_column(String(4))
     bucket: Mapped[str] = mapped_column(String(32))
     matched_signals: Mapped[list[str]] = mapped_column(JSON, default=list)
@@ -149,3 +172,47 @@ class FeedbackORM(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     job: Mapped[JobORM] = relationship(back_populates="feedback")
+
+
+class JobPurposeAssessmentORM(Base):
+    __tablename__ = "job_purpose_assessments"
+    job_uid: Mapped[str] = mapped_column(ForeignKey("jobs.job_uid"), primary_key=True)
+    human_p1: Mapped[str] = mapped_column(String(32), default="unknown")
+    human_p2: Mapped[str] = mapped_column(String(32), default="unknown")
+    predicted_p1: Mapped[str] = mapped_column(String(32), default="unknown")
+    predicted_p2: Mapped[str] = mapped_column(String(32), default="unknown")
+    practice_suitability: Mapped[str] = mapped_column(String(32), default="unknown")
+    rubric_version: Mapped[str] = mapped_column(String(100), default="")
+    human_rubric_version: Mapped[str] = mapped_column(String(100), default="")
+    human_p1_rubric_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    human_p2_rubric_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    human_source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    human_p1_source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    human_p2_source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    prediction_source_hash: Mapped[str] = mapped_column(String(64), default="")
+    prediction_reason: Mapped[dict] = mapped_column(JSON, default=dict)
+    human_note: Mapped[str] = mapped_column(Text, default="")
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow,
+                                               onupdate=utcnow)
+
+
+class JobSourceAliasORM(Base):
+    __tablename__ = "job_source_aliases"
+    alias_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_uid: Mapped[str] = mapped_column(ForeignKey("jobs.job_uid", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(64))
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SourceRunORM(Base):
+    __tablename__ = "source_runs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(255), index=True)
+    status: Mapped[str] = mapped_column(String(32))
+    snapshot_complete: Mapped[bool] = mapped_column(default=False)
+    record_count: Mapped[int] = mapped_column(Integer, default=0)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

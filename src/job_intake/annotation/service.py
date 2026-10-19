@@ -5,7 +5,8 @@ import os
 import re
 import tempfile
 import time
-from dataclasses import asdict
+from copy import deepcopy
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,13 @@ from job_intake.annotation.ai import (
     build_review_prompt,
     error_diagnostic,
     prompts_version,
+)
+from job_intake.annotation.input_contract import (
+    MODEL_KEY_VERSION,
+    annotation_input,
+    annotation_input_hash,
+    exact_saved_input,
+    model_spec,
 )
 from job_intake.annotation.jev import JEV_VERSION, JevReviewClient, normalize_jev_review
 from job_intake.annotation.progress import ProgressCallback, emit_progress
@@ -178,13 +186,30 @@ class VacancyAnnotator:
         )
 
     def _cache_key(self, record: JobRecord) -> str:
+        return stable_hash(json.dumps({
+            "version": ANNOTATION_VERSION, "key_version": MODEL_KEY_VERSION,
+            "annotation_input_hash": annotation_input_hash(record),
+            "extract": model_spec(self.config.resolved_stage("extract")),
+            "review": model_spec(self.config.resolved_stage("review"), review=True),
+            "chunk_chars": self.config.chunk_chars,
+            "review_batch_size": self.config.review_batch_size,
+            "prompts": prompts_version(),
+            "jev_prompt": (
+                JEV_VERSION if self.config.resolved_stage("review").provider == "jev" else None
+            ),
+        }, sort_keys=True, ensure_ascii=False))
+
+    def _legacy_cache_key(self, content_hash: str, *, ai_enabled: bool | None = None) -> str:
+        """Recognize an old cache only when its full old settings are provable."""
         config = asdict(self.config)
         config.pop("cache_dir")
+        if ai_enabled is not None:
+            config["ai_enabled"] = ai_enabled
         return stable_hash(
             json.dumps(
                 {
                     "version": ANNOTATION_VERSION,
-                    "source_hash": source_hash(record),
+                    "source_hash": content_hash,
                     "config": config,
                     "prompts": prompts_version(),
                     "jev_prompt": (
@@ -198,21 +223,33 @@ class VacancyAnnotator:
         )
 
     def _extraction_key(self, record: JobRecord, chunk: dict) -> str:
-        spec = asdict(self.config.resolved_stage("extract"))
-        for name in ("jev_min_probability", "jev_min_confidence", "jev_batch_size"):
-            spec.pop(name, None)
         # Reviewer changes must not pay for the same extraction again.
         from job_intake.annotation import ai
 
         return stable_hash(json.dumps({
-            "version": ANNOTATION_VERSION, "source_hash": source_hash(record),
+            "version": ANNOTATION_VERSION, "key_version": MODEL_KEY_VERSION,
+            "source_id": source_identity(record),
+            "completeness": annotation_input(record)["completeness"],
+            "chunk": chunk, "spec": model_spec(self.config.resolved_stage("extract")),
+            "prompt": ai.EXTRACTION_PROMPT,
+        }, sort_keys=True, ensure_ascii=False))
+
+    def _legacy_extraction_key(self, content_hash: str, chunk: dict) -> str:
+        from job_intake.annotation import ai
+
+        spec = asdict(self.config.resolved_stage("extract"))
+        for name in ("jev_min_probability", "jev_min_confidence", "jev_batch_size"):
+            spec.pop(name, None)
+        return stable_hash(json.dumps({
+            "version": ANNOTATION_VERSION, "source_hash": content_hash,
             "chunk": chunk, "spec": spec, "prompt": ai.EXTRACTION_PROMPT,
         }, sort_keys=True, ensure_ascii=False))
 
     def _review_key(self, extraction_key: str, drafts: list) -> str:
         return stable_hash(json.dumps({
             "extraction": extraction_key, "claims": drafts,
-            "spec": asdict(self.config.resolved_stage("review")),
+            "key_version": MODEL_KEY_VERSION,
+            "spec": model_spec(self.config.resolved_stage("review"), review=True),
             "review_batch_size": self.config.review_batch_size,
             "review_batch_version": "exact-id-source-preserving-v1",
             "prompts": prompts_version(),
@@ -372,6 +409,7 @@ class VacancyAnnotator:
         """Save only this chunk between API calls; write the full result once at the end."""
         self._write(path.parent / (path.stem + ".stages") / (chunk_id + ".json"), {
             "cache_key": annotation["cache_key"], "source_hash": annotation["source_hash"],
+            "annotation_input_hash": annotation["annotation_input_hash"],
             "chunk_id": chunk_id, "stage": annotation["stages"][chunk_id],
             "usage": [row for row in annotation["usage"] if row.get("chunk_id") == chunk_id],
         })
@@ -386,7 +424,10 @@ class VacancyAnnotator:
             if (
                 not isinstance(cached, dict)
                 or cached.get("cache_key") != annotation["cache_key"]
-                or cached.get("source_hash") != annotation["source_hash"]
+                or (
+                    cached.get("source_hash") != annotation["source_hash"]
+                    and cached.get("annotation_input_hash") != annotation["annotation_input_hash"]
+                )
                 or cached.get("chunk_id") != chunk_id
                 or not isinstance(cached.get("stage"), dict)
                 or not isinstance(cached.get("usage"), list)
@@ -406,8 +447,21 @@ class VacancyAnnotator:
         return isinstance(annotation, dict) and (
             annotation.get("version") == ANNOTATION_VERSION
             and annotation.get("source_id") == source_identity(record)
-            and annotation.get("source_hash") == source_hash(record)
+            and (
+                annotation.get("source_hash") == source_hash(record)
+                # Equal legacy source hashes predate the parser scope contract;
+                # when units are present they must match even in that case.
+                or exact_saved_input(annotation, record)
+            )
+            and ("units" not in annotation or exact_saved_input(annotation, record))
         )
+
+    def _current_config(self, saved: dict, record: JobRecord) -> bool:
+        return saved.get("cache_key") in {
+            self._cache_key(record),
+            self._legacy_cache_key(saved.get("source_hash", ""), ai_enabled=True),
+            self._legacy_cache_key(saved.get("source_hash", ""), ai_enabled=False),
+        }
 
     @staticmethod
     def _stages(cached: dict) -> dict:
@@ -436,6 +490,11 @@ class VacancyAnnotator:
     def _saved_review(self, saved: dict, record: JobRecord) -> dict | None:
         """Rebuild persisted facts from validated source evidence and exact-ID reviews."""
         if not self._matches(saved, record) or saved.get("method") != "two_pass":
+            return None
+        # Public snapshot hashes deliberately survive parser policy upgrades.
+        # A paid review without its old complete units cannot establish that
+        # its section/evidence boundaries equal the current model input.
+        if not exact_saved_input(saved, record):
             return None
         if saved.get("status") not in {"reviewed", "partial"}:
             return None
@@ -466,7 +525,7 @@ class VacancyAnnotator:
         completed = 0
         chunks = chunk_source(source_units(record), size)
         try:
-            stages = self._stages(saved)
+            stages = deepcopy(self._stages(saved))
         except ValueError:
             stages = {}
         for chunk in chunks:
@@ -498,17 +557,95 @@ class VacancyAnnotator:
         # A corrupt completed cache is rebuilt. An unfinished review stays unfinished offline.
         if saved["status"] == "reviewed" and completed != len(chunks):
             return None
-        verified = {**saved, "claims": list(by_id.values()), "rejected": rejected}
+        verified = {**deepcopy(saved), "claims": list(by_id.values()), "rejected": rejected}
         verified["stages"] = stages
         usage = saved.get("usage", [])
         verified["usage"] = (
-            usage if isinstance(usage, list) and all(isinstance(row, dict) for row in usage) else []
+            deepcopy(usage)
+            if isinstance(usage, list) and all(isinstance(row, dict) for row in usage) else []
         )
         verified["status"] = "reviewed" if completed == len(chunks) else "partial"
         verified["summary"] = summarize_claims(verified["claims"])
         verified["units"] = source_units(record)
         verified["coverage"] = {"chunks": len(chunks), "completed_chunks": completed}
+        old_hash, old_key = saved.get("source_hash"), saved.get("cache_key")
+        new_hash = source_hash(record)
+        current_config = self._current_config(saved, record)
+        verified["source_hash"] = new_hash
+        verified["input_contract"] = annotation_input(record)
+        verified["annotation_input_hash"] = annotation_input_hash(record)
+        if current_config:
+            verified["cache_key"] = self._cache_key(record)
+            # Migrate exact legacy stages only after the complete evidence has
+            # been checked above. Preserve their original paid call references.
+            for chunk in chunks:
+                stage = stages.get(chunk["chunk_id"], {})
+                if stage.get("extraction_key") == self._legacy_extraction_key(old_hash, chunk):
+                    stage = dict(stage)
+                    stages[chunk["chunk_id"]] = stage
+                    stage["extraction_key"] = self._extraction_key(record, chunk)
+                    drafts, _ = _drafts(
+                        stage["extraction"], source_identity(record),
+                        [unit for unit in chunk["units"] if unit["text"].strip()],
+                        chunk["chunk_id"],
+                    )
+                    stage["review_key"] = self._review_key(stage["extraction_key"], drafts)
+        if old_hash != new_hash or (current_config and old_key != verified["cache_key"]):
+            previous_origins = saved.get("cache_reuse", [])
+            origins = (
+                deepcopy(previous_origins)
+                if isinstance(previous_origins, list)
+                and all(isinstance(row, dict) for row in previous_origins) else []
+            )
+            # Every rebind points to the original paid usage, including the
+            # legacy-key -> new-key transition. Intermediate copies must not
+            # manufacture additional paid-call identities.
+            candidates = [saved.get("paid_usage_refs")] + [
+                row.get("usage_refs") for row in origins
+            ]
+            references = next((
+                list(value) for value in candidates
+                if isinstance(value, list) and len(value) == len(verified["usage"])
+                and all(isinstance(ref, str) and ref for ref in value)
+            ), None)
+            if references is None:
+                references = [
+                    stable_hash(json.dumps([source_identity(record), old_key, index]))
+                    for index in range(len(verified["usage"]))
+                ]
+            verified["paid_usage_refs"] = references
+            origin = {
+                "source_id": source_identity(record), "source_hash": old_hash,
+                "cache_key": old_key, "annotation_input_hash": verified["annotation_input_hash"],
+                "validation": "exact-units-and-reviewed-claims-v1",
+                "usage_refs": list(references),
+            }
+            if origin not in origins:
+                origins.append(origin)
+            verified["cache_reuse"] = origins
         return verified
+
+    def inspect_cached_review(self, record: JobRecord) -> dict | None:
+        """Inspect a recoverable paid file without API calls or writes.
+
+        This is deliberately separate from annotation: an operator can audit a
+        copied database and plan recovery without --ai, credentials, cache
+        migration, or the risk of paying for a nonmatching historical source.
+        The original file path and paid usage remain available for provenance.
+        """
+        source = replace(record)
+        directory = Path(self.config.cache_dir) / source_identity(source)
+        for path in sorted(directory.glob("*.json")):
+            try:
+                previous = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(previous, dict) or not self._current_config(previous, source):
+                    continue
+                verified = self._saved_review(previous, source)
+                if verified is not None and verified["status"] == "reviewed":
+                    return {"cache_path": str(path), "annotation": verified}
+            except (OSError, KeyError, TypeError, ValueError):
+                continue
+        return None
 
     def annotate(self, record: JobRecord, *, use_ai: bool = False) -> dict[str, Any]:
         if not self.config.enabled:
@@ -527,6 +664,8 @@ class VacancyAnnotator:
             "version": ANNOTATION_VERSION,
             "source_id": source_id,
             "source_hash": content_hash,
+            "input_contract": annotation_input(record, units),
+            "annotation_input_hash": annotation_input_hash(record, units),
             "cache_key": key,
             "source_url": record.original_url,
             "units": units,
@@ -580,15 +719,19 @@ class VacancyAnnotator:
                 for chunk in chunk_source(units, self.config.chunk_chars):
                     previous = previous_stages.get(chunk["chunk_id"], {})
                     extraction_key = self._extraction_key(record, chunk)
-                    if previous.get("extraction_key") == extraction_key:
+                    if previous.get("extraction_key") in {
+                        extraction_key,
+                        self._legacy_extraction_key(saved.get("source_hash", ""), chunk),
+                    }:
                         annotation["stages"][chunk["chunk_id"]] = {
                             name: previous[name] for name in (
                                 "extraction", "extraction_key", "extraction_provenance"
                             ) if name in previous
                         }
+                        annotation["stages"][chunk["chunk_id"]]["extraction_key"] = extraction_key
             except (KeyError, TypeError, ValueError):
                 annotation["stages"] = {}
-        if isinstance(saved, dict) and (not requested_ai or saved.get("cache_key") == key):
+        if isinstance(saved, dict) and (not requested_ai or self._current_config(saved, record)):
             verified = self._saved_review(saved, record)
             if verified is not None and (not available_ai or verified["status"] == "reviewed"):
                 self.stats["cache_hits"] += 1
@@ -618,10 +761,29 @@ class VacancyAnnotator:
             return annotation
 
         path = Path(self.config.cache_dir) / source_id / (key + ".json")
+        if not path.is_file():
+            # Old TEXT_VERSION/observation hashes can leave a paid file outside
+            # the current key. Rebind only a demonstrably identical legacy
+            # model configuration and complete exact source input. Never alter
+            # the original file or invent another usage record for this reuse.
+            recovery = self.inspect_cached_review(record)
+            if recovery is not None:
+                verified = recovery["annotation"]
+                self._write(path, verified)
+                self.stats["cache_hits"] += 1
+                record.annotation = verified
+                emit_progress(self.progress, "cache_hit", stage="legacy annotation")
+                self._completed(verified)
+                return verified
         if path.is_file():
             try:
                 cached = json.loads(path.read_text(encoding="utf-8"))
                 if self._matches(cached, record) and cached.get("cache_key") == key:
+                    verified = self._saved_review(cached, record)
+                    if verified is not None and verified.get("cache_reuse"):
+                        annotation["cache_reuse"] = verified["cache_reuse"]
+                        if verified.get("paid_usage_refs") is not None:
+                            annotation["paid_usage_refs"] = verified["paid_usage_refs"]
                     annotation["stages"] = self._stages(cached)
                     usage = cached.get("usage", [])
                     if not isinstance(usage, list) or not all(
@@ -659,7 +821,10 @@ class VacancyAnnotator:
                         cached_extract = json.loads(extraction_path.read_text(encoding="utf-8"))
                         if (
                             cached_extract.get("extraction_key") != extraction_key
-                            or cached_extract.get("source_hash") != content_hash
+                            # This key already includes the exact source ID,
+                            # chunk/prompt and model settings. Another chunk's
+                            # edit must not invalidate this paid extraction.
+                            or cached_extract.get("source_id", source_id) != source_id
                             or cached_extract.get("chunk_id") != chunk_id
                         ):
                             raise ValueError("Mismatched extraction cache")
@@ -705,6 +870,8 @@ class VacancyAnnotator:
                     stage["extraction_provenance"] = self._provenance("extract")
                     self._write(extraction_path, {
                         "extraction_key": extraction_key, "source_hash": content_hash,
+                        "source_id": source_id,
+                        "annotation_input_hash": annotation_input_hash(record),
                         "chunk_id": chunk_id, "extraction": payload,
                         "provenance": self._provenance("extract"), "usage": usage,
                     })
@@ -854,8 +1021,11 @@ class VacancyAnnotator:
 
 def apply_annotation_constraints(record: JobRecord, evaluation: JobEvaluation, engine) -> None:
     """Only supported direct statements can resolve uncertainty; drafts never affect tiers."""
+    from job_intake.filtering import refresh_eligibility_status
+
     annotation = record.annotation
     if not annotation or evaluation.decision == FilterDecision.REJECT:
+        refresh_eligibility_status(evaluation)
         return
     summary = annotation.get("summary", {})
     focus = summary.get("search_focus", {})
@@ -996,3 +1166,8 @@ def apply_annotation_constraints(record: JobRecord, evaluation: JobEvaluation, e
     evaluation.audit_log.append(
         "Source-grounded annotation: " + annotation.get("method", "unknown")
     )
+    if (confirmed_geography or engine._hiring_location_confirmed(record)) and not any(
+        risk.startswith("language:") for risk in evaluation.risks
+    ):
+        evaluation.eligibility_status = "eligible"
+    refresh_eligibility_status(evaluation)

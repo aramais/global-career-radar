@@ -17,6 +17,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from job_intake.annotation.ai import AnnotationModelClient, AnnotationModelError, error_diagnostic
+from job_intake.annotation.input_contract import (
+    MODEL_KEY_VERSION,
+    annotation_input_hash,
+    exact_saved_input,
+    input_digest,
+    model_spec,
+    source_input,
+)
 from job_intake.annotation.progress import ProgressCallback, emit_progress
 from job_intake.annotation.text import source_hash, source_identity, source_units
 from job_intake.models.job import JobRecord
@@ -433,7 +441,20 @@ class VacancyPrefilter:
         if hasattr(self.client, "set_progress"):
             self.client.set_progress(progress)
 
-    def _stage_key(self, stage: str, content_hash: str, proposed_code: str | None) -> str:
+    def _stage_key(
+        self, stage: str, content_hash: str, proposed_code: str | None,
+        *, input_hash: str | None = None,
+    ) -> str:
+        if input_hash is not None:
+            return _hash({
+                "version": PREFILTER_VERSION, "focus": FOCUS_VERSION,
+                "key_version": MODEL_KEY_VERSION, "annotation_input_hash": input_hash,
+                "stage": stage, "spec": model_spec(self.config.resolved_stage(stage)),
+                "prompt": SCREEN_PROMPT if stage == "screen" else VERIFY_PROMPT,
+                "proposed_reason_code": proposed_code,
+            })
+        # Explicit legacy reader. Old model-written quotes must still pass the
+        # current exact evidence validator; new calls use the real transport.
         return _hash({
             "version": PREFILTER_VERSION, "focus": FOCUS_VERSION,
             "source_hash": content_hash, "stage": stage,
@@ -443,49 +464,83 @@ class VacancyPrefilter:
             "max_source_chars": self.config.max_source_chars,
         })
 
-    def _result(self, content_hash: str) -> dict:
-        return {
+    def _result(self, content_hash: str, input_hash: str | None = None) -> dict:
+        result = {
             "routing": "full_review", "decision": "uncertain",
             "reason_code": "no_clear_mismatch", "reason": "No early rejection established.",
             "evidence": [], "source_hash": content_hash, "version": PREFILTER_VERSION,
             "focus_version": FOCUS_VERSION, "routing_policy_version": ROUTING_POLICY_VERSION,
             "routing_guard": None, "counterevidence": [], "cache_key": _hash({
-                "screen": self._stage_key("screen", content_hash, None),
-                "verify": self._stage_key("verify", content_hash, None),
+                "screen": self._stage_key("screen", content_hash, None, input_hash=input_hash),
+                "verify": self._stage_key("verify", content_hash, None, input_hash=input_hash),
                 "routing_policy_version": ROUTING_POLICY_VERSION,
             }), "usage": [], "stages": {}, "errors": [],
         }
+        if input_hash is not None:
+            result["annotation_input_hash"] = input_hash
+        return result
 
     def _read_stage(
         self, stage: str, source_id: str, content_hash: str, units: list[dict],
-        proposed_code: str | None = None,
+        proposed_code: str | None = None, *, input_hash: str | None = None,
     ) -> dict | None:
-        key = self._stage_key(stage, content_hash, proposed_code)
+        key = self._stage_key(stage, content_hash, proposed_code, input_hash=input_hash)
         path = Path(self.config.cache_dir) / source_id / stage / (key + ".json")
         try:
             cached = json.loads(path.read_text(encoding="utf-8"))
-            return self._validate_stage(cached, stage, content_hash, units, proposed_code)
+            return self._validate_stage(
+                cached, stage, content_hash, units, proposed_code, input_hash=input_hash,
+            )
         except (OSError, ValueError, TypeError, RecursionError):
+            if input_hash is not None:
+                legacy = self._read_stage(stage, source_id, content_hash, units, proposed_code)
+                if legacy is not None:
+                    return self._validate_stage(
+                        legacy, stage, content_hash, units, proposed_code, input_hash=input_hash,
+                    )
             return None
 
     def _validate_stage(
         self, row: Any, stage: str, content_hash: str, units: list[dict],
-        proposed_code: str | None = None,
+        proposed_code: str | None = None, *, input_hash: str | None = None,
+        legacy_source_hash: str | None = None,
     ) -> dict:
         if (
             not isinstance(row, dict)
-            or row.get("cache_key") != self._stage_key(stage, content_hash, proposed_code)
-            or row.get("source_hash") != content_hash
+            or row.get("cache_key") != self._stage_key(
+                stage, row.get("source_hash", ""), proposed_code,
+                input_hash=row.get("annotation_input_hash"),
+            )
+            or not (
+                row.get("source_hash") == content_hash
+                or (input_hash is not None and row.get("annotation_input_hash") == input_hash)
+                or (legacy_source_hash is not None
+                    and row.get("source_hash") == legacy_source_hash)
+            )
+            or (row.get("annotation_input_hash") is not None
+                and row.get("annotation_input_hash") != input_hash)
             or row.get("version") != PREFILTER_VERSION or row.get("stage") != stage
             or not isinstance(row.get("usage"), dict)
         ):
             raise ValueError("Invalid prefilter cache")
         spec = self.config.resolved_stage(stage)
-        return {"cache_key": row["cache_key"], "source_hash": content_hash,
+        verified = {"cache_key": self._stage_key(
+                        stage, content_hash, proposed_code, input_hash=input_hash,
+                    ), "source_hash": content_hash,
                 "version": PREFILTER_VERSION, "stage": stage,
                 "result": _validated(row.get("result"), units),
                 "usage": {**_usage(row["usage"]), "stage": stage, "model": spec.model,
                           "provider": spec.provider, "cached": True}}
+        if input_hash is not None:
+            verified["annotation_input_hash"] = input_hash
+        if row.get("cache_origin") is not None:
+            verified["cache_origin"] = row["cache_origin"]
+        elif row["cache_key"] != verified["cache_key"] or row["source_hash"] != content_hash:
+            verified["cache_origin"] = {
+                "cache_key": row["cache_key"], "source_hash": row["source_hash"],
+                "validation": "exact-source-input-and-duty-evidence-v1",
+            }
+        return verified
 
     def _apply_stages(self, result: dict, *, units: list[dict]) -> None:
         result.update(routing="full_review", routing_guard=None, counterevidence=[])
@@ -530,7 +585,8 @@ class VacancyPrefilter:
         if sum(len(unit["text"]) for unit in units) > self.config.max_source_chars:
             return None
         content_hash, source_id = source_hash(record), source_identity(record)
-        result = self._result(content_hash)
+        input_hash = annotation_input_hash(record, units)
+        result = self._result(content_hash, input_hash)
         saved = record.annotation.get("prefilter")
         # Local routing enforcement has its own revision. Paid model stages
         # remain valid; migrate a precisely fingerprinted preceding route after
@@ -542,13 +598,24 @@ class VacancyPrefilter:
         legacy = isinstance(saved, dict) and (
             "routing_policy_version" not in saved and saved.get("cache_key") == legacy_key
         )
+        saved_hash = saved.get("source_hash") if isinstance(saved, dict) else None
+        legacy_input = (
+            isinstance(saved, dict) and "annotation_input_hash" not in saved
+            and (saved_hash == content_hash or exact_saved_input(record.annotation, record))
+        )
+        saved_expected = (
+            self._result(saved_hash) if legacy_input else result
+        )
         current = isinstance(saved, dict) and all(
-            saved.get(name) == result[name]
+            saved.get(name) == saved_expected[name]
             for name in ("cache_key", "routing_policy_version")
         )
         if isinstance(saved, dict) and (current or legacy) and all(
             saved.get(name) == result[name]
-            for name in ("source_hash", "version", "focus_version")
+            for name in ("version", "focus_version")
+        ) and (
+            saved_hash == content_hash or saved.get("annotation_input_hash") == input_hash
+            or legacy_input
         ):
             try:
                 stages = saved.get("stages")
@@ -556,11 +623,15 @@ class VacancyPrefilter:
                     raise ValueError("Invalid saved prefilter stages")
                 result["stages"]["screen"] = self._validate_stage(
                     stages.get("screen"), "screen", content_hash, units,
+                    input_hash=input_hash,
+                    legacy_source_hash=saved_hash if legacy_input else None,
                 )
                 screen = result["stages"]["screen"]["result"]
                 if screen["decision"] == "clearly_irrelevant":
                     result["stages"]["verify"] = self._validate_stage(
                         stages.get("verify"), "verify", content_hash, units, screen["reason_code"],
+                        input_hash=input_hash,
+                        legacy_source_hash=saved_hash if legacy_input else None,
                     )
                 self._apply_stages(result, units=[] if legacy else units)
                 if any(saved.get(name) != result[name] for name in (
@@ -576,14 +647,15 @@ class VacancyPrefilter:
                     self._apply_stages(result, units=units)
                 return result
             except (ValueError, TypeError, RecursionError):
-                result = self._result(content_hash)
-        screen = self._read_stage("screen", source_id, content_hash, units)
+                result = self._result(content_hash, input_hash)
+        screen = self._read_stage("screen", source_id, content_hash, units, input_hash=input_hash)
         if screen is None:
             return None
         result["stages"]["screen"] = screen
         if screen["result"]["decision"] == "clearly_irrelevant":
             verify = self._read_stage(
                 "verify", source_id, content_hash, units, screen["result"]["reason_code"],
+                input_hash=input_hash,
             )
             if verify is None:
                 return None
@@ -614,9 +686,12 @@ class VacancyPrefilter:
         metadata: dict, proposed_code: str | None = None,
     ) -> tuple[dict, dict]:
         spec = self.config.resolved_stage(stage)
-        key = self._stage_key(stage, content_hash, proposed_code)
+        input_hash = input_digest(source_input(source_id, units, metadata))
+        key = self._stage_key(stage, content_hash, proposed_code, input_hash=input_hash)
         path = Path(self.config.cache_dir) / source_id / stage / (key + ".json")
-        cached = self._read_stage(stage, source_id, content_hash, units, proposed_code)
+        cached = self._read_stage(
+            stage, source_id, content_hash, units, proposed_code, input_hash=input_hash,
+        )
         if cached is not None:
             self.stats["cache_hits"] += 1
             emit_progress(self.progress, "prefilter_cache_hit", stage=stage, model=spec.model)
@@ -654,6 +729,7 @@ class VacancyPrefilter:
             error.usage = usage
             raise
         self._write(path, {"cache_key": key, "source_hash": content_hash,
+                           "annotation_input_hash": input_hash,
                            "version": PREFILTER_VERSION, "stage": stage,
                            "result": validated, "usage": usage})
         return validated, {**usage, "stage": stage, "model": spec.model,
@@ -661,7 +737,8 @@ class VacancyPrefilter:
 
     def route(self, record: JobRecord) -> dict:
         content_hash = source_hash(record)
-        result = self._result(content_hash)
+        input_hash = annotation_input_hash(record, source_units(replace(record)))
+        result = self._result(content_hash, input_hash)
         emit_progress(self.progress, "prefilter_start")
         cached = self.cached_route(record)
         if cached is not None:
@@ -697,7 +774,10 @@ class VacancyPrefilter:
                     )
                     result["usage"].append(usage)
                     result["stages"]["screen"] = {
-                        "cache_key": self._stage_key(stage, content_hash, None),
+                        "cache_key": self._stage_key(
+                            stage, content_hash, None, input_hash=input_hash,
+                        ),
+                        "annotation_input_hash": input_hash,
                         "source_hash": content_hash, "version": PREFILTER_VERSION,
                         "stage": stage, "result": screen, "usage": usage,
                     }
@@ -716,7 +796,9 @@ class VacancyPrefilter:
                         result["stages"]["verify"] = {
                             "cache_key": self._stage_key(
                                 stage, content_hash, screen["reason_code"],
+                                input_hash=input_hash,
                             ),
+                            "annotation_input_hash": input_hash,
                             "source_hash": content_hash, "version": PREFILTER_VERSION,
                             "stage": stage, "result": verify, "usage": usage,
                         }

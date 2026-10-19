@@ -182,3 +182,30 @@ def test_scope_cap_survives_a_serialized_batch_evaluation():
     restored.fit_score = 99
     finalize_tier(EvaluatedJob(job, restored), 14, 6)
     assert restored.tier == JobTier.C
+
+
+def test_raw_score_preserves_uncapped_order_for_reporting_mismatch():
+    job = record(description="Responsibilities:\nBuild reports and dashboards.")
+    result = score(job)
+    assert result.raw_fit_score == 9  # existing configured title + source; no invented bonus
+    assert result.fit_score == 5.5
+    assert result.score_cap_reasons == ["reporting_core"]
+    assert result.tier == JobTier.C
+
+
+def test_incomplete_unknown_mandate_caps_b_without_inventing_a_fit_floor():
+    job = record(description="Details are not available from this source.")
+    job.source_metadata["description_complete"] = False
+    result = score(job)
+    assert result.raw_fit_score == result.fit_score == 9
+    assert result.fit_max_tier == JobTier.B and result.tier == JobTier.B
+    assert result.score_cap_reasons == ["incomplete_description"]
+    assert "fit:analytical_mandate_unconfirmed" not in result.risks
+
+
+def test_incomplete_source_never_promotes_explicit_reporting_mismatch():
+    job = record(description="Responsibilities:\nBuild reports and dashboards.")
+    job.source_metadata["description_complete"] = False
+    result = score(job)
+    assert result.tier == JobTier.C and result.fit_max_tier == JobTier.C
+    assert result.score_cap_reasons == ["reporting_core"]

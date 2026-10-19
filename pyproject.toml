@@ -20,6 +20,7 @@ dependencies = [
   "SQLAlchemy>=2.0.36",
   "typer>=0.12.5",
   "openai>=1.52.0",
+  "perplexityai>=0.44.0,<1",
 ]
 
 [project.optional-dependencies]

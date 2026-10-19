@@ -130,6 +130,12 @@ PYTHONPATH=src .venv/bin/job-intake crm serve --config config/settings.yaml \
 [поиск по положительным примерам](docs/positive-example-discovery.md):
 `discovery plan` → `discovery run --budget-usd …` → `discovery prepare-labeling` →
 `crm serve --discovery RUN_DIR` → `discovery report`.
+
+Исправления P1 аудита: [применение и CRM](docs/p1-data-operations.md),
+[оценка качества](docs/p1-evaluation.md), [политики роли](docs/p1-role-policy.md).
+
+Интеграция Perplexity Search API, безопасная настройка ключа и отдельная команда
+проверки поиска — в [сохранённой инструкции](docs/perplexity-search-integration.md).
 CRM показывает кандидатов для слепой человеческой разметки и отчёт по API-расходам,
 времени поиска и активному времени разметки на подтверждённую релевантную вакансию.
 Машинный приоритет не становится человеческой меткой; поиск запускается отдельной

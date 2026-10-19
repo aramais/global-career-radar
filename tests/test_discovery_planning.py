@@ -105,6 +105,46 @@ def test_human_feedback_adds_positive_and_excludes_batch_sources(tmp_path):
     assert "https://example.test/feedback" in plan["excluded_urls"]
 
 
+def test_negative_feedback_retains_human_explanation_and_separate_hiring_gate(tmp_path):
+    gold = write(tmp_path / "gold.jsonl", [label(job())])
+    negative = label(job(original_url="https://example.test/negative"), "negative",
+                     relevance=0, gate_outcome="unknown",
+                     notes="Predominantly financial modelling; no analytical project ownership.")
+    positive = label(job(original_url="https://example.test/positive"), "positive",
+                     relevance=3, gate_outcome="ineligible", notes="Relevant duties, US only.")
+    feedback = write(tmp_path / "feedback.jsonl", [negative, positive])
+    plan = build_plan(gold, feedback_path=feedback)
+    counterexample = plan["counterexamples"][0]
+    assert counterexample["notes"] == negative["notes"]
+    assert counterexample["method"] == "blind"
+    assert counterexample["labeled_at"] == negative["labeled_at"]
+    seed = next(row for row in plan["seeds"] if row["job_uid"] == "positive")
+    assert seed["gate_outcome"] == "ineligible"
+    assert seed["relevance"] == 3
+
+
+def test_seed_queries_keep_role_scope_before_optional_topics(tmp_path):
+    plan = build_plan(write(tmp_path / "gold.jsonl", [label(job())]),
+                      max_queries=20, exploration_fraction=0)
+    queries = [entry["query"] for entry in plan["queries"]]
+    assert "business decisions stakeholder partnership" in queries[0]
+    assert "cross functional projects leadership" in queries[1]
+    assert all(any(role in query for role in (
+        "analytics manager", "data science manager", "business analytics manager",
+        "product analytics manager", "analytics project lead", "head of analytics",
+    )) for query in queries)
+    assert not any("unit economics finance" in query for query in queries)
+
+
+def test_product_role_is_retrieval_hint_without_requiring_economics(tmp_path):
+    record = job("Responsibilities:\nOwn the analytics product roadmap.\n"
+                 "Lead projects and collaborate with engineering stakeholders.",
+                 title="Product Lead (Analytics & ML)")
+    plan = build_plan(write(tmp_path / "gold.jsonl", [label(record)]), max_queries=10)
+    assert plan["queries"][0]["query"].startswith("data product manager ")
+    assert "finance" not in plan["queries"][0]["query"]
+
+
 @pytest.mark.parametrize("change", [
     {"relevance": True}, {"relevance": 2.0}, {"method": "model"},
     {"method": None}, {"labeled_at": None}, {"source_hash": "0" * 64},

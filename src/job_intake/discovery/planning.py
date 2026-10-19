@@ -20,7 +20,7 @@ from job_intake.models.job import JobRecord, JobStatus
 from job_intake.scoring.evidence import _duty_units
 from job_intake.utils.text import canonicalize_url
 
-ALGORITHM_VERSION = "positive-duties-tfidf-v1"
+ALGORITHM_VERSION = "positive-duties-geographic-roundrobin-v3"
 _CRITERIA = (
     "International data roles influencing business decisions, managing projects and "
     "working with people; direct reports are optional. English working language. "
@@ -47,7 +47,7 @@ _CONCEPTS = {
     "monetization": (r"\b(?:monetiz\w*|revenue)\b", "monetization revenue"),
     "experimentation": (r"\b(?:experiment\w*|causal|a/b)\b", "experimentation causal inference"),
     "economics": (r"\b(?:economics|profit|p&l|financial|finance|margin)\b",
-                  "unit economics finance"),
+                  "commercial analytics business planning"),
     "decisions": (r"\b(?:decision\w*|recommend\w*|strateg\w*)\b", "business decisions strategy"),
     "projects": (r"\b(?:project\w*|program\w*|roadmap\w*|prioriti\w*)\b",
                  "cross functional projects"),
@@ -55,8 +55,8 @@ _CONCEPTS = {
                "stakeholder partnership"),
     "product": (r"\b(?:product\w*|customer\w*|marketplace\w*)\b", "product insights"),
 }
-_ROLES = ("analytics lead", "decision science manager", "strategic analytics",
-          "business analytics manager", "product insights lead", "analytics project lead")
+_ROLES = ("analytics manager", "data science manager", "business analytics manager",
+          "product analytics manager", "analytics project lead", "head of analytics")
 
 
 def _unique_object(pairs: list[tuple]) -> dict:
@@ -173,20 +173,31 @@ def _seed_queries(seed: dict, document_frequency: Counter) -> list[str]:
     prohibited = {token[0].casefold() for token in _TOKEN.finditer(company)}
     phrases = _phrases(duties, prohibited, document_frequency)
     concepts = _concepts(text)
-    queries = []
+    title = " ".join((seed["source"].get("title") or "").casefold().split())
+    # Titles are retrieval hints only. They never establish candidate fit, and
+    # the downstream content gate may accept a role with any formal title.
+    role = next((value for pattern, value in (
+        (r"marketing", "marketing analytics manager"),
+        (r"commercial", "commercial analytics manager"),
+        (r"product.*(?:lead|manager)|(?:lead|manager).*product", "data product manager"),
+        (r"data science", "data science manager"),
+    ) if re.search(pattern, title)), "analytics manager")
+    queries = [
+        f"{role} business decisions stakeholder partnership jobs",
+        f"{role} cross functional projects leadership jobs",
+    ]
     # Vocabulary expansion is intentionally unquoted, to avoid treating synonyms
     # as exact source evidence or forcing exact seed-title matches.
-    for index, concept in enumerate(concepts):
+    # Optional domain interests refine role-anchored probes; a finance or causal
+    # topic must not become a free-standing surrogate for project responsibility.
+    for concept in concepts:
         vocabulary = _CONCEPTS[concept][1]
-        queries.append(f"{_ROLES[index % len(_ROLES)]} {vocabulary} jobs")
-        for following in concepts[index + 1:]:
-            queries.append(f"analytics {_CONCEPTS[concept][1]} {_CONCEPTS[following][1]} jobs")
+        queries.append(f"{role} {vocabulary} cross functional projects jobs")
     for index, phrase in enumerate(phrases):
         # Broad content words first; quoted exact phrases are a separate,
         # narrower probe rather than the only way to find similar work.
-        queries.append(f"{phrase} analytics leadership jobs")
+        queries.append(f"{role} {phrase} stakeholder leadership jobs")
         queries.append(f'{_ROLES[index % len(_ROLES)]} "{phrase}" jobs')
-    title = " ".join((seed["source"].get("title") or "").casefold().split())
     return [query for query in dict.fromkeys(queries)
             if len(query) <= 128
             and not (title and title in query.casefold())
@@ -201,20 +212,22 @@ def _exploration_queries() -> list[str]:
         "project ownership product decisions",
         "decision support business unit partnership",
         "experimentation project leadership",
-        "commercial decisions finance partnership",
+        "commercial decisions analytics project leadership",
         "insights business recommendations project management",
         "product strategy stakeholder collaboration",
     )
     # No single industry, preferred domain, title or country is mandatory.
-    contexts = ("jobs", "English remote jobs", "Brazil English jobs", "LATAM remote jobs")
+    contexts = ("Brazil English jobs", "LATAM remote jobs", "worldwide English remote jobs")
     return [f"{role} {theme} {context}"
-            for context in contexts for theme in themes for role in _ROLES[:3]]
+            for theme in themes for role in _ROLES[:3] for context in contexts]
 
 
 def build_plan(
     gold_path: Path, *, holdout_path: Path | None = None, max_queries: int = 80,
     exploration_fraction: float = .2, feedback_path: Path | None = None,
     source_records: dict[str, JobRecord] | None = None,
+    feedback_paths: list[Path] | None = None, cohort: dict | None = None,
+    objective: str = "training",
 ) -> dict:
     """Plan a bounded, round-robin search from human positives, without writes.
 
@@ -230,9 +243,13 @@ def build_plan(
     if (type(exploration_fraction) not in (int, float)
             or not math.isfinite(exploration_fraction) or not 0 <= exploration_fraction <= 1):
         raise ValueError("exploration_fraction must be a finite number from 0 to 1")
+    if objective not in {"training", "p1", "p2"}:
+        raise ValueError("Discovery objective must be training, p1 or p2")
     gold = _load_labels(gold_path, source_records)
     holdout = _load_labels(holdout_path, source_records) if holdout_path is not None else []
-    feedback = _load_labels(feedback_path, source_records) if feedback_path is not None else []
+    feedback_inputs = list(dict.fromkeys([*([feedback_path] if feedback_path else []),
+                                         *(feedback_paths or [])]))
+    feedback = [row for path in feedback_inputs for row in _load_labels(path, source_records)]
     holdout_uids = {row["job_uid"] for row in holdout}
     # URL overlap catches a held-out vacancy that was assigned a different ID.
     holdout_urls = {canonicalize_url(row["source"].get(field))
@@ -249,9 +266,19 @@ def build_plan(
             for field in ("relevance", "role_label", "gate_outcome")
         ):
             raise ValueError("Conflicting human labels for duplicate job_uid: " + uid)
-        seen.setdefault(uid, row)
-    known_gold = {row["job_uid"] for row in gold}
-    train = [*gold, *[row for row in feedback if row["job_uid"] not in known_gold]]
+        if uid not in seen:
+            seen[uid] = copy.deepcopy(row)
+        else:
+            saved = seen[uid]
+            for field in ("relevance", "role_label", "gate_outcome", "method", "labeled_at"):
+                if saved.get(field) is None and row.get(field) is not None:
+                    saved[field] = copy.deepcopy(row[field])
+            previous_tags, incoming_tags = saved.get("tags", {}), row.get("tags", {})
+            if any(previous_tags[key] != value for key, value in incoming_tags.items()
+                   if key in previous_tags):
+                raise ValueError("Conflicting human tags for duplicate job_uid: " + uid)
+            saved["tags"] = {**previous_tags, **incoming_tags}
+    train = [row for uid, row in seen.items() if uid not in holdout_uids]
     seeds, counterexamples, warnings = [], [], []
     for row in sorted(train, key=lambda item: item["job_uid"]):
         urls = {canonicalize_url(row["source"].get(field))
@@ -268,7 +295,8 @@ def build_plan(
             warnings.append(f"No attributable role duties; skipped {row['job_uid']}")
             continue
         entry = {key: copy.deepcopy(row.get(key))
-                 for key in ("job_uid", "source_hash", "relevance", "role_label", "source")}
+                 for key in ("job_uid", "source_hash", "relevance", "role_label", "source",
+                             "notes", "gate_outcome", "method", "labeled_at")}
         entry["snapshot_hash"] = source_hash(_record(row["source"]))
         entry["source_binding"] = (
             "snapshot_verified" if entry["snapshot_hash"] == row["source_hash"]
@@ -279,6 +307,11 @@ def build_plan(
         (seeds if relevance >= 2 else counterexamples).append(entry)
     if not seeds:
         raise ValueError("No validated human relevance 2/3 seeds with attributable role duties")
+    if cohort is not None:
+        from job_intake.annotation.cohorts import validate_seed_usage
+        validate_seed_usage(cohort, [*seeds, *counterexamples], purpose="discovery_seed")
+    from job_intake.annotation.cohorts import validate_registered_seed_usage
+    validate_registered_seed_usage([*seeds, *counterexamples], purpose="discovery_seed")
     frequency = Counter(term for seed in seeds for term in set(_terms("\n".join(seed["duties"]))))
     query_rows, seen_queries = [], set()
 
@@ -291,13 +324,27 @@ def build_plan(
                 existing["seed_ids"] = sorted(set(existing["seed_ids"]) | set(seed_ids))
             return False
         seen_queries.add(key)
+        context = next((name for name, pattern in (
+            ("brazil", r"\bBrazil\b"), ("latam", r"\bLATAM\b"),
+            ("worldwide", r"\bworldwide\b")) if re.search(pattern, query, re.I)), "general")
         query_rows.append({"id": f"q-{len(query_rows) + 1:04d}", "query": query,
-                           "seed_ids": seed_ids, "kind": kind})
+                           "seed_ids": seed_ids, "kind": kind, "context": context,
+                           "stream": "analytics_data", "criteria_version": "2026-10-16"})
         return True
 
     exploration_count = min(max_queries, round(max_queries * exploration_fraction))
     seed_limit = max_queries - exploration_count
-    queues = [(seed["job_uid"], _seed_queries(seed, frequency)) for seed in seeds]
+    contexts = ("Brazil English jobs", "LATAM remote jobs", "worldwide English remote jobs")
+    queues = []
+    for seed_index, seed in enumerate(seeds):
+        queue = []
+        for phase in range(len(contexts)):
+            for query_index, query in enumerate(_seed_queries(seed, frequency)):
+                context = contexts[(query_index + phase + seed_index) % len(contexts)]
+                expanded = f"{query.removesuffix(' jobs')} {context}"
+                if len(expanded) <= 128:
+                    queue.append(expanded)
+        queues.append((seed["job_uid"], queue))
     # Round-robin prevents the longest positive source consuming the whole plan.
     while len(query_rows) < seed_limit and any(queue for _, queue in queues):
         for uid, queue in queues:
@@ -311,6 +358,9 @@ def build_plan(
         warnings.append("Not enough distinct grounded queries to fill the requested query budget")
     return {
         "schema": "discovery-plan-v1", "created_at": datetime.now(UTC).isoformat(),
+        "objective": objective,
+        "feedback_sources": [str(path) for path in feedback_inputs],
+        "cohort": cohort,
         "algorithm_version": ALGORITHM_VERSION, "seeds": seeds,
         "counterexamples": counterexamples, "queries": query_rows,
         "excluded_job_uids": sorted(seen),

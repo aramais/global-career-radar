@@ -17,12 +17,17 @@ _LEADER = r"(?:head|manager|director|lead|vp|vice president)(?: of)?"
 _DOMAIN = (
     r"(?:product|commercial|marketing|business|performance|customer|financial|finance|"
     r"revenue|growth|operational|operations|sales|risk|clinical|real world|cybersecurity|"
-    r"digital|enterprise|advanced|applied|global|regional|strategic|security|fraud|credit)"
+    r"digital|enterprise|advanced|applied|global|regional|strategic|security|fraud|credit|data)"
 )
 _MODIFIERS = rf"(?:{_DOMAIN}\s+){{0,3}}"
 _ANALYTICS = r"(?:reporting and )?analytics(?: and (?:insights|reporting))?"
 _SCIENCE = r"data science(?: and analytics)?"
 _TITLE_PATTERNS = {
+    "product-management": [
+        re.compile(rf"\b{_LEADER}\s+product\b"),
+        re.compile(rf"\bproduct\s+{_LEADER}\b"),
+        re.compile(r"\bchief product officer\b"),
+    ],
     "analytics-leadership": [
         re.compile(rf"\b{_LEADER}\s+{_MODIFIERS}{_ANALYTICS}\b"),
         re.compile(rf"\b{_MODIFIERS}{_ANALYTICS}\s+(?:(?:chapter|team|project) )?{_LEADER}\b"),
@@ -40,7 +45,13 @@ _TITLE_PATTERNS = {
 
 
 def _title_text(value: str) -> str:
-    return normalize_text(value.replace("&", " and ").replace("-", " ").replace(":", " "))
+    # Parenthesised domains qualify the advertised occupation rather than extend
+    # its noun phrase: Product Lead (Analytics & ML) differs from Product Lead Designer.
+    bounded = re.sub(r"[()\[\]{}]", " : ", value.replace(":", " "))
+    return normalize_text(
+        bounded.replace("&", " and ").replace("-", " ").replace(":", " : ")
+        .replace("/", " ")
+    )
 
 
 def _occupation_match(title: str, match: re.Match[str], label: str) -> bool:

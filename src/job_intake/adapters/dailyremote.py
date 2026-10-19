@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from urllib.parse import urljoin
+import re
+from itertools import zip_longest
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -10,30 +12,53 @@ from job_intake.adapters._parsing import (
     enrich_from_detail,
     fetch_detail_text,
     parse_date,
+    publication_metadata,
     same_origin_url,
 )
-from job_intake.adapters.base import JobSourceAdapter
+from job_intake.adapters.base import JobSourceAdapter, SourceAuthenticationError, source_snapshot
 from job_intake.models.job import JobRecord
 from job_intake.utils.http import build_session, fetch_text
 from job_intake.utils.text import compact_text
 
 
+def configure_dailyremote_session(session, params: dict) -> bool:
+    """Apply explicit auth policy once; never fall back after a configured auth failure."""
+    cookies_file = params.get("cookies_file")
+    policy = params.get(
+            "auth_policy",
+            "require_authenticated" if "cookies_file" in params else "allow_anonymous",
+        )
+    if policy not in {"require_authenticated", "allow_anonymous"}:
+        raise ValueError(
+            "DailyRemote auth_policy must be require_authenticated or allow_anonymous"
+        )
+    if policy == "require_authenticated" and not cookies_file:
+        raise SourceAuthenticationError("DailyRemote authenticated session is required")
+    if cookies_file:
+        try:
+            load_dailyremote_cookies(session, cookies_file)
+        except ValueError as exc:
+            raise SourceAuthenticationError(str(exc)) from None
+    return bool(cookies_file)
+
+
 class DailyRemoteAdapter(JobSourceAdapter):
+    @source_snapshot("search")
     def fetch_jobs(self) -> list[JobRecord]:
         self.errors.clear()
         with build_session() as session:
             return self._fetch_jobs(session)
 
     def _fetch_jobs(self, session) -> list[JobRecord]:
-        cookies_file = self.params.get("cookies_file")
-        if cookies_file:
-            load_dailyremote_cookies(session, cookies_file)
+        authenticated = configure_dailyremote_session(session, self.params)
         jobs: list[JobRecord] = []
         max_pages = bounded_int(self.params, "max_pages", 1, 20)
         max_details = bounded_int(self.params, "max_detail_fetches", 100, 1000)
-        detail_count = 0
+        groups: list[list[JobRecord]] = []
         seen_jobs: set[str] = set()
         for search_url in self.params.get("search_urls", []):
+            query_jobs: list[JobRecord] = []
+            groups.append(query_jobs)
             url = search_url
             visited: set[str] = set()
             for page in range(max_pages):
@@ -43,24 +68,25 @@ class DailyRemoteAdapter(JobSourceAdapter):
                 try:
                     html = (
                         fetch_dailyremote_text(session, url)
-                        if cookies_file
+                        if authenticated
                         else fetch_text(session, url)
                     )
                     soup = BeautifulSoup(html, "html.parser")
                     page_jobs = self._parse_listing_page(url, soup)
                 except Exception as exc:
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if status in {401, 403} or re.search(
+                        r"DailyRemote HTTP (?:401|403)\b", str(exc),
+                    ):
+                        self._snapshot_auth_required = True
                     self.errors.append(f"DailyRemote listing {url}: {exc}")
                     break
                 for job in page_jobs:
                     if job.original_url in seen_jobs:
                         continue
                     seen_jobs.add(job.original_url)
-                    if self.params.get("fetch_details", True) and detail_count < max_details:
-                        detail_count += 1
-                        self._fetch_detail(session, url, job)
-                    elif self.params.get("fetch_details", True):
-                        job.source_metadata["detail_error"] = "Detail fetch limit reached"
-                    jobs.append(job)
+                    job.source_metadata["search_context"] = search_url
+                    query_jobs.append(job)
                 next_node = soup.select_one(
                     self.params.get(
                         "next_selector", 'a[rel="next"], a[aria-label="Go to next page"]'
@@ -79,6 +105,20 @@ class DailyRemoteAdapter(JobSourceAdapter):
                         "DailyRemote pagination limit reached; collection is incomplete"
                     )
                 url = next_url
+        # Establish the search frame before spending a detail quota. Every query
+        # receives a turn, so the first broad stream cannot consume all detail reads.
+        for row in zip_longest(*groups):
+            jobs.extend(job for job in row if job is not None)
+        for index, job in enumerate(jobs):
+            if self.params.get("fetch_details", True) and index < max_details:
+                self._fetch_detail(session, job.source_metadata["listing_url"], job)
+            elif self.params.get("fetch_details", True):
+                job.source_metadata["detail_error"] = "Detail fetch limit reached"
+                job.source_metadata["detail_outcome"] = "quota_deferred"
+        if not jobs and not self.errors:
+            self.errors.append(
+                "DailyRemote search returned no vacancy cards; verify source layout/access"
+            )
         return jobs
 
     def _fetch_detail(self, session, listing_url: str, job: JobRecord) -> None:
@@ -99,19 +139,27 @@ class DailyRemoteAdapter(JobSourceAdapter):
                 job.source_metadata.update(
                     description_complete=False,
                     detail_access="restricted",
+                    detail_outcome="auth_required",
                     detail_error=(
                         "DailyRemote full description is restricted: "
                         "sign-in/premium access required"
                     ),
                 )
+                self.errors.append("DailyRemote detail requires sign-in/premium access")
+                self._snapshot_auth_required = True
                 return
             complete = enrich_from_detail(job, soup, self.params.get("detail_description_selector"))
             if not complete and not self.params.get("detail_description_selector"):
                 complete = enrich_from_detail(job, soup, ".dj-descwrap:not(.dj-paygated) .dj-prose")
             if not complete:
                 job.source_metadata["detail_error"] = "No JobPosting or description selector found"
+                job.source_metadata["detail_outcome"] = "parse_missing_description"
+                self.errors.append("DailyRemote detail has no supported vacancy description")
+            else:
+                job.source_metadata["detail_outcome"] = "success"
         except Exception as exc:
             job.source_metadata["detail_error"] = str(exc)
+            job.source_metadata["detail_outcome"] = "request_error"
             self.errors.append(f"DailyRemote detail {job.original_url}: {exc}")
 
     def _parse_listing_page(self, base_url: str, soup: BeautifulSoup) -> list[JobRecord]:
@@ -122,7 +170,10 @@ class DailyRemoteAdapter(JobSourceAdapter):
                 continue
 
             title = compact_text(title_link.get_text(" ", strip=True))
-            if not title:
+            original_url = urljoin(base_url, title_link["href"])
+            parsed_url = urlparse(original_url)
+            if not title or parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+                self.errors.append("DailyRemote listing card has no valid title/URL")
                 continue
 
             block = self._collect_block_siblings(heading)
@@ -136,15 +187,24 @@ class DailyRemoteAdapter(JobSourceAdapter):
             for link in links:
                 label = compact_text(link.get_text(" ", strip=True)).lower()
                 if "apply" in label:
-                    apply_url = urljoin(base_url, link["href"])
-                    break
+                    candidate = urljoin(base_url, link["href"])
+                    if urlparse(candidate).scheme in {"http", "https"}:
+                        apply_url = candidate
+                        break
 
             # Use only explicit source dates. A collection time is not a posting date.
             posted_at = None
+            published_label = None
+            published_value = None
             for node in block:
                 time_nodes = [node] if node.name == "time" else node.select("time[datetime]")
                 for time_node in time_nodes:
                     posted_at = parse_date(time_node.get("datetime")) or posted_at
+                    published_value = time_node.get("datetime") or published_value
+                    published_label = (
+                        compact_text(time_node.get_text(" ", strip=True))
+                        or time_node.get("datetime") or published_label
+                    )
             # Include every block, not just the first paragraph: eligibility requirements
             # can be in lists or later paragraphs in the card.
             description = block_text
@@ -155,10 +215,10 @@ class DailyRemoteAdapter(JobSourceAdapter):
                     source_job_id=title_link.get("href"),
                     company=company or "Unknown",
                     title=title,
-                    original_url=urljoin(base_url, title_link["href"]),
-                    apply_url=apply_url or urljoin(base_url, title_link["href"]),
+                    original_url=original_url,
+                    apply_url=apply_url or original_url,
                     posted_at=posted_at,
-                    location_text=self._extract_location(block_text),
+                    location_text=self._extract_card_location(block),
                     remote_text="Remote",
                     salary_text=self._extract_salary(block_text),
                     employment_type="Full Time" if "full time" in block_text.casefold() else None,
@@ -169,6 +229,8 @@ class DailyRemoteAdapter(JobSourceAdapter):
                         "description_complete": False,
                         "description_source": "listing_card",
                         "card_paragraph_count": len(paragraphs),
+                        **publication_metadata(published_value, "listing_time"),
+                        "published_label": published_label,
                     },
                 )
             )
@@ -194,7 +256,7 @@ class DailyRemoteAdapter(JobSourceAdapter):
     @staticmethod
     def _extract_location(text: str) -> str | None:
         marker_candidates = [
-            "worldwide",
+            "worldwide", "global", "latam", "amer",
             "united states",
             "canada",
             "argentina",
@@ -206,13 +268,31 @@ class DailyRemoteAdapter(JobSourceAdapter):
         ]
         lowered = text.casefold()
         for candidate in marker_candidates:
-            if candidate in lowered:
+            if re.search(r"(?<!\w)" + re.escape(candidate) + r"(?!\w)", lowered):
                 return candidate.title()
         return None
 
+    @classmethod
+    def _extract_card_location(cls, nodes) -> str | None:
+        locations = []
+        for node in nodes:
+            if node.name in {"p", "ul", "ol", "a"}:
+                continue
+            text = compact_text(node.get_text(" ", strip=True))
+            if "·" in text:
+                candidates = text.split("·")[1:]
+                for candidate in candidates:
+                    if cls._extract_location(candidate):
+                        locations.append(candidate.strip())
+        return "; ".join(dict.fromkeys(locations)) or None
+
     @staticmethod
     def _extract_salary(text: str) -> str | None:
-        if "$" not in text:
-            return None
-        parts = [part for part in text.split() if "$" in part]
-        return " ".join(parts[:4]) or None
+        salary = re.search(
+            r"(?:(?:USD|CAD|BRL|EUR|GBP)\s*)?(?:R\$|\$|€|£)\s*"
+            r"\d[\d.,]*(?:\s*[kKmM])?(?:\s*(?:[-–—]|to)\s*"
+            r"(?:(?:USD|CAD|BRL|EUR|GBP)\s*)?(?:R\$|\$|€|£)?\s*"
+            r"\d[\d.,]*(?:\s*[kKmM])?)?"
+            r"(?:\s*(?:/|per\s+)?(?:year|yr|annum|month|mo|hour|hr))?", text,
+        )
+        return compact_text(salary[0]) if salary else None

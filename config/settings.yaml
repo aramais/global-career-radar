@@ -109,6 +109,7 @@ sources:
     enabled: true
     params:
       cookies_file: ${DAILYREMOTE_COOKIES_FILE}
+      auth_policy: require_authenticated
       use_profile_queries: true
       search_url_template: https://dailyremote.com/remote-jobs?search={query}
       fetch_details: true

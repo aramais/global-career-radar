@@ -153,21 +153,33 @@ def hiring_decision_comparison(before: dict[str, dict], after: dict[str, dict]) 
 
 
 def compare(config: AppConfig, *, gold: Path, baseline: str,
-            repository: Path = REPOSITORY, focus: str = "classification") -> dict:
+            repository: Path = REPOSITORY, focus: str = "classification",
+            cohort: Path | None = None) -> dict:
     if focus not in {"classification", "scoring"}:
         raise ValueError("Comparison focus must be classification or scoring")
     raw_cases = read_jsonl(gold)
+    cohort_manifest = None
+    if cohort:
+        from job_intake.annotation.cohorts import load_cohort, select_cases
+
+        cohort_manifest = load_cohort(cohort)
+        raw_cases = select_cases(raw_cases, cohort_manifest)
     cases = completed_cases(raw_cases)
     uids = [case["job_uid"] for case in cases]
-    database, saved, problems = read_saved_records(config.database_url, limit=None, job_uids=uids)
+    database, saved, problems = read_saved_records(
+        config.database_url, limit=None, job_uids=uids, include_archived=True,
+    )
     if problems:
         raise ValueError("Comparison requires valid saved source and annotation records")
     diff = run_rules_diff(config, baseline=baseline, repository=repository,
-                          limit=None, job_uids=uids)
+                          limit=None, job_uids=uids, include_archived=True)
     if diff["source_snapshot"]["fingerprint"] != _source_fingerprint(saved):
         raise ValueError("Source inputs changed during comparison; retry against a stable database")
     profile_ids = list(set(diff["baseline"]["profiles"]) | set(diff["current"]["profiles"]))
-    validation = validate_gold(saved, cases, profile_ids=profile_ids)
+    from job_intake.annotation.source_compat import read_source_history
+
+    validation = validate_gold(saved, cases, profile_ids=profile_ids,
+                               source_history=read_source_history(config.database_url, cases))
     if not validation["valid"]:
         raise ValueError("Invalid completed gold: " + "; ".join(
             error["code"] for error in validation["errors"]))
@@ -211,7 +223,8 @@ def compare(config: AppConfig, *, gold: Path, baseline: str,
                  "sha256": hashlib.sha256(gold.read_bytes()).hexdigest(),
                  "total_rows": len(raw_cases), "completed_rows": len(cases),
                  "validation": validation, "parser_only_rebound": len(parser_only)},
-        "selection": {"job_uids": uids, "archived": False, "complete_decisions_only": True},
+        "selection": {"job_uids": uids, "archived": True, "complete_decisions_only": True,
+                      "cohort": cohort_manifest},
         "source_snapshot": diff["source_snapshot"], "scope": diff["scope"],
         "before": _evaluation(cases, before), "after": _evaluation(cases, after),
         "role_changes": dict(Counter(row["role_result"] for row in comparison)),
@@ -374,17 +387,30 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True,
                         help="Write JSON and adjacent Markdown")
     parser.add_argument("--config", type=Path, default=REPOSITORY / "config/settings.yaml")
+    parser.add_argument("--cohort", type=Path, help="Strict provenance sidecar; gold v2 unchanged")
+    parser.add_argument("--exposure-log", type=Path, help="Append developer analysis for holdout")
     parser.add_argument("--focus", choices=("classification", "scoring"), default="classification",
                         help="Choose classification or relevance-scoring report focus")
     args = parser.parse_args()
     try:
         config = load_app_config(args.config)
-        report = compare(config, gold=args.gold, baseline=args.baseline, focus=args.focus)
+        report = compare(config, gold=args.gold, baseline=args.baseline, focus=args.focus,
+                         cohort=args.cohort)
+        manifest = report["selection"].get("cohort")
+        if manifest and manifest["dataset_role"] == "holdout" \
+                and not args.exposure_log and not manifest.get("exposure_log"):
+            raise ValueError("Holdout analysis requires --exposure-log or manifest exposure_log")
         protected = [args.gold, args.config, config.rules_path, config.search_profiles_path,
                      sqlite_path(config.database_url)]
+        if args.cohort:
+            protected.append(args.cohort)
         if Path(args.baseline).expanduser().is_file():
             protected.append(Path(args.baseline))
         outputs = save_comparison(report, args.output, protected_paths=protected)
+        if manifest:
+            from job_intake.annotation.cohorts import record_report_exposure
+
+            record_report_exposure(manifest, output=args.output, exposure_log=args.exposure_log)
     except (OSError, ValueError) as exc:
         parser.exit(1, f"Comparison failed: {exc}\n")
     print("\n".join(str(path) for path in outputs))

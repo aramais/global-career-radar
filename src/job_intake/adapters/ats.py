@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from urllib.parse import quote, urlencode, urlparse
 
-from job_intake.adapters._parsing import bounded_int, html_text, parse_date
-from job_intake.adapters.base import JobSourceAdapter
+from job_intake.adapters._parsing import (
+    bounded_int,
+    description_text,
+    html_text,
+    parse_date,
+    publication_metadata,
+)
+from job_intake.adapters.base import JobSourceAdapter, source_snapshot
 from job_intake.models.job import JobRecord, JobStatus
 from job_intake.utils.http import build_session
 from job_intake.utils.text import compact_text
@@ -42,6 +48,7 @@ def _remote(location: str | None) -> str | None:
 class GreenhouseAdapter(JobSourceAdapter):
     """Public Job Board API: one list call includes the complete HTML description."""
 
+    @source_snapshot("board")
     def fetch_jobs(self) -> list[JobRecord]:
         self.errors.clear()
         token = _token(self.params, "board_token")
@@ -92,6 +99,7 @@ class GreenhouseAdapter(JobSourceAdapter):
                 "departments": item.get("departments", []),
                 "offices": item.get("offices", []),
                 "custom_fields": item.get("metadata"),
+                **publication_metadata(item.get("first_published"), "greenhouse:first_published"),
             },
         )
 
@@ -99,6 +107,7 @@ class GreenhouseAdapter(JobSourceAdapter):
 class AshbyAdapter(JobSourceAdapter):
     """Public Job Posting API includes full descriptions and optional compensation."""
 
+    @source_snapshot("board")
     def fetch_jobs(self) -> list[JobRecord]:
         self.errors.clear()
         board = _token(self.params, "board_name")
@@ -111,6 +120,7 @@ class AshbyAdapter(JobSourceAdapter):
             try:
                 # Unlisted postings are direct-link postings, not public search results.
                 if item.get("isListed") is False and not self.params.get("include_unlisted", False):
+                    self._snapshot_filtered = True
                     continue
                 jobs.append(self._parse_job(item, url))
             except (AttributeError, KeyError, TypeError, ValueError) as exc:
@@ -123,7 +133,7 @@ class AshbyAdapter(JobSourceAdapter):
         if not title or not url:
             raise ValueError("job title and jobUrl are required")
         raw = str(item.get("descriptionHtml") or item.get("descriptionPlain") or "")
-        description = compact_text(item.get("descriptionPlain")) or html_text(raw)
+        description = description_text(item.get("descriptionPlain")) or html_text(raw)
         locations = [item.get("location")]
         for location in item.get("secondaryLocations") or []:
             if isinstance(location, dict):
@@ -141,7 +151,7 @@ class AshbyAdapter(JobSourceAdapter):
             company=str(self.params.get("company") or self.name),
             title=title,
             original_url=url,
-            apply_url=item.get("applyUrl") or url,
+            apply_url=_job_url(item.get("applyUrl") or url),
             posted_at=parse_date(item.get("publishedAt")),
             location_text=location_text,
             remote_text=item.get("workplaceType")
@@ -162,6 +172,7 @@ class AshbyAdapter(JobSourceAdapter):
                 "address": item.get("address"),
                 "secondary_locations": item.get("secondaryLocations", []),
                 "compensation": compensation,
+                **publication_metadata(item.get("publishedAt"), "ashby:publishedAt"),
             },
         )
 
@@ -169,6 +180,7 @@ class AshbyAdapter(JobSourceAdapter):
 class LeverAdapter(JobSourceAdapter):
     """Public Postings API; bounded pagination and all body/list/closing blocks."""
 
+    @source_snapshot("board")
     def fetch_jobs(self) -> list[JobRecord]:
         self.errors.clear()
         site = _token(self.params, "site")
@@ -204,6 +216,8 @@ class LeverAdapter(JobSourceAdapter):
                     unseen += 1
                 except (AttributeError, KeyError, TypeError, ValueError) as exc:
                     self.errors.append(f"Lever job skipped: {exc}")
+            if not unseen and len(payload) >= page_size:
+                self.errors.append("Lever repeated a full page; board snapshot is incomplete")
             if len(payload) < page_size or not unseen:
                 break
             if page == max_pages - 1:
@@ -247,7 +261,7 @@ class LeverAdapter(JobSourceAdapter):
             company=str(self.params.get("company") or self.name),
             title=title,
             original_url=url,
-            apply_url=item.get("applyUrl") or url,
+            apply_url=_job_url(item.get("applyUrl") or url),
             # The public Lever API does not document a publication timestamp.
             posted_at=None,
             location_text=location_text,
@@ -267,5 +281,6 @@ class LeverAdapter(JobSourceAdapter):
                 "team": categories.get("team"),
                 "department": categories.get("department"),
                 "salary_range": salary,
+                **publication_metadata(None, "lever:unavailable"),
             },
         )

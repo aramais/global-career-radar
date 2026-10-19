@@ -400,6 +400,7 @@ def run_evaluation(
 ) -> dict:
     path, rows, load_findings = read_saved_records(
         settings.database_url, limit=limit, job_uids=job_uids,
+        include_archived=gold_path is not None,
     )
     report = evaluate_records(rows, settings.annotation, settings.prefilter)
     for job in report["jobs"]:
@@ -420,7 +421,8 @@ def run_evaluation(
     ).items()))
     report.update(generated_at=datetime.now(UTC).isoformat(),
                   selection={"order": "updated_at DESC, job_uid", "limit": limit,
-                             "job_uids": job_uids or [], "archived": False},
+                             "job_uids": job_uids or [],
+                             "include_archived": gold_path is not None},
                   database=str(path), database_access="read_only")
     if log_path:
         report["log"] = evaluate_log(log_path)

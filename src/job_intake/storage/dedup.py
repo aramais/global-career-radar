@@ -47,7 +47,7 @@ class JobDeduplicator:
             )
         )
         return DedupIdentity(
-            job_uid=stable_hash(primary_key),
+            job_uid=job._canonical_job_uid or stable_hash(primary_key),
             content_hash=content_hash,
             fingerprint=fingerprint,
         )

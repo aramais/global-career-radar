@@ -217,10 +217,13 @@ class GoldLabelStore:
 
     def _source_records(self, uid: str) -> tuple:
         """Resolve immutable source facts; discovery can supply its own artifact."""
-        return read_saved_records(self.config.database_url, limit=None, job_uids=[uid])
+        return read_saved_records(
+            self.config.database_url, limit=None, job_uids=[uid], include_archived=True,
+        )
 
     def _detail(self, case: dict, line: bytes) -> dict:
         uid, warnings, can_save, state = case["job_uid"], [], True, "current"
+        proof = None
         try:
             _, rows, problems = self._source_records(uid)
         except (OSError, ValueError, sqlite3.Error) as error:
@@ -229,8 +232,18 @@ class GoldLabelStore:
             state = "missing" if "Requested jobs" in str(error) else "unavailable"
         else:
             record = dict(rows)[uid]
+            from job_intake.annotation.source_compat import (
+                check_source_compatibility,
+                read_source_history,
+            )
+
+            history = {}
+            if case.get("source_hash") != source_hash(record) \
+                    and self._source_records.__func__ is GoldLabelStore._source_records:
+                history = read_source_history(self.config.database_url, [case])
             report = validate_gold(rows, [case], profile_ids=[role["value"]
-                                                           for role in self._roles()])
+                                                           for role in self._roles()],
+                                   source_history=history)
             warnings.extend(_SOURCE_WARNINGS.get(item["code"], item["message"])
                             for item in report["warnings"] if item["code"] != "unlabeled_case")
             if not report["valid"]:
@@ -240,11 +253,16 @@ class GoldLabelStore:
                    for item in problems.get(uid, [])):
                 warnings.append("Исходные данные в базе повреждены; сохранение запрещено.")
                 can_save, state = False, "invalid"
-            if case.get("source_hash") != source_hash(record) \
-                    or case.get("source") != _snapshot(record):
+            proof = check_source_compatibility(case, record, history=history.get(uid))
+            snapshot_matches = case.get("source") == _snapshot(record) or (
+                proof["compatible"] and proof["method"] != "exact_public_hash"
+            )
+            if not proof["compatible"] or not snapshot_matches:
                 warnings.append("Источник изменился или snapshot отсутствует. Разметка не будет "
                                 "перенесена на другой текст; сначала проверьте расхождение.")
                 can_save, state = False, "drift"
+            elif proof["method"] != "exact_public_hash":
+                state = "compatible_observations"
         if not isinstance(case.get("source"), dict) or _source_error(case.get("source")):
             warnings.append("Некорректный snapshot исходной вакансии.")
             can_save, state = False, "invalid"
@@ -253,6 +271,8 @@ class GoldLabelStore:
             "labels": {field: copy.deepcopy(case.get(field)) for field in _LABEL_FIELDS},
             "version": _sha(line), "complete": _complete(case),
             "warnings": warnings, "can_save": can_save, "source_state": state,
+            "source_compatibility": {key: value for key, value in proof.items()
+                                     if key != "source_snapshot"} if proof else None,
         }
 
     def detail(self, uid: str) -> dict:

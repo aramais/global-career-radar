@@ -5,12 +5,13 @@ from pathlib import Path
 import yaml
 
 from job_intake.adapters.ats import AshbyAdapter, GreenhouseAdapter, LeverAdapter
-from job_intake.adapters.base import JobSourceAdapter
+from job_intake.adapters.base import JobSourceAdapter, source_snapshot
 from job_intake.adapters.html_page import HtmlPageAdapter
 from job_intake.models.job import JobRecord
 
 
 class CompanyWatchlistAdapter(JobSourceAdapter):
+    @source_snapshot("watchlist")
     def fetch_jobs(self) -> list[JobRecord]:
         self.errors.clear()
         watchlist_path = Path(self.params["watchlist_path"]).resolve()
@@ -25,12 +26,16 @@ class CompanyWatchlistAdapter(JobSourceAdapter):
             if not item.get("enabled", True):
                 continue
             company_name = item.get("name", "Unknown")
+            adapter = None
             try:
                 adapter = self._build_company_adapter(item)
                 company_jobs = adapter.fetch_jobs()
             except Exception as exc:
+                if adapter is not None:
+                    self.board_snapshots.extend(adapter.board_snapshots)
                 self.errors.append(f"{company_name}: {exc}")
                 continue
+            self.board_snapshots.extend(adapter.board_snapshots)
             self.errors.extend(f"{company_name}: {error}" for error in adapter.errors)
             for job in company_jobs:
                 job.company = company_name

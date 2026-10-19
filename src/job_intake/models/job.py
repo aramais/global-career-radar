@@ -48,6 +48,13 @@ class JobRecord:
     _text_units_cache: tuple[Any, ...] | None = field(
         default=None, init=False, repr=False, compare=False,
     )
+    # Optimistic source revision captured before any classification/model work.
+    # These are transport guards, never source facts or public snapshot fields.
+    _source_reconciled: bool = field(default=False, init=False, repr=False, compare=False)
+    _expected_source_revision: int | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+    _canonical_job_uid: str | None = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -68,6 +75,12 @@ class JobEvaluation:
     # Relevance policy is independent of the separately persisted hiring decision.
     fit_policy: str = "legacy"
     fit_max_tier: JobTier | None = None
+    # Unknown for legacy rows: a capped score cannot reconstruct the original rank.
+    raw_fit_score: float | None = None
+    score_cap_reasons: list[str] = field(default_factory=list)
+    # Hiring evidence is independent of occupation, role fit and overall routing.
+    eligibility_status: str = "unknown"
+    eligibility_evidence_status: str = "unconfirmed"
 
 
 @dataclass(slots=True)
@@ -80,6 +93,7 @@ class EvaluatedJob:
     profile_context: str = ""
     # Occupation classification is distinct from source facts and relevance.
     role_classification: dict[str, Any] = field(default_factory=dict)
+    version_components: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

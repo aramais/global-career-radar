@@ -25,8 +25,9 @@ from job_intake.config.settings import (
     load_app_config,
     load_yaml_mapping,
 )
+from job_intake.filtering import refresh_eligibility_status
 from job_intake.models.job import EvaluatedJob, FilterDecision, JobRecord, JobStatus, JobTier
-from job_intake.profiles import SearchStream, load_streams, with_other_stream
+from job_intake.profiles import SearchStream, load_streams, profile_query_order, with_other_stream
 from job_intake.scoring.llm import BatchReranker, build_reranker, should_skip_llm
 from job_intake.scoring.tiering import finalize_tier
 from job_intake.storage.database import Database
@@ -34,6 +35,8 @@ from job_intake.storage.dedup import JobDeduplicator
 from job_intake.storage.models import AlertOutboxORM
 from job_intake.storage.queries import classification_is_current
 from job_intake.storage.repository import JobRepository, validate_job_uids
+from job_intake.storage.source_lifecycle import record_source_snapshot
+from job_intake.storage.source_state import reconcile_source
 from job_intake.utils.logging import configure_logging
 from job_intake.utils.text import stable_hash
 
@@ -70,7 +73,7 @@ class JobIntakePipeline:
             template = params.get(
                 "search_url_template", "https://dailyremote.com/remote-jobs?search={query}"
             )
-            keywords = dict.fromkeys(k for stream in self.streams for k in stream.keywords)
+            keywords = profile_query_order(self.streams)
             params["search_urls"] = [template.replace("{query}", quote_plus(k)) for k in keywords]
         return replace(source, params=params)
 
@@ -82,6 +85,8 @@ class JobIntakePipeline:
             "evaluations": 0,
             "alerts": 0,
             "source_errors": 0,
+            "source_closures": 0,
+            "source_reopens": 0,
             "record_errors": 0,
             "alert_errors": 0,
             "llm_calls": 0,
@@ -127,11 +132,13 @@ class JobIntakePipeline:
         for source in self.config.sources:
             if not source.enabled:
                 continue
+            adapter = None
             try:
                 adapter = build_adapter(self._source_with_queries(source))
                 records = adapter.fetch_jobs()
             except Exception as exc:
                 self._error(stats, "source_errors", source.name, exc)
+                self._record_source_health(adapter, source, stats, failed=True)
                 continue
             for error in getattr(adapter, "errors", []):
                 self._error(stats, "source_errors", source.name, error)
@@ -150,10 +157,38 @@ class JobIntakePipeline:
                         pending_groups.pop(job_uid, None)
                 except Exception as exc:
                     self._error(stats, "record_errors", record.original_url or record.title, exc)
+            self._record_source_health(adapter, source, stats)
         self._finish_batches(pending_groups, stats, queue_alert=True)
         self._dispatch_alerts(stats)
         LOGGER.info("run_complete %s", json.dumps(stats, ensure_ascii=False))
         return stats
+
+    def _record_source_health(self, adapter, source, stats, *, failed=False):
+        snapshots = list(getattr(adapter, "board_snapshots", []) or [])
+        if not snapshots:
+            snapshots = [{"source": source.name, "scope": "unknown",
+                          "status": "failed" if failed else "partial" if getattr(
+                              adapter, "errors", [],
+                          ) else "success",
+                          "snapshot_complete": False, "seen_urls": [], "seen_job_ids": []}]
+        closures = []
+        with self.database.session() as session:
+            for snapshot in snapshots:
+                closures.extend(record_source_snapshot(
+                    session, snapshot, grace_days=float(source.params.get("missing_grace_days", 7)),
+                    minimum_observations=int(source.params.get("missing_min_observations", 2)),
+                ))
+            session.commit()
+        for record in closures:
+            try:
+                items, keys, _ = self._evaluate_record(record, stats, use_llm=False)
+                self._save(items, keys, observed=False, queue_alert=False)
+                counter = (
+                    "source_closures" if record.status == JobStatus.CLOSED else "source_reopens"
+                )
+                stats[counter] += 1
+            except Exception as exc:
+                self._error(stats, "record_errors", "source closure", exc)
 
     def _finish_batches(
         self,
@@ -207,12 +242,11 @@ class JobIntakePipeline:
         with self.database.session() as session:
             repository = JobRepository(session)
             saved = repository.find_by_record(record)
+            reconcile_source(record, saved)
             cached_evaluations = (
                 repository.profile_evaluations_for_job(saved.job_uid)
                 if saved is not None and use_llm and self.config.llm.enabled else {}
             )
-            if saved is not None and not record.annotation:
-                record.annotation = saved.annotation or {}
             # Choose occupation before evaluating relevance or per-role conditions.
             before_classification = dict(self.classifier.stats)
             stream, classification = self.classifier.classify(
@@ -280,6 +314,7 @@ class JobIntakePipeline:
             apply_annotation_constraints(record, item.evaluation, engine)
             item.profile_id, item.profile_name = stream.id, stream.name
             item.profile_version, item.profile_context = stream.version, stream.context
+            item.version_components = dict(stream.version_components)
             item.role_classification = classification
             if stream.id == "other":
                 # No relevance estimate against an unrelated occupation.
@@ -333,6 +368,8 @@ class JobIntakePipeline:
                 ):
                     item.evaluation.semantic_score = cached.semantic_score
                     item.evaluation.fit_score += cached.semantic_score
+                    if item.evaluation.raw_fit_score is not None:
+                        item.evaluation.raw_fit_score += cached.semantic_score
                     item.evaluation.bridge_role |= cached.bridge_role
                     item.evaluation.fit_reason = cached.fit_reason
                     item.evaluation.risks = sorted(set(item.evaluation.risks + cached.risks))
@@ -361,7 +398,18 @@ class JobIntakePipeline:
     def _finalize(self, items: list[EvaluatedJob]) -> None:
         by_id = {s.id: s for s in self.streams}
         for item in items:
+            if item.record.source_metadata.get("source_conflicts"):
+                if item.evaluation.decision != FilterDecision.REJECT:
+                    item.evaluation.decision = FilterDecision.REVIEW
+                if item.evaluation.fit_max_tier != JobTier.C:
+                    item.evaluation.fit_max_tier = JobTier.B
+                if "source_update_unverified" not in item.evaluation.risks:
+                    item.evaluation.risks.append("source_update_unverified")
+                    item.evaluation.audit_log.append(
+                        "Incomplete update differs from saved details; both retained for review."
+                    )
             scoring = by_id[item.profile_id].scoring
+            refresh_eligibility_status(item.evaluation)
             finalize_tier(item, scoring.threshold_a, scoring.threshold_b)
 
     def _save(
@@ -381,7 +429,11 @@ class JobIntakePipeline:
                     and self.config.telegram.instant_a_tier
                 ),
             )
+            session.flush()
+            saved = repository.find_by_record(items[0].record)
+            revision = saved.source_revision
             session.commit()
+            items[0].record._expected_source_revision = revision
 
     def _dispatch_alerts(self, stats: dict[str, Any]) -> None:
         if not self.config.telegram.enabled or not self.config.telegram.instant_a_tier:
@@ -440,6 +492,7 @@ class JobIntakePipeline:
         self, *, use_ai: bool = False, limit: int | None = None,
         progress: ProgressCallback | None = None,
         job_uids: list[str] | None = None,
+        include_archived: bool = False,
     ) -> dict[str, Any]:
         """Apply profiles offline; progress does not change evaluations or cache keys."""
         selection = validate_job_uids(job_uids)
@@ -455,6 +508,8 @@ class JobIntakePipeline:
         emit_progress(progress, "run_start")
         try:
             selected = {"job_uids": selection} if selection is not None else {}
+            if include_archived:
+                selected["include_archived"] = True
             result = self._reevaluate_saved(
                 use_ai=use_ai, limit=limit, progress=progress, **selected,
             )
@@ -472,13 +527,16 @@ class JobIntakePipeline:
     def _reevaluate_saved(
         self, *, use_ai: bool, limit: int | None, progress: ProgressCallback | None,
         job_uids: list[str] | None = None,
+        include_archived: bool = False,
     ) -> dict[str, Any]:
         """Apply profiles to saved data; AI is explicit opt-in, notifications stay disabled."""
         stats = self._stats()
         pending_groups = {}
         with self.database.session() as session:
             selected = {"job_uids": job_uids} if job_uids is not None else {}
-            jobs = JobRepository(session).list_jobs(limit=limit, archived=False, **selected)
+            jobs = JobRepository(session).list_jobs(
+                limit=limit, archived=None if include_archived else False, **selected,
+            )
             if job_uids is not None:
                 by_uid = {job.job_uid: job for job in jobs}
                 if set(job_uids) - set(by_uid):

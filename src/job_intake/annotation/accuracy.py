@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 from job_intake.annotation.benchmark import read_jsonl
 from job_intake.annotation.eval_runner import (
+    _object_json,
     evaluate_log,
     read_saved_records,
     sqlite_path,
@@ -31,7 +32,7 @@ from job_intake.config.settings import AppConfig, load_yaml_mapping
 from job_intake.models.job import JobRecord, JobStatus
 from job_intake.profiles import load_streams
 
-ACCURACY_VERSION = "vacancy-accuracy-v1"
+ACCURACY_VERSION = "vacancy-accuracy-v2"
 _SCOPE_MAP = {
     "project_management": "project_management",
     "people_interaction": "people_interaction",
@@ -49,6 +50,8 @@ _NEGATIVES = {
 }
 _NUMBER = r"[0-9]{1,12}(?:\.[0-9]{1,6})?"
 _MISSING = "__abstained__"
+_ROUTES = {"full_review", "suppressed", "OUT_OF_SCOPE", "out_of_scope", "local_reject",
+           "title_out_of_family"}
 
 
 def proportion(numerator: int, denominator: int) -> dict:
@@ -296,6 +299,9 @@ def read_saved_predictions(
         }
         fields = {"job_uid", "profile_id", "profile_version", "content_hash", "decision",
                   "tier", "fit_score"}
+        optional = sorted(score_columns & {"eligibility_status", "eligibility_evidence_status",
+                                           "raw_fit_score", "score_cap_reasons",
+                                           "version_components"})
         for uid, record in rows:
             prediction = {"job_uid": uid, **adapt_saved_record(record)}
             metadata = connection.execute("SELECT * FROM jobs WHERE job_uid = ?", (uid,)).fetchone()
@@ -309,7 +315,8 @@ def read_saved_predictions(
                     pass
             saved = [dict(row) for row in connection.execute(
                 "SELECT job_uid, profile_id, profile_version, content_hash, "
-                "decision, tier, fit_score FROM job_relevance_evaluations "
+                "decision, tier, fit_score" + ("," + ",".join(optional) if optional else "")
+                + " FROM job_relevance_evaluations "
                 "WHERE job_uid = ?", (uid,),
             )] if score_columns >= fields else []
             stale_content = [row["profile_id"] for row in saved if (
@@ -336,17 +343,45 @@ def read_saved_predictions(
                 row["profile_id"] == label and classification_current
                 and row["profile_id"] not in stale_content + stale_profiles
                 and row.get("decision") in {"pass", "review", "reject"}
-                and row.get("tier") in {"A", "B", "C"}
-                and type(row.get("fit_score")) in {int, float}
-                and math.isfinite(row["fit_score"])
+                and (label == "other" or (
+                    row.get("tier") in {"A", "B", "C"}
+                    and type(row.get("fit_score")) in {int, float}
+                    and math.isfinite(row["fit_score"])
+                ))
             )]
             current = valid[0] if len(valid) == 1 and source_current is not False else {}
             unscored = classification_current and label == "other"
+            gate = current.get("eligibility_status")
+            gate = gate if gate in {"eligible", "ineligible", "unknown"} else None
+            raw_score = current.get("raw_fit_score")
+            raw_score = raw_score if type(raw_score) in {int, float} \
+                and math.isfinite(raw_score) and not unscored else None
+            cap_reasons, components = None, None
+            try:
+                parsed = json.loads(current.get("score_cap_reasons") or "null")
+                if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
+                    cap_reasons = parsed
+                components = _object_json(current.get("version_components"), "version_components") \
+                    if "version_components" in current else None
+            except (ValueError, TypeError):
+                pass
             prediction.update(
                 decision=current.get("decision"), tier=None if unscored else current.get("tier"),
                 fit_score=None if unscored else current.get("fit_score"),
                 profile_id=label if unscored else current.get("profile_id"),
                 role_label=label if classification_current else None,
+                gate_outcome=gate, raw_fit_score=raw_score, score_cap_reasons=cap_reasons,
+                version_components=components,
+                eligibility_evidence_status=current.get("eligibility_evidence_status")
+                if current.get("eligibility_evidence_status") in {
+                    "confirmed", "blocked", "unconfirmed",
+                } else None,
+                eligibility_provenance={
+                    "column_present": "eligibility_status" in score_columns,
+                    "source": "current_saved_evaluation" if gate is not None else
+                    "missing_column" if "eligibility_status" not in score_columns else
+                    "stale_or_invalid_saved_evaluation",
+                },
                 role_classification=classification,
                 relevance_evaluation=None if unscored else current or None,
                 source_current=source_current,
@@ -396,7 +431,8 @@ def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
 
     def excluded(case: dict) -> bool:
         row = prediction(case)
-        return row.get("decision") == "reject" or row.get("route") in {
+        return row.get("decision") == "reject" or isinstance(row.get("route"), str) \
+            and row.get("route") in {
             "suppressed",
             "OUT_OF_SCOPE",
             "out_of_scope",
@@ -425,11 +461,13 @@ def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
     for name, tiers in (("precision_A", {"A"}), ("precision_AB", {"A", "B"})):
         selected = [case for case in labeled if shortlisted(case, tiers)]
         metrics[name] = proportion(sum(_relevance(case) >= 2 for case in selected), len(selected))
+    ranking_cases = [case for case in labeled if case.get("role_label") != "other"]
     rankable = [
         case
         for case in labeled
         if prediction(case).get("tier") in {"A", "B", "C"}
         and type(prediction(case).get("fit_score")) in {int, float}
+        and math.isfinite(prediction(case)["fit_score"])
     ]
     ranked = sorted(
         rankable,
@@ -467,6 +505,31 @@ def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
                    if truth == gold}
             for gold in sorted({gold for gold, _ in role_pairs})
         },
+    }
+    eligibility_values = {"eligible", "ineligible", "unknown"}
+    eligibility_pairs = [
+        (case["gate_outcome"], prediction(case).get("gate_outcome"))
+        for case in cases if case.get("gate_outcome") in eligibility_values
+    ]
+    eligibility_confusion = Counter(
+        (gold, predicted if predicted in eligibility_values else _MISSING)
+        for gold, predicted in eligibility_pairs
+    )
+    eligibility_metrics = {
+        "accuracy": proportion(sum(gold == predicted for gold, predicted in eligibility_pairs),
+                               len(eligibility_pairs)),
+        "prediction_coverage": proportion(
+            sum(predicted in eligibility_values for _, predicted in eligibility_pairs),
+            len(eligibility_pairs),
+        ),
+        "confusion": {
+            gold: {predicted: count
+                   for (truth, predicted), count in sorted(eligibility_confusion.items())
+                   if truth == gold}
+            for gold in sorted({gold for gold, _ in eligibility_pairs})
+        },
+        "note": ("Eligibility requires its own prediction; "
+                 "role, relevance and tier do not imply it."),
     }
     tag_metrics = {}
     aggregate_negative = Counter()
@@ -539,6 +602,14 @@ def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
         and prediction(case).get("tier") in {"A", "B", "C"}
         for case in labeled
     )
+    route_present = [case for case in labeled
+                     if isinstance(prediction(case).get("route"), str)
+                     and prediction(case)["route"] in _ROUTES]
+    route_missing = [case["job_uid"] for case in labeled
+                     if case not in route_present]
+    route_coverage = proportion(len(route_present), len(labeled))
+    route_status = "not_applicable" if not labeled else "unmeasured" if not route_present else \
+        "measured" if len(route_present) == len(labeled) else "partial"
     return {
         "counts": {
             "gold_rows": len(cases),
@@ -549,8 +620,25 @@ def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
             "ranked": len(rankable),
         },
         "decision_prediction_coverage": proportion(complete, len(labeled)),
+        "task_prediction_coverage": {
+            "decision": proportion(sum(
+                prediction(case).get("decision") in {"pass", "review", "reject"}
+                for case in labeled
+            ), len(labeled)),
+            "role_classification": role_metrics["prediction_coverage"],
+            "eligibility": eligibility_metrics["prediction_coverage"],
+            "route": route_coverage,
+            "ranking": proportion(sum(case in ranking_cases for case in rankable),
+                                  len(ranking_cases)),
+            **{f"tags.{name}": row["prediction_coverage"] for name, row in tag_metrics.items()},
+        },
         "metrics": metrics,
         "role_classification": role_metrics,
+        "eligibility": eligibility_metrics,
+        "routing": {"prediction_coverage": route_coverage, "status": route_status,
+                    "N": len(labeled), "predicted_N": len(route_present),
+                    "missing_N": len(route_missing), "missing_job_uids": route_missing,
+                    "note": "Routing needs its own saved output; decision/tier do not imply it."},
         "tags": tag_metrics,
         "negative_restrictions": {
             "recall": proportion(aggregate_negative["tp"], aggregate_negative["actual"]),
@@ -604,7 +692,8 @@ def compare_stability(first: dict[str, dict], second: dict[str, dict]) -> dict:
         "tags": results,
         "independent_runs_confirmed": None,
         "source_provenance_confirmed": None,
-        "acceptance_passed": None,
+        "acceptance_status": "insufficient_evidence",
+        "acceptance_passed": False,
         "limitations": [
             "At least 30 comparable vacancies and independent runs are required.",
             "Saved report comparisons alone do not establish model repeatability.",
@@ -849,27 +938,43 @@ def _log_operational(path: Path) -> dict:
 
 def readiness_report(evaluation: dict) -> dict:
     counts = evaluation["counts"]
-    ready = counts["decision_labeled"] >= 160 and counts["relevant"] >= 40
-    coverage = evaluation["decision_prediction_coverage"]
+    labels_ready = counts["decision_labeled"] >= 160 and counts["relevant"] >= 40
+    tasks = {}
+    for name, coverage in evaluation["task_prediction_coverage"].items():
+        denominator, numerator = coverage["denominator"], coverage["numerator"]
+        state = ("not_applicable" if not denominator else "unmeasured" if not numerator
+                 else "measured" if numerator == denominator else "partial")
+        tasks[name] = {"coverage": coverage, "status": state,
+                       "measured": bool(numerator),
+                       "prediction_complete": bool(denominator) and numerator == denominator}
+    applicable = [task for task in tasks.values() if task["coverage"]["denominator"]]
+    complete = bool(counts["decision_labeled"]) and bool(applicable) and all(
+        task["prediction_complete"] for task in applicable
+    )
     return {
-        "status": "baseline_measured" if ready else "pending_human_labels",
-        "gold_ready": ready,
+        "status": ("pending_human_labels" if not labels_ready else
+                   "baseline_measured" if complete else "pending_predictions"),
+        "human_labels_ready": labels_ready,
+        "gold_ready": labels_ready and complete,
         "minimum_labeled": 160,
         "minimum_relevant": 40,
-        "baseline_measured": bool(counts["decision_labeled"]),
-        "prediction_complete": coverage["denominator"] > 0
-        and coverage["numerator"] == coverage["denominator"],
-        "acceptance_passed": None,
+        "labels_present": bool(counts["decision_labeled"]),
+        "baseline_measured": complete,
+        "prediction_complete": complete,
+        "tasks": tasks,
+        "acceptance_status": "insufficient_evidence",
+        "acceptance_passed": False,
         "default_mode_change_authorized": False,
         "gates": [
-            {"name": name, "passed": None}
-            for name in (
-                "decision_accuracy_vs_baseline",
-                "negative_restrictions",
-                "scope_vs_baseline",
-                "speed_at_concurrency_6",
-                "current_price_cost",
-                "repeat_run_stability",
+            {"name": name, "passed": False, "status": "insufficient_evidence",
+             "reason": reason}
+            for name, reason in (
+                ("decision_accuracy_vs_baseline", "No comparable baseline/candidate pair."),
+                ("negative_restrictions", "No comparable baseline/candidate pair."),
+                ("scope_vs_baseline", "No comparable baseline/candidate pair."),
+                ("speed_at_concurrency_6", "No cohort-linked concurrency-6 benchmark."),
+                ("current_price_cost", "No complete candidate usage at current prices."),
+                ("repeat_run_stability", "No provenance-matched independent repeat run."),
             )
         ],
         "limitations": [
@@ -878,9 +983,10 @@ def readiness_report(evaluation: dict) -> dict:
         ]
         + (
             ["Gold needs at least 160 decision labels and 40 relevant vacancies."]
-            if not ready
+            if not labels_ready
             else []
-        ),
+        ) + (["Missing task predictions prevent a measured complete baseline."]
+             if not complete else []),
     }
 
 
@@ -916,6 +1022,8 @@ def run_accuracy(
     prices: Path | None = None,
     log: Path | None = None,
     output: Path | None = None,
+    cohort: Path | None = None,
+    allow_source_snapshot: bool = False,
 ) -> dict:
     from job_intake.annotation.gold import validate_gold
 
@@ -924,12 +1032,36 @@ def run_accuracy(
             "Only the saved accuracy variant is implemented in Phase 0; no AI calls are made"
         )
     cases = read_jsonl(gold)
+    cohort_manifest = None
+    if cohort is not None:
+        from job_intake.annotation.cohorts import load_cohort, select_cases
+
+        cohort_manifest = load_cohort(cohort)
+        cases = select_cases(cases, cohort_manifest)
     if any(not isinstance(case.get("job_uid"), str) for case in cases):
         raise ValueError("Vacancy gold rows require job_uid")
     uids = [case["job_uid"] for case in cases]
     if not uids:
         raise ValueError("Gold is empty")
-    database, rows, problems = read_saved_records(config.database_url, limit=None, job_uids=uids)
+    if allow_source_snapshot:
+        from job_intake.annotation.frozen_eval import record_from_snapshot
+
+        database, saved_rows, problems = read_saved_records(
+            config.database_url, limit=None, include_archived=True,
+        )
+        saved_rows = [(uid, record) for uid, record in saved_rows if uid in uids]
+        records = dict(saved_rows)
+        rows = list(saved_rows)
+        for case in cases:
+            if case["job_uid"] not in records:
+                if not isinstance(case.get("source"), dict):
+                    raise ValueError("Missing source snapshot for absent saved vacancy")
+                rows.append((case["job_uid"], record_from_snapshot(case["source"])))
+    else:
+        database, rows, problems = read_saved_records(
+            config.database_url, limit=None, job_uids=uids, include_archived=True,
+        )
+        saved_rows = rows
     versions = None
     classifier_version = None
     if config.rules_path.is_file() and config.search_profiles_path.is_file():
@@ -941,10 +1073,13 @@ def run_accuracy(
         )
         versions = {stream.id: stream.version for stream in streams}
         classifier_version = taxonomy_version(streams)
+    from job_intake.annotation.source_compat import read_source_history
+
     validated = validate_gold(
         rows,
         cases,
         profile_ids=list(versions) if versions is not None else None,
+        source_history=read_source_history(config.database_url, cases),
     )
     if not validated["valid"]:
         raise ValueError(
@@ -962,9 +1097,13 @@ def run_accuracy(
         if warning.get("code") == "source_hash_changed"
     } - parser_only
     predictions = read_saved_predictions(
-        config.database_url, rows, profile_versions=versions,
+        config.database_url, saved_rows, profile_versions=versions,
         classification_version=classifier_version,
     )
+    for uid, _ in rows:
+        if uid not in predictions:
+            predictions[uid] = {"job_uid": uid, "tags": {}, "route": None,
+                                "evaluation_state": "missing_saved_prediction"}
     for uid, findings in problems.items():
         if any(finding["severity"] == "error" for finding in findings):
             predictions[uid]["tags"] = dict.fromkeys(predictions[uid]["tags"], None)
@@ -989,7 +1128,8 @@ def run_accuracy(
         "database_access": "read_only",
         "api_calls": 0,
         "gold": {"path": str(gold.resolve()), "validation": validated},
-        "selection": {"job_uids": uids, "archived": False},
+        "selection": {"job_uids": uids, "include_archived": True,
+                      "cohort": cohort_manifest, "source_snapshot_fallback": allow_source_snapshot},
         "evaluation": evaluation,
         "operational": operational_metrics(rows, price_config, log=log),
         "readiness": readiness_report(evaluation),
@@ -1004,6 +1144,9 @@ def run_accuracy(
             "Legacy mapping is loss-aware; unmapped tags count as abstention errors.",
             "Legacy profile matrices and stale decisions need classification and reevaluation.",
             "Exclusion counts observed cases only; incomplete coverage prevents acceptance.",
+            "Legacy or stale saved rows without independent eligibility fields abstain."
+            if any(row.get("gate_outcome") is None for row in predictions.values()) else
+            "Eligibility is read independently from current saved hiring assessments.",
             "NDCG uses tier, score descending, job_uid in this gold cohort, not the full queue.",
         ],
     }
@@ -1014,20 +1157,33 @@ def run_accuracy(
     )
     report["readiness"]["full_tag_labeled"] = full_tags
     report["readiness"]["minimum_full_tag_labeled"] = 60
-    report["readiness"]["full_tag_sample_ready"] = full_tags >= 60
+    report["readiness"]["full_tag_label_sample_ready"] = full_tags >= 60
+    report["readiness"]["full_tag_sample_ready"] = full_tags >= 60 and all(
+        task["prediction_complete"] for name, task in report["readiness"]["tasks"].items()
+        if name.startswith("tags.")
+    )
     report["readiness"]["blind_decision_labeled"] = sum(
         case.get("method") == "blind" and _relevance(case) is not None
         and case.get("gate_outcome") in {"eligible", "ineligible", "unknown"}
         for case in evaluation_cases
     )
     report["readiness"]["minimum_blind_decision_labeled"] = 30
-    report["readiness"]["blind_sample_ready"] = (
+    report["readiness"]["blind_label_sample_ready"] = (
         report["readiness"]["blind_decision_labeled"] >= 30
     )
-    if not (report["readiness"]["full_tag_sample_ready"]
-            and report["readiness"]["blind_sample_ready"]):
+    blind_cases = [case for case in evaluation_cases if case.get("method") == "blind"]
+    blind_tasks = readiness_report(evaluate_vacancies(blind_cases, predictions))["tasks"]
+    report["readiness"]["blind_tasks"] = blind_tasks
+    report["readiness"]["blind_sample_ready"] = (
+        report["readiness"]["blind_label_sample_ready"]
+        and all(task["prediction_complete"] for task in blind_tasks.values()
+                if task["coverage"]["denominator"])
+    )
+    if not (report["readiness"]["full_tag_label_sample_ready"]
+            and report["readiness"]["blind_label_sample_ready"]):
+        report["readiness"]["human_labels_ready"] = False
         report["readiness"]["gold_ready"] = False
-        if report["readiness"]["status"] == "baseline_measured":
+        if report["readiness"]["status"] != "pending_human_labels":
             report["readiness"]["status"] = "pending_tag_or_blind_labels"
         report["readiness"]["limitations"].append(
             "Gold also needs 60 full-tag cases and 30 blind decision labels."
@@ -1036,6 +1192,7 @@ def run_accuracy(
     if drift_uids:
         report["readiness"]["status"] = "pending_source_review"
         report["readiness"]["gold_ready"] = False
+        report["readiness"]["human_labels_ready"] = False
         report["readiness"]["limitations"].append(
             "Changed source labels await human review; quote rebinding alone is insufficient."
         )
@@ -1079,6 +1236,13 @@ def accuracy_markdown(report: dict) -> str:
         f"Decision labels: {evaluation['counts']['decision_labeled']}; "
         f"relevant: {evaluation['counts']['relevant']}.",
         "",
+        "## Prediction coverage by task",
+        "",
+        "| Task | Coverage | Status |",
+        "| --- | --- | --- |",
+        *[f"| {name} | {_formatted(task['coverage'])} | {task['status']} |"
+          for name, task in report["readiness"]["tasks"].items()],
+        "",
         "| Metric | Result |",
         "| --- | --- |",
     ]
@@ -1086,12 +1250,19 @@ def accuracy_markdown(report: dict) -> str:
         f"| {name} | {_formatted(metric)} |" for name, metric in evaluation["metrics"].items()
     )
     role = evaluation["role_classification"]
+    eligibility = evaluation["eligibility"]
     lines += [
         "",
         "## Role classification",
         "",
         f"Accuracy: {_formatted(role['accuracy'])}; "
         f"coverage: {_formatted(role['prediction_coverage'])}.",
+        "",
+        "## Eligibility",
+        "",
+        f"Accuracy: {_formatted(eligibility['accuracy'])}; "
+        f"coverage: {_formatted(eligibility['prediction_coverage'])}.",
+        eligibility["note"],
         "",
         "## Tags",
         "",
@@ -1152,7 +1323,10 @@ def accuracy_markdown(report: dict) -> str:
         "",
         "## Readiness",
         "",
-        f"Gold ready: {report['readiness']['gold_ready']}. Acceptance gates: unmeasured; "
+        f"Human labels ready: {report['readiness']['human_labels_ready']}; "
+        f"complete baseline measured: {report['readiness']['baseline_measured']}; "
+        f"gold ready for comparison: {report['readiness']['gold_ready']}.",
+        "Acceptance gates: insufficient_evidence; "
         "default mode unchanged.",
         "",
     ]

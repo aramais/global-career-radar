@@ -16,6 +16,7 @@ from job_intake.annotation.eval_runner import (
     sqlite_path,
     write_report,
 )
+from job_intake.annotation.evaluation_cli import app as frozen_eval_app
 from job_intake.annotation.progress import AnnotationProgressReporter
 from job_intake.config.settings import (
     ANNOTATION_PROVIDER_DEFAULTS,
@@ -28,6 +29,8 @@ from job_intake.crm.cli import app as crm_app
 from job_intake.discovery.cli import app as discovery_app
 from job_intake.pipeline import JobIntakePipeline, build_pipeline
 from job_intake.profiles import load_streams
+from job_intake.sources_cli import app as sources_app
+from job_intake.storage.repair_cli import app as repair_app
 from job_intake.storage.repository import validate_job_uids
 
 app = typer.Typer(
@@ -35,9 +38,12 @@ app = typer.Typer(
 )
 app.add_typer(crm_app, name="crm")
 app.add_typer(discovery_app, name="discovery")
+app.add_typer(repair_app, name="repair")
+app.add_typer(sources_app, name="sources")
 eval_app = typer.Typer(no_args_is_help=False, help="Read-only integrity and accuracy evaluation")
 gold_app = typer.Typer(help="Prepare and validate human vacancy labels without API calls")
 app.add_typer(eval_app, name="eval")
+eval_app.add_typer(frozen_eval_app, name="frozen")
 app.add_typer(gold_app, name="gold")
 
 _ANNOTATION_PRESETS = {
@@ -171,9 +177,12 @@ def _import_email_source(source: SourceDefinition, config: str) -> None:
 
 
 @app.command("reevaluate")
-def reevaluate(config: str = typer.Option("config/settings.yaml", help="App config YAML")) -> None:
+def reevaluate(config: str = typer.Option("config/settings.yaml", help="App config YAML"),
+               include_archived: bool = typer.Option(False)) -> None:
     """Re-score saved vacancies offline without fetching, AI calls or notifications."""
-    result = build_pipeline(config).reevaluate_saved()
+    pipeline = build_pipeline(config)
+    result = (pipeline.reevaluate_saved(include_archived=True) if include_archived
+              else pipeline.reevaluate_saved())
     typer.echo(
         f"Reevaluated {result['persisted']} jobs, {result['evaluations']} relevance evaluations. "
         f"classification_calls={result.get('classification_calls', 0)} "
@@ -554,6 +563,7 @@ def gold_validate(
             raise ValueError("Gold must contain vacancy rows with job_uid")
         _, rows, problems = read_saved_records(
             settings.database_url, limit=None, job_uids=[case["job_uid"] for case in cases],
+            include_archived=True,
         )
         streams = load_streams(load_yaml_mapping(settings.rules_path),
                                load_yaml_mapping(settings.search_profiles_path))
@@ -697,17 +707,42 @@ def eval_accuracy(
     output: Annotated[Path, typer.Option()] = Path("data/local/eval/accuracy-saved.json"),
     prices: Annotated[Path | None, typer.Option(help="Dated YAML token tariffs")] = None,
     log: Annotated[Path | None, typer.Option(help="Optional annotation run log")] = None,
+    cohort: Annotated[Path | None, typer.Option(help="Dataset cohort manifest")] = None,
+    source_snapshot: bool = typer.Option(False, help="Use gold snapshots for missing DB IDs"),
+    exposure_log: Annotated[
+        Path | None, typer.Option(help="Append-only cohort analysis log")
+    ] = None,
 ) -> None:
     """Measure a saved baseline against human labels without API calls or DB writes."""
     from job_intake.annotation.accuracy import run_accuracy, write_accuracy_report
 
     try:
         settings = load_app_config(config)
-        protected = _eval_inputs(settings, config, gold,
-                                 prices or settings.rules_path.parent / "eval_prices.yaml", log)
+        protected = _eval_inputs(
+            settings, config, gold, prices or settings.rules_path.parent / "eval_prices.yaml",
+            log, cohort,
+        )
         _eval_destinations([output, output.with_suffix(".md")], protected)
-        report = run_accuracy(settings, gold=gold, variant=variant, prices=prices, log=log)
+        report = run_accuracy(settings, gold=gold, variant=variant, prices=prices, log=log,
+                              cohort=cohort, allow_source_snapshot=source_snapshot)
+        manifest = report["selection"].get("cohort")
+        if manifest and manifest.get("dataset_role") == "holdout" and not (
+            exposure_log or manifest.get("exposure_log")
+        ):
+            raise ValueError("Holdout analysis requires an exposure log")
+        if manifest:
+            from job_intake.annotation.cohorts import exposure_events
+
+            exposure_events(exposure_log, manifest)
+            journal = exposure_log or manifest.get("exposure_log")
+            if journal:
+                protected.append(Path(journal))
+                _eval_destinations([output, output.with_suffix(".md")], protected)
         paths = write_accuracy_report(report, output, protected_paths=protected)
+        if manifest:
+            from job_intake.annotation.cohorts import record_report_exposure
+
+            record_report_exposure(manifest, output=output, exposure_log=exposure_log)
     except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo("Accuracy baseline calculated. API calls=0; database=read-only.")

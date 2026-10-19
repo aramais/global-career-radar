@@ -293,3 +293,35 @@ def test_work_model_and_recruiting_title_do_not_become_actual_duties():
     assert not evidence.analytical_mandate
     assert evidence.project_leadership
     assert all(heading != signal["quote"] for signal in evidence.signals)
+
+
+@pytest.mark.parametrize("duty", [
+    "Lead pricing experiments and guide decisions.",
+    "Analyze incrementality to guide decisions the business can act on.",
+    "Partner with the General Manager on P&L decisions.",
+    "Collaborate with Finance on business decisions.",
+])
+def test_audit_decision_phrases_in_actual_duties(duty):
+    evidence = description_evidence(_record("Responsibilities\n" + duty))
+    assert evidence.substantive_decision
+
+
+@pytest.mark.parametrize("duty", [
+    "Manage direct reports and lead pricing experiments to guide decisions.",
+    "Lead analytical projects without direct reports and analyze causal lift.",
+    "Manage your direct report and design LTV modeling experiments.",
+])
+def test_people_reporting_lines_are_not_reporting_outputs(duty):
+    evidence = description_evidence(_record("Responsibilities\n" + duty))
+    assert evidence.analytical_mandate
+    assert not evidence.reporting_core
+
+
+@pytest.mark.parametrize("text", [
+    "Requirements\nExperience guiding decisions and partnering with Finance on P&L.",
+    "About us\nWe partner with the General Manager on P&L decisions.",
+    "Responsibilities\nPartner with colleagues who guide decisions and own pricing.",
+])
+def test_expanded_phrases_do_not_borrow_company_history_or_other_peoples_scope(text):
+    evidence = description_evidence(_record(text))
+    assert not evidence.substantive_decision

@@ -12,14 +12,18 @@ import json
 import re
 import unicodedata
 from datetime import UTC, date, datetime
+from html import unescape
 from typing import Any
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 from job_intake.models.job import JobRecord
 from job_intake.utils.text import canonicalize_url, contains_any, normalize_text
 
 TEXT_VERSION = "source-units-v3"
+# Public source_hash is a historical source-snapshot contract, independent of
+# parsing. Version derived units separately so old gold snapshots still validate.
+SOURCE_UNITS_VERSION = "source-units-v5"
 _FIELDS = (
     "title", "company", "location_text", "remote_text", "employment_type",
     "salary_text", "timezone_text",
@@ -90,7 +94,7 @@ def _period_is_internal(text: str, index: int) -> bool:
         return True
     if re.search(r"\b(?:[A-Za-z]\.)+[A-Za-z]$", text[max(0, index - 16):index]):
         following = re.compile(r"\s*(\S)").match(text, index + 1)
-        return bool(following and following[1].islower())
+        return bool(following and (following[1].islower() or following[1] in "?!"))
     return False
 
 
@@ -130,30 +134,142 @@ def _heading(text: str) -> str | None:
     return None
 
 
-def _raw_heading_positions(record: JobRecord, text: str) -> dict[int, str]:
-    """Recover heading scope lost by HTML-to-one-line adapters, without rewriting text."""
+def _canonical_characters(text: str) -> tuple[str, list[int]]:
+    characters: list[str] = []
+    offsets: list[int] = []
+    for index, character in enumerate(text):
+        if not character.isspace():
+            folded = character.casefold()
+            characters.append(folded)
+            offsets.extend([index] * len(folded))
+    return "".join(characters), offsets
+
+
+_HTML_BLOCKS = {
+    "address", "article", "aside", "blockquote", "dd", "div", "dl", "dt", "h1", "h2",
+    "h3", "h4", "h5", "h6", "hr", "li", "main", "ol", "p", "pre", "section", "table",
+    "td", "th", "tr", "ul",
+}
+
+
+def _standalone_heading(node: Tag) -> bool:
+    """A bold word within a duty is formatting, not a section boundary."""
+    if node.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+        return True
+    current = node
+    while current.parent is not None:
+        for siblings in (current.previous_siblings, current.next_siblings):
+            for sibling in siblings:
+                if isinstance(sibling, Comment):
+                    continue
+                if isinstance(sibling, Tag) and sibling.name in _HTML_BLOCKS | {"br"}:
+                    break
+                if str(sibling).strip():
+                    return False
+        parent = current.parent
+        if parent.name in _HTML_BLOCKS or parent.name == "[document]":
+            return True
+        current = parent
+    return True
+
+
+def _raw_structure_positions(record: JobRecord, text: str) -> dict[int, str | None]:
+    """Map DOM block/headings to exact source offsets, including legacy flat text.
+
+    The complete visible character stream must agree (case and whitespace aside).
+    Matching a heading word with a substring search could select an earlier duty
+    mentioning "requirements" and incorrectly change the scope of that duty.
+    """
     raw = record.description_raw
+    for _ in range(2):
+        decoded = unescape(raw)
+        if decoded == raw:
+            break
+        raw = decoded
     if "<" not in raw or ">" not in raw:
         return {}
     soup = BeautifulSoup(raw, "html.parser")
-    positions: dict[int, str] = {}
-    cursor = 0
-    for node in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "strong", "b"]):
+    for node in soup.select("script, style, noscript"):
+        node.decompose()
+    pieces: list[str] = []
+    node_offsets: dict[int, int] = {}
+    node_lengths: dict[int, int] = {}
+    boundaries: set[int] = set()
+    length = 0
+    for node in soup.descendants:
+        if isinstance(node, NavigableString) and not isinstance(node, Comment):
+            canonical, _ = _canonical_characters(str(node))
+            node_offsets[id(node)] = length
+            node_lengths[id(node)] = len(canonical)
+            pieces.append(canonical)
+            length += len(canonical)
+        elif isinstance(node, Tag) and node.name in {"br", "hr"}:
+            boundaries.add(length)
+    canonical, text_offsets = _canonical_characters(text)
+    visible = "".join(pieces)
+    if visible != canonical:
+        # Some historical HTML renderers inserted a visible bullet before each
+        # li. Accept that layout difference only at a verified DOM list boundary.
+        list_starts = {
+            node_offsets[id(child)] for node in soup.find_all("li")
+            if (child := next((child for child in node.descendants
+                               if id(child) in node_offsets and str(child).strip()), None))
+            is not None
+        }
+        mapped_offsets: list[int] = []
+        cursor = 0
+        for index, character in enumerate(visible):
+            if index in list_starts and cursor + 1 < len(canonical):
+                position = text_offsets[cursor]
+                if (
+                    canonical[cursor] in "-•*‣"
+                    and canonical[cursor + 1] == character
+                    and (position == 0 or text[position - 1].isspace())
+                    and position + 1 < len(text) and text[position + 1].isspace()
+                ):
+                    cursor += 1
+            if cursor >= len(canonical) or canonical[cursor] != character:
+                # A different plain-text variant cannot safely inherit positions.
+                return {}
+            mapped_offsets.append(text_offsets[cursor])
+            cursor += 1
+        if cursor != len(canonical):
+            return {}
+        text_offsets = mapped_offsets
+    for node in soup.find_all(_HTML_BLOCKS):
+        descendants = [
+            child for child in node.descendants
+            if id(child) in node_offsets and node_lengths[id(child)]
+        ]
+        if descendants:
+            first, last = descendants[0], descendants[-1]
+            boundaries.update({
+                node_offsets[id(first)], node_offsets[id(last)] + node_lengths[id(last)],
+            })
+    positions: dict[int, str | None] = {
+        text_offsets[position]: None for position in boundaries if position < len(text_offsets)
+    }
+    for node in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "strong", "b", "p"]):
         label = node.get_text(" ", strip=True)
         section = _heading(label)
-        if section is None or not label:
+        if section is None or not label or (
+            node.name != "p" and not _standalone_heading(node)
+        ):
             continue
-        pattern = r"\s+".join(re.escape(word) for word in label.split())
-        match = re.search(pattern, text[cursor:], re.I)
-        if match is not None:
-            position = cursor + match.start()
-            positions[position] = section
-            cursor += match.end()
+        first_text = next((
+            child for child in node.descendants
+            if isinstance(child, NavigableString) and not isinstance(child, Comment)
+            and str(child).strip()
+        ), None)
+        if first_text is not None:
+            position = node_offsets[id(first_text)]
+            if position < len(text_offsets):
+                positions[text_offsets[position]] = section
     return positions
 
 
 def _description_units(
-    text: str, field: str, heading_positions: dict[int, str] | None = None,
+    text: str, field: str, heading_positions: dict[int, str | None] | None = None,
 ) -> list[dict[str, Any]]:
     units: list[dict[str, Any]] = []
     section = "other"
@@ -175,8 +291,9 @@ def _description_units(
         })
         for start, end in zip(starts, starts[1:] + [len(line)], strict=True):
             fragment = line[start:end]
-            if line_match.start() + start in heading_positions:
-                section = heading_positions[line_match.start() + start]
+            heading = heading_positions.get(line_match.start() + start)
+            if heading is not None:
+                section = heading
             fragment_section = section
             if (
                 _COMPANY_LANGUAGE.search(fragment) and not _DIRECT_ROLE_CUES.search(fragment)
@@ -208,7 +325,7 @@ def source_units(record: JobRecord) -> list[dict[str, Any]]:
         )
     metadata = tuple(metadata_items)
     cache_key = (
-        TEXT_VERSION, *(getattr(record, field) for field in _FIELDS),
+        SOURCE_UNITS_VERSION, *(getattr(record, field) for field in _FIELDS),
         record.description_raw, record.description_clean, metadata,
     )
     cached = record._text_units_cache
@@ -229,7 +346,7 @@ def source_units(record: JobRecord) -> list[dict[str, Any]]:
     field = "description_clean" if record.description_clean else "description_raw"
     description = getattr(record, field)
     units.extend(_description_units(
-        description, field, _raw_heading_positions(record, description)
+        description, field, _raw_structure_positions(record, description)
     ))
     for key, index, text in metadata:
         field = f"source_metadata.{key}"

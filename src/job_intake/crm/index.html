@@ -171,12 +171,17 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
         <option value="">Все категории</option><option value="A">A</option>
         <option value="B">B</option><option value="C">C</option>
         <option value="unrated">Без актуальной оценки</option></select></label>
+      <label><span>Назначение</span><select id="purposeFilter">
+        <option value="all">Все назначения</option><option value="p1">Следующая работа</option>
+        <option value="p2">Практика интервью</option>
+        <option value="review">Назначение требует решения</option></select></label>
       <label><span>Баллы от</span><input id="scoreMinFilter" type="number" step="any" placeholder="Любое"></label>
       <label><span>Баллы до</span><input id="scoreMaxFilter" type="number" step="any" placeholder="Любое"></label>
       <label><span>Сортировка</span><select id="jobSort">
         <option value="tier-asc">Категория: A → C</option><option value="tier-desc">Категория: C → A</option>
         <option value="score-desc">Баллы: больше сначала</option>
-        <option value="score-asc">Баллы: меньше сначала</option></select></label>
+        <option value="score-asc">Баллы: меньше сначала</option>
+        <option value="review-evidence">REVIEW: подтверждённость условий</option></select></label>
       <button id="resetJobFilters" type="button">Сбросить фильтры</button>
     </div>
     <p class="help" id="jobFilterScope"></p>
@@ -185,10 +190,10 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
       <p>Баллы — сумма весов совпавших признаков в названии и описании, бонусов за источник
         и приоритетную компанию. Это не шкала 0–15: балл может быть выше 15 или дробным.</p>
       <div id="gradingThresholds"></div>
-      <p>Если условия работы требуют проверки, из оценки вычитаются 3 балла (до нуля).
-        Исключающее ограничение даёт 0 баллов и C. Сначала определяется одна метка роли,
-        затем рассчитывается одна оценка по её критериям;
-        низкий балл может означать неполное описание и не мешает откликнуться.
+      <p>Соответствие роли и условия найма оцениваются отдельно. Неподтверждённая
+        ответственность или неполный источник могут ограничить категорию; сырой балл
+        до ограничений виден в карточке. Сначала определяется одна метка роли,
+        затем рассчитывается одна оценка по её критериям.
         Для метки other релевантность остаётся без балла до уточнения роли.</p>
     </details>
   </section>
@@ -412,7 +417,8 @@ function metricsQuery() {
 function jobQuery() {
   const query = new URLSearchParams({offset:String(jobOffset),limit:'100'});
   [['profile_id','profileFilter'],['job_archive','jobArchiveFilter'],['query','query'],
-    ['tier','tierFilter'],['score_min','scoreMinFilter'],['score_max','scoreMaxFilter'],['sort','jobSort']]
+    ['tier','tierFilter'],['score_min','scoreMinFilter'],['score_max','scoreMaxFilter'],['sort','jobSort'],
+    ['purpose','purposeFilter']]
     .forEach(([name,id]) => { if ($(id).value.trim()) query.set(name,$(id).value.trim()); });
   return '/api/jobs?' + query.toString();
 }
@@ -640,7 +646,9 @@ function renderJobFilters() {
   $('jobFilterScope').textContent = (profileId ? 'Метка вакансии: ' + profileName(profileId) + '.'
     : 'У вакансии одна метка и одна оценка релевантности.')
     + ' '
-    + ($('jobSort').value.startsWith('tier-') ? 'Внутри категории — сначала больший балл.'
+    + ($('jobSort').value === 'review-evidence'
+      ? 'Сначала REVIEW с подтверждёнными условиями, затем с неизвестными. Это приоритет проверки.'
+      : $('jobSort').value.startsWith('tier-') ? 'Внутри категории — сначала больший балл.'
       : 'При равных баллах — категория A → C.') + ' Без оценки — в конце.';
   const min = scoreNumber($('scoreMinFilter').value), max = scoreNumber($('scoreMaxFilter').value);
   const badNumber = $('scoreMinFilter').validity?.badInput || $('scoreMaxFilter').validity?.badInput;
@@ -661,14 +669,14 @@ function renderJobFilters() {
   groups.forEach(({a,b,names}) => {
     if (groups.size > 1) $('gradingThresholds').append(el('p',names.join(', '),'small'));
     const rules = el('ul');
-    ['A — от ' + a + ' баллов, обязательные условия пройдены и есть признаки целевой роли.',
+    ['A — от ' + a + ' баллов и подтверждён содержательный мандат роли.',
       'B — от ' + b + ' баллов, если условия A не выполнены.',
-      'C — ниже ' + b + ' баллов или есть исключающее ограничение.']
+      'C — ниже ' + b + ' баллов или подтверждено несоответствие роли.']
       .forEach((text) => rules.append(el('li',text)));
     $('gradingThresholds').append(rules);
   });
   if (!groups.size) $('gradingThresholds').append(el('p',
-    'A требует прохождения обязательных условий и признаков целевой роли; пороги A и B задаются в профиле поиска.'));
+    'A требует подтверждённого мандата роли; пороги A и B задаются в профиле поиска.'));
   return !badNumber && !invalidRange;
 }
 function currentApplications() {
@@ -803,10 +811,23 @@ function jobCard(job) {
     ? 'Роль требует проверки; релевантность не оценена.' : 'Без актуальной оценки'));
   if (!assessment && job.eligibility?.decision === 'reject')
     tags.append(badge('Есть обязательное ограничение','amber'));
+  const suitabilityLabels = {suitable:'подходит',unsuitable:'не подходит',unknown:'не определено'};
+  ['p1','p2'].forEach((dimension) => {
+    const purpose = job.purpose || {};
+    const human = purpose['human_' + dimension] || 'unknown';
+    const predicted = purpose['predicted_' + dimension] || 'unknown';
+    const stale = purpose['human_' + dimension + '_stale'] ?? purpose.human_stale;
+    const value = !stale && human !== 'unknown' ? human : predicted;
+    const origin = !stale && human !== 'unknown' ? 'вы' : 'прогноз';
+    tags.append(badge((dimension === 'p1' ? 'Работа' : 'Практика') + ': '
+      + suitabilityLabels[value] + ' (' + origin + ')',value === 'suitable' ? 'blue' : ''));
+  });
+  if (job.purpose?.human_stale) tags.append(badge('Назначение: исходник изменился','amber'));
   card.append(head,tags);
   const links = el('div',null,'row'); links.append(sourceLink(job.url),
     el('span',[job.location,job.remote].filter(Boolean).join(' · '),'small muted')); card.append(links);
   card.append(jobAnnotationDetails(job,assessment));
+  card.append(jobPurposeDetails(job));
   const description = el('details'); description.append(el('summary','Описание вакансии','small muted'));
   let descriptionLoaded = false, descriptionLoading = false;
   description.addEventListener('toggle',async() => {
@@ -820,6 +841,74 @@ function jobCard(job) {
     finally { descriptionLoading = false; }
   }); card.append(description);
   return card;
+}
+function purposeUpdatePayload(purpose, p1, p2, note, confirm = {}) {
+  const payload = {human_note:note,expected_version:purpose.version,
+    source_hash:purpose.prediction_source_hash};
+  if (p1 !== (purpose.human_p1 || 'unknown') || confirm.p1) payload.human_p1 = p1;
+  if (p2 !== (purpose.human_p2 || 'unknown') || confirm.p2) payload.human_p2 = p2;
+  return payload;
+}
+function renderPurposeEditor(job) {
+  const purpose = job.purpose || {};
+  const form = el('form',null,'detail-section');
+  form.append(el('p','Следующая работа и практика оцениваются независимо. Для практики полезны '
+    + 'аналитика/data с похожими задачами, даже если уровень или условия найма не подходят для следующей работы.','help'));
+  const options = [{value:'unknown',label:'Не определено'},{value:'suitable',label:'Подходит'},
+    {value:'unsuitable',label:'Не подходит'}];
+  const p1 = select(options,purpose.human_p1 || 'unknown');
+  const p2 = select(options,purpose.human_p2 || 'unknown');
+  const p1Label = el('label','Ваше решение: следующая работа'); p1Label.append(p1);
+  const p2Label = el('label','Ваше решение: практика интервью'); p2Label.append(p2);
+  const confirmation = {};
+  ['p1','p2'].forEach((dimension) => {
+    if (!(purpose['human_' + dimension + '_stale'] ?? purpose.human_stale)) return;
+    const checkbox = el('input'); checkbox.type = 'checkbox'; confirmation[dimension] = checkbox;
+    const label = el('label','Подтверждаю прежнее решение для текущего исходника: '
+      + (dimension === 'p1' ? 'следующая работа' : 'практика'));
+    label.append(checkbox); (dimension === 'p1' ? p1Label : p2Label).append(label);
+  });
+  const note = el('textarea'); note.value = purpose.human_note || ''; note.maxLength = 20000;
+  const noteLabel = el('label','Обоснование назначения'); noteLabel.append(note);
+  const prediction = {suitable:'подходит',unsuitable:'не подходит',unknown:'не определено'};
+  form.append(el('p','Машинный прогноз — работа: ' + (prediction[purpose.predicted_p1] || 'не определено')
+    + '; практика: ' + (prediction[purpose.predicted_p2] || 'не определено') + '.','small muted'));
+  if (purpose.human_stale) form.append(el('p','Исходник изменился после вашего решения. '
+    + 'Проверьте назначение и сохраните его для текущей версии.','small status error'));
+  if (job.raw_fit_score !== null && job.raw_fit_score !== undefined) form.append(el('p',
+    'Сырой балл: ' + job.raw_fit_score + '; итоговый: ' + (job.fit_score ?? '—')
+    + ((job.score_cap_reasons || []).length ? '. Ограничения: ' + job.score_cap_reasons.join(', ') : ''),'small'));
+  const availability = {eligible:'подтверждены',ineligible:'есть ограничение',unknown:'не подтверждены'};
+  form.append(el('p','Условия найма: ' + (availability[job.eligibility_status] || 'не подтверждены')
+    + '. Это состояние доказательств, не вероятность трудоустройства.','small muted'));
+  if ((job.stale_reasons || []).length) form.append(el('p',
+    'Актуальность оценки: ' + job.stale_reasons.join(', '),'tiny muted'));
+  const save = el('button','Сохранить назначение','primary'); save.type = 'submit';
+  if (!purpose.version || !purpose.prediction_source_hash) {
+    save.disabled = true;
+    form.append(el('p','Сначала нужна переоценка сохранённой вакансии для текущего исходника.','help'));
+  }
+  form.append(p1Label,p2Label,noteLabel,save);
+  form.addEventListener('submit',async(event) => {
+    event.preventDefault();
+    if (!purpose.version || !purpose.prediction_source_hash) return;
+    await write('/api/jobs/' + encodeURIComponent(job.job_uid) + '/purpose','PATCH',
+      purposeUpdatePayload(purpose,p1.value,p2.value,note.value,
+        {p1:confirmation.p1?.checked,p2:confirmation.p2?.checked}));
+  });
+  return form;
+}
+function jobPurposeDetails(job) {
+  const details = el('details'); details.append(el('summary','Назначение: работа и практика'));
+  let loaded = false, pending = false;
+  details.addEventListener('toggle',async() => {
+    if (!details.open || loaded || pending) return;
+    pending = true; const message = el('p','Загрузка…','small muted'); details.append(message);
+    try { message.replaceWith(renderPurposeEditor(await loadJobDetail(job))); loaded = true; }
+    catch(error) { message.remove(); showError(errorMessage(error)); }
+    finally { pending = false; }
+  });
+  return details;
 }
 async function setJobArchived(job, archived) {
   await write('/api/jobs/' + encodeURIComponent(job.job_uid) + '/archive','PATCH',
@@ -1473,6 +1562,11 @@ function goldEditorMessage(message, kind = '') {
   goldEditor.message.textContent = message;
   goldEditor.message.className = 'gold-message gold-editor-status ' + kind;
 }
+function regionalVariantFacts(variants) {
+  return (Array.isArray(variants) ? variants : []).filter((item) => item && typeof item === 'object')
+    .map((item) => ({title:String(item.title || 'Региональная версия'),
+      location:String(item.location || 'География не указана'),url:safeURL(item.url)}));
+}
 function renderGoldEditor(detail, message = '') {
   activeId = null;
   goldEditor = {detail,savedLabels:goldLabels(detail.labels),saving:false,form:null,message:null,
@@ -1485,6 +1579,15 @@ function renderGoldEditor(detail, message = '') {
   original.append(sourceLink(source.original_url || source.apply_url,'Открыть исходную вакансию'));
   const location = [source.location_text,source.remote_text].filter(Boolean).join(' · ');
   if (location) original.append(el('p',location,'small muted'));
+  const variants = regionalVariantFacts(detail.regional_variants);
+  if (variants.length) {
+    const section = el('section',null,'detail-section'); section.append(el('h3','Региональные версии'));
+    variants.forEach((variant) => {
+      const row = el('p',null,'small'); row.append(el('span',variant.location + ' · '),
+        sourceLink(variant.url,variant.title)); section.append(row);
+    });
+    original.append(section);
+  }
   original.append(el('h3','Исходное описание'),el('div',goldDescription(source) || 'Текст источника недоступен. Откройте исходную ссылку.', 'gold-description'));
   const roles = [{value:'',label:'Пока не размечено'},...(goldPage?.profiles || [])];
   const labels = goldLabels(detail.labels);
@@ -1662,11 +1765,12 @@ $('filters').addEventListener('submit',(event) => { event.preventDefault(); refr
 $('query').addEventListener('input',queueJobRefresh); $('stageFilter').addEventListener('change',render);
 $('actionFilter').addEventListener('change',render);
 $('profileFilter').addEventListener('change',() => { if (view === 'jobs') refreshJobs(); });
-['tierFilter','jobSort'].forEach((id) => $(id).addEventListener('change',() => refreshJobs()));
+['tierFilter','jobSort','purposeFilter'].forEach((id) => $(id).addEventListener('change',() => refreshJobs()));
 $('jobArchiveFilter').addEventListener('change',() => { jobSelection.clear(); refreshJobs(); });
 ['scoreMinFilter','scoreMaxFilter'].forEach((id) => $(id).addEventListener('input',queueJobRefresh));
 $('resetJobFilters').addEventListener('click',() => {
   ['tierFilter','scoreMinFilter','scoreMaxFilter'].forEach((id) => $(id).value = '');
+  $('purposeFilter').value = 'all';
   $('jobSort').value = 'tier-asc'; $('jobArchiveFilter').value = 'active'; refreshJobs();
 });
 $('previousJobs').addEventListener('click',() => { jobOffset = Math.max(0,jobOffset - 100); jobSelection.clear(); refreshJobs(false); });

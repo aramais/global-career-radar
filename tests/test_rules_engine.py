@@ -658,7 +658,139 @@ def test_healthequity_later_date_onboarding_is_not_a_foreign_office() -> None:
     assert result.decision == FilterDecision.REVIEW
     assert result.blocker_signals == []
     assert "geography:onsite_location_unknown" in result.risks
+    assert "geography:eligibility_unconfirmed" not in result.risks
+
+
+@pytest.mark.parametrize("location", ["Global", "AMER"])
+def test_standalone_configured_remote_regions_are_hiring_evidence(location):
+    rules = replace(broad_rules(), target_geographies=broad_rules().target_geographies + [
+        "Global", "AMER",
+    ])
+    result = RuleEngine(rules).evaluate(JobRecord(
+        source="test", company="Example", title="Analytics Manager",
+        original_url="https://example.test/global", location_text=location,
+        source_metadata={"working_language": "English"},
+    ))
+    assert result.eligibility_status == "eligible"
+    assert result.eligibility_evidence_status == "confirmed"
+    assert not any(risk.startswith("geography:") for risk in result.risks)
+
+
+@pytest.mark.parametrize("statement", [
+    "Applicants must be authorized to work in the United States.",
+    "You must be authorized to work in the US.",
+    "Candidates must be legally authorized to work for any employer in the U.S.",
+])
+def test_us_authorization_spelling_variants_are_explicit_hiring_blockers(statement):
+    result = RuleEngine(broad_rules()).evaluate(JobRecord(
+        source="test", company="Example", title="Analytics Manager",
+        original_url="https://example.test/auth", location_text="Worldwide",
+        description_clean=statement, source_metadata={"working_language": "English"},
+    ))
+    assert result.decision == FilterDecision.REJECT
+    assert result.eligibility_status == "ineligible"
+    assert result.eligibility_evidence_status == "blocked"
+
+
+@pytest.mark.parametrize("statement", [
+    "You do not need to be authorized to work in the United States.",
+    "Being authorized to work in the US is not required.",
+    "Candidates may be authorized to work in the US, but it is optional.",
+    "Must you be authorized to work for any employer in the U.S.?",
+    "Must you be authorized to work in the U.S.?",
+])
+def test_negated_optional_or_questioned_us_authorization_is_not_a_blocker(statement):
+    result = RuleEngine(broad_rules()).evaluate(JobRecord(
+        source="test", company="Example", title="Analytics Manager",
+        original_url="https://example.test/auth", location_text="Worldwide",
+        description_clean=statement, source_metadata={"working_language": "English"},
+    ))
+    assert result.blocker_signals == []
+    assert result.eligibility_status != "ineligible"
+
+
+def test_anywhere_in_us_does_not_mean_worldwide():
+    rules = replace(broad_rules(), target_geographies=broad_rules().target_geographies + [
+        "anywhere",
+    ])
+    result = RuleEngine(rules).evaluate(JobRecord(
+        source="test", company="Example", title="Analytics Manager",
+        original_url="https://example.test/us", location_text="Anywhere in the US",
+        description_clean="Remote role with English as the working language.",
+    ))
+    assert result.decision == FilterDecision.REJECT
+    assert result.eligibility_status == "ineligible"
+
+
+def test_role_mismatch_and_unknown_hiring_are_separate_axes():
+    rules = replace(broad_rules(), recall_first=False)
+    result = RuleEngine(rules).evaluate(JobRecord(
+        source="test", company="Example", title="Data Engineer",
+        original_url="https://example.test/role", description_clean="Build data pipelines.",
+    ))
+    assert result.decision == FilterDecision.REJECT
+    assert result.eligibility_status == "unknown"
+    assert result.eligibility_evidence_status == "unconfirmed"
+
+
+@pytest.mark.parametrize("text", [
+    "Lead our platforms and infrastructure to support global operations.",
+    "Remote working environment with opportunities for global collaboration.",
+    "Other benefits may vary according to your location in LATAM.",
+    "This role works with a global remote team and customers worldwide.",
+])
+def test_operations_teams_and_benefits_do_not_prove_where_role_can_hire(text):
+    result = RuleEngine(broad_rules()).evaluate(JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.test/location", remote_text="Remote",
+        description_clean=text, source_metadata={"working_language": "English"},
+    ))
+    assert result.decision == FilterDecision.REVIEW
+    assert result.eligibility_status == "unknown"
     assert "geography:eligibility_unconfirmed" in result.risks
+
+
+def test_work_anywhere_is_a_policy_but_conditional_permission_remains_unknown():
+    result = RuleEngine(broad_rules()).evaluate(JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.test/anywhere", remote_text="Remote",
+        description_clean=(
+            "As long as you speak fluent English and you're authorized to work where you live, "
+            "you can work from anywhere."
+        ), source_metadata={"working_language": "English"},
+    ))
+    assert result.decision == FilterDecision.REVIEW
+    assert result.eligibility_status == "unknown"
+    assert result.risks == ["authorization:work_permission_unconfirmed"]
+
+
+@pytest.mark.parametrize("text", [
+    "Candidates do not need to have the right to work in Ireland.",
+    "Candidates may need to have the right to work in Ireland.",
+    "Candidates must have the right to work in Ireland?",
+    "Our customers must have the right to work in Ireland to use our service.",
+])
+def test_generic_permission_is_scoped_negation_sensitive_and_not_a_personal_verdict(text):
+    result = RuleEngine(broad_rules()).evaluate(JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.test/permission", location_text="Worldwide",
+        description_clean=text, source_metadata={"working_language": "English"},
+    ))
+    assert result.decision == FilterDecision.PASS
+    assert result.blocker_signals == []
+    assert not any(risk.startswith("authorization:") for risk in result.risks)
+
+
+def test_mandatory_local_permission_needs_review_even_outside_recall_mode():
+    result = RuleEngine(replace(broad_rules(), recall_first=False)).evaluate(JobRecord(
+        source="test", company="Example", title="Product Analytics Lead",
+        original_url="https://example.test/permission", location_text="Brazil",
+        description_clean="Candidates must have the right to work in Brazil.",
+        source_metadata={"working_language": "English"},
+    ))
+    assert result.decision == FilterDecision.REVIEW
+    assert result.eligibility_status == "unknown"
+    assert result.blocker_signals == []
 
 
 def test_office_location_is_read_after_obligation_not_candidate_location() -> None:

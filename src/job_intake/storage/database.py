@@ -52,6 +52,17 @@ class Database:
         "role_classification": "JSON NOT NULL DEFAULT '{}'",
         "archived_at": "DATETIME",
         "archive_version": "INTEGER NOT NULL DEFAULT 1",
+        "source_revision": "INTEGER NOT NULL DEFAULT 1",
+        "raw_fit_score": "FLOAT",
+        "score_cap_reasons": "JSON NOT NULL DEFAULT '[]'",
+        "eligibility_status": "VARCHAR(32) NOT NULL DEFAULT 'unknown'",
+        "eligibility_evidence_status": "VARCHAR(32) NOT NULL DEFAULT 'unconfirmed'",
+        "version_components": "JSON NOT NULL DEFAULT '{}'",
+        "missing_since": "DATETIME",
+        "missing_successes": "INTEGER NOT NULL DEFAULT 0",
+        "missing_verified_seconds": "FLOAT NOT NULL DEFAULT 0",
+        "missing_last_checked_at": "DATETIME",
+        "last_complete_seen_at": "DATETIME",
     }
 
     def _apply_lightweight_migrations(self) -> None:
@@ -65,9 +76,19 @@ class Database:
         migrations = {
             "jobs": self._JOBS_ADDITIVE_COLUMNS,
             "crm_companies": {"version": "INTEGER NOT NULL DEFAULT 1"},
+            "job_purpose_assessments": {
+                "human_p1_source_hash": "VARCHAR(64)", "human_p2_source_hash": "VARCHAR(64)",
+                "human_p1_rubric_version": "VARCHAR(100)",
+                "human_p2_rubric_version": "VARCHAR(100)",
+            },
             "job_relevance_evaluations": {
                 "classification_version": "VARCHAR(64) NOT NULL DEFAULT ''",
                 "classification_source_hash": "VARCHAR(64) NOT NULL DEFAULT ''",
+                "raw_fit_score": "FLOAT",
+                "score_cap_reasons": "JSON NOT NULL DEFAULT '[]'",
+                "eligibility_status": "VARCHAR(32) NOT NULL DEFAULT 'unknown'",
+                "eligibility_evidence_status": "VARCHAR(32) NOT NULL DEFAULT 'unconfirmed'",
+                "version_components": "JSON NOT NULL DEFAULT '{}'",
             },
         }
         tables = set(inspector.get_table_names())

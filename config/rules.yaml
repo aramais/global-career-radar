@@ -1,4 +1,4 @@
-# Synced with career-orientation 2026-10-10 and direct user clarification in HR.
+# Reviewed against career-orientation 2026-10-16; recognition corrections 2026-10-19.
 # High-recall mode: unconfirmed scope stays REVIEW; explicit hiring blockers still reject.
 recall_first: true
 onsite_locations: [Sao Paulo, São Paulo]
@@ -16,7 +16,7 @@ negative_title_signals: [recruiting analytics, people analytics, security analyt
 negative_description_signals: [recruiting analytics, hr analytics, fraud detection only, reporting only, reports only, dashboard maintenance only, dashboards only, routine reporting only, only produce reports, solo analysis only, individual analysis only, without stakeholder interaction]
 company_blacklist: []
 company_whitelist: []
-target_geographies: [Brazil, Brasil, BR, worldwide, global remote, LATAM, Latin America, South America, Americas]
+target_geographies: [Brazil, Brasil, BR, worldwide, global remote, Global, AMER, LATAM, Latin America, South America, Americas]
 allowlist_phrases: [worldwide, globally remote, global remote, remote anywhere, work from anywhere, LATAM, Latin America, South America, Americas]
 geography_blockers:
   - must be based in

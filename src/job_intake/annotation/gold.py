@@ -205,6 +205,7 @@ def _source_error(snapshot: object) -> str | None:
 def validate_gold(
     rows: list[tuple[str, JobRecord]], cases: list[dict], *,
     profile_ids: list[str] | tuple[str, ...] | None = None,
+    source_history: dict[str, list[dict]] | None = None,
 ) -> dict:
     """Validate human labels without inferring labels or depending on model claim IDs.
 
@@ -214,7 +215,7 @@ def validate_gold(
     """
     records = dict(rows)
     expected_profiles = set(profile_ids or DEFAULT_PROFILE_IDS)
-    errors, warnings, rebound = [], [], []
+    errors, warnings, rebound, compatibility = [], [], [], []
     seen = set()
 
     def finding(target: list, uid: object, code: str, message: str) -> None:
@@ -253,8 +254,18 @@ def validate_gold(
         ):
             finding(errors, uid, "invalid_source_hash", "source_hash must be a SHA-256 digest.")
         elif case["source_hash"] != source_hash(record):
-            finding(warnings, uid, "source_hash_changed",
-                    "Source hash changed; review source drift before trusting prior labels.")
+            from job_intake.annotation.source_compat import check_source_compatibility
+
+            proof = check_source_compatibility(case, record,
+                                               history=(source_history or {}).get(uid))
+            if proof["compatible"]:
+                compatibility.append({"job_uid": uid, **proof})
+                finding(warnings, uid, "source_observations_compatible",
+                        "Legacy source pin preserved: exact source facts/units match; "
+                        "only collection observations changed.")
+            else:
+                finding(warnings, uid, "source_hash_changed",
+                        "Source hash changed; review source drift before trusting prior labels.")
         if not isinstance(case.get("text_version"), str) or not case["text_version"].strip():
             finding(errors, uid, "invalid_text_version", "text_version must be nonempty.")
         elif case["text_version"] != TEXT_VERSION:
@@ -344,6 +355,7 @@ def validate_gold(
         "labeled_count": len(labeled),
         "relevant_count": sum(case["relevance"] >= 2 for case in labeled),
         "errors": errors, "warnings": warnings,
+        "source_compatibility": compatibility,
     }
 
 

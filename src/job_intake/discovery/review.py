@@ -22,6 +22,7 @@ from job_intake.annotation.gold_ui import (
 )
 from job_intake.annotation.text import source_hash
 from job_intake.config.settings import AppConfig
+from job_intake.discovery.artifacts import review_content_keys
 from job_intake.models.job import JobRecord, JobStatus
 
 MAX_REVIEW_SECONDS = 1800
@@ -93,7 +94,19 @@ class DiscoveryLabelStore(GoldLabelStore):
         return {**super().list_cases(query), "mode": "discovery"}
 
     def _detail(self, case: dict, line: bytes) -> dict:
-        return {**super()._detail(case, line), "mode": "discovery"}
+        detail = {**super()._detail(case, line), "mode": "discovery"}
+        if not detail.get("can_save"):
+            return {**detail, "regional_variants": []}
+        keys = review_content_keys(_source_record(case["source"]))
+        variants = []
+        for candidate in _json_lines(self.candidates_path):
+            if candidate["job_uid"] == case["job_uid"]:
+                continue
+            record = _source_record(candidate["source"])
+            if keys & review_content_keys(record):
+                variants.append({"job_uid": candidate["job_uid"], "title": record.title,
+                                 "location": record.location_text, "url": record.original_url})
+        return {**detail, "regional_variants": variants}
 
     def _events(self) -> list[dict]:
         return _json_lines(self.events_path) if self.events_path.exists() else []

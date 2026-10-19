@@ -1,0 +1,7 @@
+version: data-interview-practice-2026-10-19-v1
+confirmed_at: '2026-10-19'
+source: user_confirmation_in_project_chat
+p1: role tasks and hiring supported independently
+p2: analytics/data work with similar tasks, even if level or hiring does not fit next work
+human_confirmation: independent_from_machine_recommendation
+unknown: preserve_missing_evidence

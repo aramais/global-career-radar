@@ -63,6 +63,34 @@ def stored(tmp_path, monkeypatch):
     return path, settings, job
 
 
+@pytest.mark.parametrize("replace_journal", [False, True])
+def test_accuracy_rejects_journal_override_or_overwrite_before_report_write(
+    stored, tmp_path, monkeypatch, replace_journal,
+):
+    from job_intake.annotation import accuracy
+
+    journal = tmp_path / "exposure.json"
+    journal.write_text("")
+    manifest = {"cohort_id": "audit", "dataset_role": "holdout", "exposure_log": str(journal)}
+    monkeypatch.setattr(accuracy, "run_accuracy", lambda *args, **kwargs: {
+        "selection": {"cohort": manifest},
+    })
+
+    def unexpected_write(*args, **kwargs):
+        pytest.fail("Invalid journal destination must be rejected before writing a report")
+
+    monkeypatch.setattr(accuracy, "write_accuracy_report", unexpected_write)
+    output = tmp_path / "report.json" if replace_journal else journal
+    args = ["eval", "accuracy", "--gold", str(tmp_path / "gold.jsonl"), "--output", str(output)]
+    if replace_journal:
+        args.extend(["--exposure-log", str(tmp_path / "alternate.jsonl")])
+    result = CliRunner().invoke(cli.app, args)
+    assert result.exit_code != 0
+    assert journal.read_text() == ""
+    if replace_journal:
+        assert not output.exists()
+
+
 def test_eval_selects_latest_active_rows_without_mutating_database(stored, tmp_path):
     path, _, _ = stored
     before = path.read_bytes()
@@ -131,6 +159,40 @@ def test_eval_single_requested_uid_does_not_select_unrelated_jobs(stored, tmp_pa
     assert [row["job_uid"] for row in json.loads(output.read_text())["jobs"]] == ["older"]
     with pytest.raises(ValueError, match="Requested jobs"):
         read_saved_records(stored[1].database_url, job_uids=["missing"])
+
+
+def test_archived_loading_is_explicit_and_preserves_active_only_default(stored):
+    path, settings, _ = stored
+    before = path.read_bytes()
+    assert {uid for uid, _ in read_saved_records(settings.database_url, limit=None)[1]} == {
+        "older", "recent",
+    }
+    assert [uid for uid, _ in read_saved_records(
+        settings.database_url, limit=None, job_uids=["archived"], include_archived=True,
+    )[1]] == ["archived"]
+    with pytest.raises(ValueError, match="Requested jobs"):
+        read_saved_records(settings.database_url, limit=None, job_uids=["archived"])
+    assert path.read_bytes() == before
+
+
+def test_claim_gold_can_evaluate_archived_cohort_member(stored, tmp_path):
+    path, settings, record = stored
+    units = source_units(record)
+    chunk = chunk_source(units, settings.annotation.chunk_chars)[0]
+    drafts, _ = _drafts({"claims": []}, source_identity(record), chunk["units"], chunk["chunk_id"])
+    record.annotation["stages"] = {chunk["chunk_id"]: {"extraction": {"claims": []}}}
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE jobs SET annotation=? WHERE job_uid='archived'",
+                           (json.dumps(record.annotation),))
+    gold = tmp_path / "archived-claims.jsonl"
+    gold.write_text(json.dumps({"case_id": "archived", "units": units,
+                                "drafts": [dict(drafts[0], expected_review_status="SUPPORTED")]})
+                    + "\n")
+    before = path.read_bytes()
+    report = run_evaluation(settings, job_uids=["archived"], gold_path=gold)
+    assert report["selection"]["include_archived"] is True
+    assert [row["job_uid"] for row in report["jobs"]] == ["archived"]
+    assert path.read_bytes() == before
 
 
 def test_eval_log_reports_last_run_without_copying_raw_data(tmp_path):

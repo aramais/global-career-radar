@@ -249,3 +249,204 @@ def test_followup_cli_run_excludes_candidates_from_sibling_run(tmp_path, monkeyp
     second = read_json(tmp_path / "second" / "manifest.json")
     assert second["counts"]["known"] == 4
     assert second["counts"]["candidates"] == 0
+
+
+def test_batch_queries_are_billed_per_post_with_batch_level_provenance(tmp_path):
+    class MultiSearch:
+        def search(self, query, max_results):
+            assert isinstance(query, list)
+            return Search().search(query[0], max_results)
+
+    output = tmp_path / "batched"
+    result = run_discovery(plan(), output, search=MultiSearch(), fetcher=Fetcher(),
+                           budget_usd=.01, query_batch_size=2)
+    assert result["cost_usd"] == pytest.approx(.01)
+    assert len(result["expenses"]) == 2
+    assert result["expenses"][0]["query_ids"] == ["q0", "q1"]
+    assert result["expenses"][0]["query_units"] == 2
+    candidates = read_jsonl(output / "candidates.jsonl")
+    assert len(candidates) == 2
+    assert candidates[0]["observations"][0]["query_ids"] == ["q0", "q1"]
+
+
+def test_authentication_error_stops_discovery_and_known_unbilled_attempts_cost_zero(tmp_path):
+    class UnauthorizedSearch:
+        def search(self, query, max_results):
+            raise ProviderError("401", paid_request_attempted=True, status_code=401,
+                                billing_known_free=True)
+    output = tmp_path / "unauthorized"
+    result = run_discovery(plan(), output, search=UnauthorizedSearch(), fetcher=Fetcher(),
+                           budget_usd=.01, max_concurrency=1)
+    assert len(result["expenses"]) == 1
+    assert result["stop_reason"] == "authentication_error"
+    assert result["cost_usd"] == 0
+    assert build_report(output)["cost"]["uncertain_requests"] == 0
+
+
+def test_target_stops_at_five_complete_candidates_without_next_search_or_extra_fetches(tmp_path):
+    calls, fetched = [], []
+
+    class ManyResults:
+        def search(self, query, max_results):
+            calls.append(query)
+            return [{"url": f"https://jobs.example.com/jobs/{i}"} for i in range(10)]
+
+    class TrackedFetcher:
+        def fetch(self, hit):
+            fetched.append(hit["url"])
+            return Fetcher().fetch(hit)
+
+    output = tmp_path / "five"
+    result = run_discovery(plan(), output, search=ManyResults(), fetcher=TrackedFetcher(),
+                           budget_usd=1, target_candidates=5, max_concurrency=16)
+    assert len(calls) == 1 and len(fetched) == 5
+    assert result["counts"]["candidates"] == 5
+    assert result["counts"]["search_attempts"] == 1
+    assert result["cost_usd"] == pytest.approx(.005)
+    assert result["stop_reason"] == "target_reached"
+    assert result["limits"]["target_candidates"] == 5
+    assert len(load_candidates(output)) == 5
+    assert [row["outcome"] for row in read_jsonl(output / "discoveries.jsonl")].count(
+        "target_reached") == 5
+    prepare_labeling(output, size=5, random_size=0)
+    report = build_report(output)
+    assert report["counts"]["queued"] == 5 and report["counts"]["relevant"] == 0
+
+
+def test_target_excludes_known_closed_incomplete_failed_and_duplicate_jobs(tmp_path):
+    calls, fetched = [], []
+    first = ["0", "1", "2", "3"]
+    second = ["3", "mirror", "4", "5"]
+
+    class MixedSearch:
+        def search(self, query, max_results):
+            calls.append(query)
+            assert len(calls) <= 2, "No further POST once two new candidates exist"
+            return [{"url": f"https://jobs.example.com/jobs/{i}"}
+                    for i in (first if len(calls) == 1 else second)]
+
+    class MixedFetcher:
+        def fetch(self, hit):
+            index = hit["url"].rsplit("/", 1)[1]
+            fetched.append(index)
+            if index == "4":
+                raise ProviderError("unavailable")
+            record = vacancy(3 if index == "mirror" else int(index))
+            if index == "1":
+                record.status = JobStatus.CLOSED
+            elif index == "2":
+                record.source_metadata["description_complete"] = False
+            return record
+
+    output = tmp_path / "mixed-target"
+    result = run_discovery(plan(), output, search=MixedSearch(), fetcher=MixedFetcher(),
+                           budget_usd=1, target_candidates=2, known_records=[vacancy(0)])
+    assert len(calls) == 2 and fetched.count("3") == 1
+    assert result["counts"]["candidates"] == 2
+    assert result["counts"]["known"] == result["counts"]["closed"] == 1
+    assert result["counts"]["missing_text"] == result["counts"]["duplicates"] == 1
+    assert result["counts"]["fetch_attempts"] == 6
+    assert result["stop_reason"] == "target_reached"
+    rows = load_candidates(output)
+    assert {obs["query_id"] for obs in rows[0]["observations"]} == {"q0", "q1"}
+    assert len(rows[0]["observations"]) == 3
+
+
+@pytest.mark.parametrize(("budget", "expected_count", "reason"), [
+    (.005, 1, "budget_limit"), (1, 4, "plan_exhausted"),
+])
+def test_unreached_target_reports_budget_or_exhausted_plan(
+    tmp_path, budget, expected_count, reason,
+):
+    result = run_discovery(plan(), tmp_path / "limited", search=Search(), fetcher=Fetcher(),
+                           budget_usd=budget, target_candidates=5)
+    assert result["counts"]["candidates"] == expected_count
+    assert result["stop_reason"] == reason
+    assert result["cost_usd"] <= budget
+
+
+def test_target_honors_total_detail_limit_before_dispatching_next_search(tmp_path):
+    calls = []
+
+    class Results:
+        def search(self, query, max_results):
+            calls.append(query)
+            return [{"url": f"https://jobs.example.com/jobs/{i}"} for i in range(10)]
+
+    class ClosedFetcher:
+        def fetch(self, hit):
+            record = Fetcher().fetch(hit)
+            record.status = JobStatus.CLOSED
+            return record
+
+    result = run_discovery(plan(), tmp_path / "details", search=Results(), fetcher=ClosedFetcher(),
+                           budget_usd=1, target_candidates=5, max_details=5)
+    assert len(calls) == 1 and result["counts"]["fetch_attempts"] == 5
+    assert result["counts"]["candidates"] == 0
+    assert result["stop_reason"] == "detail_limit"
+
+
+def test_target_honors_time_limit_before_dispatching_next_search(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from job_intake.discovery import service
+
+    clock, calls = [100.0], []
+    monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    class SlowSearch:
+        def search(self, query, max_results):
+            calls.append(query)
+            return Search().search(query, max_results)
+
+    class SlowFetcher:
+        def fetch(self, hit):
+            clock[0] += 2
+            return Fetcher().fetch(hit)
+
+    result = run_discovery(plan(), tmp_path / "time", search=SlowSearch(), fetcher=SlowFetcher(),
+                           budget_usd=1, target_candidates=5, max_seconds=1)
+    assert len(calls) == 1 and result["counts"]["candidates"] == 1
+    assert result["stop_reason"] == "time_limit"
+
+
+def test_target_with_query_batching_stops_after_single_paid_batch(tmp_path):
+    calls = []
+
+    class BatchedSearch:
+        def search(self, query, max_results):
+            calls.append(query)
+            return [{"url": f"https://jobs.example.com/jobs/{i}"} for i in range(10)]
+
+    result = run_discovery(plan(), tmp_path / "batch-target", search=BatchedSearch(),
+                           fetcher=Fetcher(), budget_usd=1, target_candidates=3,
+                           query_batch_size=2)
+    assert len(calls) == 1 and isinstance(calls[0], list) and len(calls[0]) == 2
+    assert result["counts"]["candidates"] == 3
+    assert result["cost_usd"] == pytest.approx(.005)
+    assert result["stop_reason"] == "target_reached"
+
+
+@pytest.mark.parametrize("target", [True, 0, -1, 1.5, 201])
+def test_invalid_target_fails_before_creating_run(tmp_path, target):
+    with pytest.raises(ValueError, match="target-candidates"):
+        run_discovery(plan(), tmp_path / "invalid", search=Search(), fetcher=Fetcher(),
+                      budget_usd=1, target_candidates=target)
+    assert not (tmp_path / "invalid").exists()
+
+
+def test_target_cli_runs_incrementally_and_shows_reached_goal(tmp_path, monkeypatch):
+    from job_intake.discovery import cli
+
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan()), encoding="utf-8")
+    monkeypatch.setattr(cli, "_records", lambda *_: {})
+    monkeypatch.setattr(cli, "PerplexitySearch", lambda *_: Search())
+    monkeypatch.setattr(cli, "PublicJobFetcher", Fetcher)
+    output = tmp_path / "cli-target"
+    result = CliRunner().invoke(app, ["discovery", "run", "--plan", str(plan_path),
+                                      "--output", str(output), "--budget-usd", "1",
+                                      "--target-candidates", "2"])
+    assert result.exit_code == 0, result.output
+    assert "кандидатов=2/2" in result.output and "target_reached" in result.output
+    assert read_json(output / "manifest.json")["cost_usd"] == pytest.approx(.01)

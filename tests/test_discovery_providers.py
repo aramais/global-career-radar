@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import socket
 
+import httpx
 import pytest
 import requests
 
@@ -77,51 +78,70 @@ def page(value):
 
 
 def test_search_uses_verified_endpoint_and_single_post():
-    response = Response(payload={"results": [{
+    response = httpx.Response(200, json={"id": "fixture", "results": [{
         "title": "Analytics Lead", "url": "https://careers.example.com/jobs/42",
         "snippet": "pricing analytics", "date": "2026-10-16", "ignored": "not retained",
     }]})
-    session = Session([response])
-    hits = PerplexitySearch("secret", session=session).search(" analytics pricing ", 5)
+    client, calls = search_client([response])
+    hits = client.search(" analytics pricing ", 5)
     assert hits == [{"title": "Analytics Lead", "url": "https://careers.example.com/jobs/42",
                      "snippet": "pricing analytics", "date": "2026-10-16"}]
-    assert len(session.calls) == 1
-    method, url, kwargs = session.calls[0]
-    assert method == "POST"
-    assert url == "https://api.perplexity.ai/search"
-    assert kwargs["json"] == {"query": "analytics pricing", "max_results": 5}
-    assert kwargs["headers"]["Authorization"] == "Bearer secret"
-    assert kwargs["allow_redirects"] is False
-    assert response.closed
+    assert len(calls) == 1
+    request = calls[0]
+    assert request.method == "POST"
+    assert str(request.url) == "https://api.perplexity.ai/search"
+    assert json.loads(request.content) == {"query": "analytics pricing", "max_results": 5}
+    assert request.headers["Authorization"] == "Bearer secret"
+    assert client.client.max_retries == 0
+    assert response.is_closed
+    client.close()
+
+
+def search_client(responses, **kwargs):
+    calls = []
+    remaining = iter(responses)
+
+    def respond(request):
+        calls.append(request)
+        result = next(remaining)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    session = httpx.Client(transport=httpx.MockTransport(respond), follow_redirects=False)
+    return PerplexitySearch("secret", session=session, **kwargs), calls
 
 
 @pytest.mark.parametrize("response", [
-    Response(payload={"answer": "wrong API"}),
-    Response(payload={"results": ["not an object"]}),
-    Response(payload={"results": [{"title": "a", "url": "https://example.com"}]}),
-    Response(payload=ValueError("secret response body")),
-    Response(status=401), Response(status=429),
-    Response(status=307, headers={"Location": "https://other.example.com"}),
-    requests.Timeout("Authorization Bearer secret"),
+    httpx.Response(200, json={"answer": "wrong API"}),
+    httpx.Response(200, json={"id": "fixture", "results": ["not an object"]}),
+    httpx.Response(200, json={"id": "fixture", "results": [
+        {"title": "a", "url": "https://example.com"}]}),
+    httpx.Response(200, text="secret response body is not JSON"),
+    httpx.Response(401), httpx.Response(429),
+    httpx.Response(307, headers={"Location": "https://other.example.com"}),
+    httpx.ReadTimeout("Authorization Bearer secret"),
 ])
 def test_search_schema_errors_and_failures_are_sanitized_and_not_retried(response):
-    session = Session([response])
+    client, calls = search_client([response])
     with pytest.raises(ProviderError) as caught:
-        PerplexitySearch("secret", session=session).search("query")
+        client.search("query")
     assert caught.value.paid_request_attempted is True
     assert "secret" not in str(caught.value)
-    assert len(session.calls) == 1
+    assert len(calls) == 1
+    client.close()
 
 
 def test_search_validation_happens_before_paid_request():
-    session = Session([])
+    client, calls = search_client([])
     with pytest.raises(ProviderError) as caught:
-        PerplexitySearch("secret", session=session).search("", 10)
+        client.search("", 10)
     assert caught.value.paid_request_attempted is False
-    assert not session.calls
+    assert not calls
     with pytest.raises(ProviderError):
-        PerplexitySearch("secret", session=session).search("query", 21)
-    assert not session.calls
+        client.search("query", 21)
+    assert not calls
+    client.close()
 
 
 def test_fetch_uses_original_full_description_and_metadata_not_search_hint():

@@ -8,11 +8,13 @@ from datetime import UTC
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session, load_only, selectinload
 
-from job_intake.storage.models import JobORM, JobProfileEvaluationORM
+from job_intake.profiles import stale_version_reasons
+from job_intake.purpose import PURPOSE_RUBRIC_VERSION, serialize_purpose
+from job_intake.storage.models import JobORM, JobProfileEvaluationORM, JobPurposeAssessmentORM
 from job_intake.storage.queries import classification_is_current, ranked_profile_evaluations
 
 JOB_QUERY_FIELDS = {"profile_id", "job_archive", "query", "tier", "score_min", "score_max",
-                    "sort", "offset", "limit"}
+                    "sort", "offset", "limit", "purpose"}
 PUBLIC_ANNOTATION_FIELDS = {
     "version", "status", "method", "summary", "claims", "issues", "extract_model", "review_model",
     "extract_provider", "review_provider", "coverage", "description_complete",
@@ -22,6 +24,7 @@ LIST_COLUMNS = (
     JobORM.archived_at, JobORM.archive_version, JobORM.apply_url, JobORM.original_url,
     JobORM.location_text, JobORM.remote_text,
     JobORM.role_label, JobORM.role_classification,
+    JobORM.version_components,
 )
 EVALUATION_COLUMNS = (
     JobProfileEvaluationORM.job_uid, JobProfileEvaluationORM.profile_id,
@@ -30,6 +33,9 @@ EVALUATION_COLUMNS = (
     JobProfileEvaluationORM.decision, JobProfileEvaluationORM.fit_score,
     JobProfileEvaluationORM.classification_version,
     JobProfileEvaluationORM.classification_source_hash,
+    JobProfileEvaluationORM.raw_fit_score, JobProfileEvaluationORM.score_cap_reasons,
+    JobProfileEvaluationORM.eligibility_status, JobProfileEvaluationORM.eligibility_evidence_status,
+    JobProfileEvaluationORM.version_components,
 )
 
 
@@ -58,12 +64,16 @@ def _score(query: dict, key: str) -> float | None:
     return number
 
 
-def current_evaluations(job: JobORM, versions: dict[str, str]) -> list[JobProfileEvaluationORM]:
+def current_evaluations(job: JobORM, versions: dict[str, str],
+                        components: dict[str, dict] | None = None) -> list[JobProfileEvaluationORM]:
     return sorted(
         (p for p in job.profile_evaluations
          if classification_is_current(job, p)
          and versions.get(p.profile_id) == p.profile_version
-         and p.content_hash == job.content_hash),
+         and p.content_hash == job.content_hash
+         and not (components and p.version_components and stale_version_reasons(
+             p.version_components, components.get(p.profile_id, {}),
+         ))),
         key=lambda p: ({"A": 0, "B": 1, "C": 2}.get(p.tier, 3),
                        {"pass": 0, "review": 1, "reject": 2}.get(p.decision, 3),
                        -p.fit_score, p.profile_id),
@@ -91,10 +101,25 @@ def _public_prefilter(value: object) -> dict | None:
 
 
 def serialize_job(job: JobORM, versions: dict[str, str], *, profile: str | None = None,
-                  detailed: bool = False) -> dict:
-    evaluations = current_evaluations(job, versions)
+                  detailed: bool = False, components: dict[str, dict] | None = None) -> dict:
+    evaluations = current_evaluations(job, versions, components)
     classified = classification_is_current(job, next(iter(job.profile_evaluations), None))
     best = next(iter(evaluations), None)
+    previous = next(iter(job.profile_evaluations), None)
+    old_components = previous.version_components if previous is not None else job.version_components
+    stale_reasons = stale_version_reasons(
+        old_components, (components or {}).get(job.role_label, {}),
+    )
+    if previous is not None and previous.content_hash != job.content_hash:
+        stale_reasons.append("source:content_changed")
+    if previous is not None and previous.profile_version != versions.get(previous.profile_id):
+        stale_reasons.append("profile_version:changed")
+    if not classified:
+        stale_reasons.append("classification:source_or_role_changed")
+    if old_components and components and stale_version_reasons(
+        old_components, components.get(job.role_label, {}), stage="classification",
+    ):
+        classified = False
     if profile and job.role_label != profile:
         best = None
         evaluations = []
@@ -102,6 +127,12 @@ def serialize_job(job: JobORM, versions: dict[str, str], *, profile: str | None 
     archived_at = job.archived_at
     if archived_at is not None and archived_at.tzinfo is None:
         archived_at = archived_at.replace(tzinfo=UTC)
+    purpose = serialize_purpose(job.purpose_assessment)
+    if not detailed:
+        purpose = {key: value for key, value in purpose.items() if key in {
+            "human_p1", "human_p2", "predicted_p1", "predicted_p2", "version",
+            "human_stale", "human_p1_stale", "human_p2_stale",
+        }}
     result = {
         "job_uid": job.job_uid, "company": job.company, "title": job.title,
         "archived": archived_at is not None,
@@ -112,9 +143,14 @@ def serialize_job(job: JobORM, versions: dict[str, str], *, profile: str | None 
         "role_name": (job.role_classification or {}).get("name"),
         "classification_reason": (job.role_classification or {}).get("reason"),
         "classification_state": "current" if classified else "needs_reclassification",
+        "stale_reasons": sorted(set(stale_reasons)),
+        "version_components": old_components or {},
+        "purpose": purpose,
         "evaluation_state": ("unscored" if classified and job.role_label == "other"
                              else "current" if best else "needs_reevaluation"),
         "eligibility": ({"decision": best.decision,
+                         "status": best.eligibility_status,
+                         "evidence_status": best.eligibility_evidence_status,
                          **({"blocker_signals": best.blocker_signals, "risks": best.risks}
                             if detailed else {})} if best else None),
         "relevance": ({"id": best.profile_id, "name": best.profile_name,
@@ -123,6 +159,10 @@ def serialize_job(job: JobORM, versions: dict[str, str], *, profile: str | None 
                            "blocker_signals": best.blocker_signals} if detailed else {})}
                       if scored else None),
         "fit_score": best.fit_score if scored else None, "tier": best.tier if scored else None,
+        "raw_fit_score": best.raw_fit_score if scored else None,
+        "score_cap_reasons": best.score_cap_reasons if scored else [],
+        "eligibility_status": best.eligibility_status if best else "unknown",
+        "eligibility_evidence_status": best.eligibility_evidence_status if best else "unconfirmed",
         "decision": best.decision if best else None,
         "profiles": [{"id": p.profile_id, "name": p.profile_name, "score": p.fit_score,
                       "tier": p.tier, "decision": p.decision,
@@ -140,7 +180,8 @@ def serialize_job(job: JobORM, versions: dict[str, str], *, profile: str | None 
     return result
 
 
-def list_job_page(session: Session, versions: dict[str, str], query: dict[str, str]) -> dict:
+def list_job_page(session: Session, versions: dict[str, str], query: dict[str, str],
+                  components: dict[str, dict] | None = None) -> dict:
     """Apply current assessment, search and sort in SQL before offset/limit."""
     unknown = set(query) - JOB_QUERY_FIELDS
     if unknown:
@@ -153,16 +194,58 @@ def list_job_page(session: Session, versions: dict[str, str], query: dict[str, s
     if tier not in {None, "A", "B", "C", "unrated"}:
         raise ValueError("Unknown vacancy tier")
     sort = query.get("sort") or "tier-asc"
-    if sort not in {"tier-asc", "tier-desc", "score-asc", "score-desc"}:
+    if sort not in {"tier-asc", "tier-desc", "score-asc", "score-desc", "review-evidence"}:
         raise ValueError("Unknown vacancy sort")
+    purpose = query.get("purpose") or "all"
+    if purpose not in {"all", "p1", "p2", "review"}:
+        raise ValueError("Unknown vacancy purpose")
     offset = _integer(query, "offset", 0)
     limit = _integer(query, "limit", 100, 500)
     minimum, maximum = _score(query, "score_min"), _score(query, "score_max")
     if minimum is not None and maximum is not None and minimum > maximum:
         raise ValueError("Minimum score must not exceed maximum score")
     ranked = ranked_profile_evaluations(versions, profile_id=profile)
+    if components:
+        ranked = select(ranked).where(or_(
+            ranked.c.version_components == {},
+            *[and_(ranked.c.profile_id == label, *[
+                ranked.c.version_components[key].as_string() == value
+                for key, value in expected.items() if key != "query"
+            ]) for label, expected in components.items()],
+        )).subquery("current_component_evaluations")
     join = and_(ranked.c.job_uid == JobORM.job_uid, ranked.c.evaluation_rank == 1)
     statement = select(JobORM).outerjoin(ranked, join)
+    if purpose != "all":
+        row = JobPurposeAssessmentORM
+        statement = statement.outerjoin(row, row.job_uid == JobORM.job_uid)
+        stale_axes = {}
+        for axis in ("p1", "p2"):
+            human = getattr(row, "human_" + axis)
+            pin = func.coalesce(
+                func.nullif(getattr(row, "human_" + axis + "_source_hash"), ""),
+                row.human_source_hash, "",
+            )
+            rubric = func.coalesce(
+                func.nullif(getattr(row, "human_" + axis + "_rubric_version"), ""),
+                row.human_rubric_version, "",
+            )
+            stale_axes[axis] = and_(human != "unknown", or_(
+                pin != row.prediction_source_hash,
+                rubric != PURPOSE_RUBRIC_VERSION,
+            ))
+        if purpose == "review":
+            statement = statement.where(or_(
+                row.job_uid.is_(None), stale_axes["p1"], stale_axes["p2"],
+                row.human_p1 == "unknown", row.human_p2 == "unknown",
+            ))
+        else:
+            human = row.human_p1 if purpose == "p1" else row.human_p2
+            predicted = row.predicted_p1 if purpose == "p1" else row.predicted_p2
+            human_current = ~stale_axes[purpose]
+            statement = statement.where(or_(
+                and_(human_current, human == "suitable"),
+                and_(or_(~human_current, human == "unknown"), predicted == "suitable"),
+            ))
     if archive != "all":
         statement = statement.where(JobORM.archived_at.is_not(None) if archive == "archived"
                                     else JobORM.archived_at.is_(None))
@@ -197,19 +280,28 @@ def list_job_page(session: Session, versions: dict[str, str], query: dict[str, s
     score = case((unscored, None), else_=ranked.c.fit_score)
     score_order = score.asc() if sort == "score-asc" else score.desc()
     order = (score_order, tier_order) if sort.startswith("score-") else (tier_order, score_order)
+    if sort == "review-evidence":
+        order = (case((ranked.c.decision == "review", 0), else_=1), case(
+            (ranked.c.eligibility_evidence_status == "confirmed", 0),
+            (ranked.c.eligibility_evidence_status == "unconfirmed", 1), else_=2,
+        ), score_order, tier_order)
     statement = statement.order_by(unrated, *order, JobORM.job_uid).offset(offset).limit(limit)
     statement = statement.options(
         load_only(*LIST_COLUMNS, raiseload=True),
         selectinload(JobORM.profile_evaluations).load_only(*EVALUATION_COLUMNS, raiseload=True),
+        selectinload(JobORM.purpose_assessment),
     )
-    jobs = [serialize_job(job, versions, profile=profile) for job in session.scalars(statement)]
+    jobs = [serialize_job(job, versions, profile=profile, components=components)
+            for job in session.scalars(statement)]
     return {"jobs": jobs, "total": total, "offset": offset, "limit": limit,
             "has_more": offset + len(jobs) < total}
 
 
-def job_detail(session: Session, versions: dict[str, str], uid: str) -> dict | None:
+def job_detail(session: Session, versions: dict[str, str], uid: str,
+               components: dict[str, dict] | None = None) -> dict | None:
     if not isinstance(uid, str) or not uid or len(uid) > 100:
         raise ValueError("Invalid vacancy ID")
     job = session.scalar(select(JobORM).where(JobORM.job_uid == uid)
-                         .options(selectinload(JobORM.profile_evaluations)))
-    return serialize_job(job, versions, detailed=True) if job else None
+                         .options(selectinload(JobORM.profile_evaluations),
+                                  selectinload(JobORM.purpose_assessment)))
+    return serialize_job(job, versions, detailed=True, components=components) if job else None

@@ -79,10 +79,23 @@ def cohort(tmp_path, monkeypatch):
     def fake_diff(config_arg, **kwargs):
         assert config_arg is config
         assert set(kwargs["job_uids"]) == {"relevant", "irrelevant"}
+        assert kwargs["include_archived"] is True
         return diff
 
     monkeypatch.setattr(comparison, "run_rules_diff", fake_diff)
     return config, gold, diff, database
+
+
+def test_archiving_a_gold_member_does_not_remove_it_from_the_comparison(cohort):
+    config, gold, _, database = cohort
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE jobs ADD COLUMN archived_at TEXT")
+        connection.execute("UPDATE jobs SET archived_at='2026-10-19' WHERE job_uid='irrelevant'")
+    before = database.read_bytes()
+    report = comparison.compare(config, gold=gold, baseline="baseline.json")
+    assert report["gold"]["completed_rows"] == 2
+    assert report["after"]["role_classification"]["accuracy"]["denominator"] == 2
+    assert database.read_bytes() == before
 
 
 def test_other_is_an_explicit_unranked_role_and_routes_are_not_reused():
