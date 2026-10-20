@@ -9,7 +9,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
+import tempfile
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -23,7 +26,7 @@ from job_intake.labeling.schema import (
 from job_intake.models.job import JobRecord
 
 MIGRATION_SCHEMA = "vacancy-labels-v3-migration-v1"
-TAG_MAP_VERSION = "v2-to-v3-tags-v1"
+TAG_MAP_VERSION = "v2-to-v3-tags-v3"
 METHOD_MAP = {"blind": "blind", "assisted": "curated"}
 _HIRING_GEOGRAPHY = {
     "brazil_explicit": "open_to_brazil", "includes_brazil_region": "open_to_brazil",
@@ -35,8 +38,55 @@ _WORKING_LANGUAGE = {
     "english_required": "english", "other_language_required": "other_language_required",
     "unspecified": "unspecified",
 }
-_SAO_PAULO = re.compile(r"\bs[aã]o paulo\b", re.I)
-_BRAZIL = re.compile(r"\b(?:brazil|brasil)\b", re.I)
+_SAO_PAULO_CITY = re.compile(
+    r"(?:(?:city|municipality) of |(?:cidade|municipio) de )?sao paulo"
+    r"(?: city| capital| \(city\))?(?:\s*\(sp\))?"
+    r"(?:\s*[,/–-]\s*(?:sp|sao paulo))?"
+    r"(?:\s*[,/–-]\s*(?:brazil|brasil|br))?",
+    re.I,
+)
+_BRAZIL_AUTHORIZATION_ALIASES = frozenset({"brazil", "brasil", "br", "bra"})
+# This migration recognizes explicit aliases, not arbitrary nonempty text. A
+# country absent here is preserved as a dropped tag for review, never guessed.
+_FOREIGN_AUTHORIZATION_ALIASES = frozenset({
+    "us", "usa", "u s", "u s a", "united states", "united states of america", "estados unidos",
+    "uk", "gb", "gbr", "united kingdom", "reino unido", "canada", "ca", "can",
+    "australia", "au", "aus", "new zealand", "nz", "nzl", "nova zelandia",
+    "germany", "de", "deu", "deutschland", "alemanha", "france", "fr", "fra", "franca",
+    "spain", "es", "esp", "espanha", "portugal", "pt", "prt", "ireland", "ie", "irl",
+    "netherlands", "nl", "nld", "paises baixos", "italy", "it", "ita", "italia",
+    "switzerland", "ch", "che", "suica", "sweden", "se", "swe", "suecia",
+    "norway", "no", "nor", "noruega", "denmark", "dk", "dnk", "dinamarca",
+    "poland", "pl", "pol", "polonia", "finland", "fi", "fin", "finlandia",
+    "belgium", "be", "bel", "belgica", "austria", "at", "aut",
+    "mexico", "mx", "mex", "argentina", "ar", "arg", "chile", "cl", "chl",
+    "colombia", "co", "col", "peru", "pe", "per", "uruguay", "uy", "ury", "uruguai",
+    "india", "in", "ind", "singapore", "sg", "sgp", "singapura", "japan", "jp", "jpn",
+    "japao", "china", "cn", "chn", "south korea", "kr", "kor", "coreia do sul",
+    "israel", "il", "isr", "united arab emirates", "uae", "ae", "are",
+    "south africa", "za", "zaf", "africa do sul",
+    # These explicit regions exclude Brazil; inclusive or ambiguous regions do not.
+    "europe", "europa", "european union", "eu", "european economic area", "eea",
+    "north america", "america do norte", "emea", "apac", "asia pacific", "asia",
+    "africa", "middle east", "oceania", "australia and new zealand", "anz",
+})
+_SAO_PAULO_STATE_QUALIFIERS = frozenset({
+    "sp", "sao paulo", "sao paulo state", "state of sao paulo", "estado de sao paulo",
+    "brazil", "brasil", "br", "bra",
+})
+# This is a conservative parser alias table, not a preference or a complete city
+# gazetteer. Unsupported cities and location phrases are dropped for review.
+_OTHER_OFFICE_CITIES = dict.fromkeys(
+    ("campinas", "santos", "sao caetano do sul", "barueri"), _SAO_PAULO_STATE_QUALIFIERS,
+) | {
+    "london": frozenset({"uk", "gb", "gbr", "united kingdom", "england", "reino unido"}),
+}
+
+
+def _geography_name(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    return " ".join("".join(char for char in normalized
+                            if not unicodedata.combining(char)).casefold().split())
 
 
 def gold_file_schema(cases: list[dict]) -> str:
@@ -60,9 +110,16 @@ def _hiring(tags: dict) -> tuple[dict | None, list[tuple[str, str, str]]]:
     if isinstance(authorization, dict):
         value = authorization.get("value")
         if value == "country_required":
-            brazil = bool(_BRAZIL.search(str(authorization.get("country", ""))))
-            candidates.append(("open_to_brazil" if brazil else "restricted_elsewhere",
-                               authorization["quote"]))
+            country = authorization.get("country")
+            alias = re.sub(r"[^\w]+", " ", _geography_name(country)).strip() \
+                if isinstance(country, str) else ""
+            if alias in _BRAZIL_AUTHORIZATION_ALIASES:
+                candidates.append(("open_to_brazil", authorization["quote"]))
+            elif alias in _FOREIGN_AUTHORIZATION_ALIASES:
+                candidates.append(("restricted_elsewhere", authorization["quote"]))
+            else:
+                dropped.append(("work_authorization", value,
+                                "authorization country is missing or unsupported"))
         elif value == "unspecified":
             candidates.append(("unspecified", authorization["quote"]))
         else:
@@ -87,7 +144,19 @@ def _work_mode(label: dict) -> tuple[dict | None, str | None]:
     if value in {"hybrid", "onsite"} and isinstance(location, str) and location.strip():
         if len(location) > 80:
             return None, "office_location longer than 80 characters"
-        mode = "office_sao_paulo" if _SAO_PAULO.search(location) else "office_elsewhere"
+        normalized = _geography_name(location)
+        if _SAO_PAULO_CITY.fullmatch(normalized):
+            mode = "office_sao_paulo"
+        else:
+            # Recognize the entire location, not just the leading fragment. All
+            # suffixes must be known administrative qualifiers for that city.
+            # Slash/semicolon/or lists are not administrative qualifiers: e.g.
+            # "London / São Paulo" and "Santos / São Paulo" are ambiguous.
+            parts = re.split(r"\s*,\s*|\s+[–-]\s+", normalized)
+            qualifiers = _OTHER_OFFICE_CITIES.get(parts[0])
+            if qualifiers is None or any(part not in qualifiers for part in parts[1:]):
+                return None, "office city is not established by the location"
+            mode = "office_elsewhere"
         return {"value": mode, "office_location": location, "quote": quote,
                 "basis": "explicit"}, None
     return None, "office mode without a location has no v3 analogue"
@@ -156,17 +225,66 @@ def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _write_migration_outputs(outputs: list[tuple[Path, str]]) -> None:
+    """Stage both outputs, publish without replacement, roll back owned links on error.
+
+    The two paths cannot be made visible in one filesystem operation. A normal
+    exception rolls back our published links; an interrupted process may leave an
+    incomplete pair. Never remove a path another process replaced with its file.
+    """
+    from job_intake.annotation.gold_workbook import ensure_new_outputs
+
+    ensure_new_outputs([path for path, _ in outputs])
+    staged: list[tuple[Path, Path, tuple[int, int]]] = []
+    published: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        for output, content in outputs:
+            path = output.expanduser().resolve()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".",
+                suffix=".tmp", delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                identity = os.fstat(handle.fileno())
+                staged.append((temporary, path, (identity.st_dev, identity.st_ino)))
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+        for temporary, path, identity in staged:
+            # Register before linking so an interrupt immediately after publication
+            # still has an ownership record. A refused link cannot match our inode.
+            published.append((path, identity))
+            os.link(temporary, path)
+    except BaseException as exc:
+        for path, identity in reversed(published):
+            try:
+                current = path.lstat()
+                if (current.st_dev, current.st_ino) == identity:
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_error:
+                exc.add_note(f"Could not roll back migration output {path}: {cleanup_error}")
+        raise
+    finally:
+        for temporary, _, _ in staged:
+            temporary.unlink(missing_ok=True)
+
+
 def migrate_gold_v2(source: Path, out: Path, *, rubric_version: str) -> dict:
     """v2 labeled → v3: role_label/relevance/gate_outcome/notes/source/hashes 1:1;
     tags: only labeled v2 tags with a v3 analogue (hiring_geography+work_authorization →
     hiring_eligibility by table; work_mode; working_language); method: blind→blind,
     assisted→curated; first_labeled_at=labeled_at. Refuses an existing out. Writes out
-    and out.with_suffix('.manifest.json') with SHA-256 of input and output."""
-    from job_intake.annotation.benchmark import read_jsonl
+    and out.with_suffix('.manifest.json') with SHA-256 of the bytes parsed and output.
+    Both files are staged before publication; a handled write failure rolls back
+    published links still owned by this call. A process crash may leave a partial pair.
+    """
+    from job_intake.annotation.benchmark import parse_jsonl
     from job_intake.annotation.gold_workbook import (
         ensure_new_outputs,
         jsonl_content,
-        write_new_text,
     )
 
     if not isinstance(rubric_version, str) or not rubric_version.strip():
@@ -177,7 +295,7 @@ def migrate_gold_v2(source: Path, out: Path, *, rubric_version: str) -> dict:
         raise ValueError("Migration outputs must not replace the v2 source")
     ensure_new_outputs([out, manifest_path])
     raw = source.read_bytes()
-    cases = read_jsonl(source)
+    cases = parse_jsonl(raw.decode("utf-8"))
     if not cases:
         raise ValueError("Cannot migrate an empty gold file")
     if len({case.get("job_uid") for case in cases}) != len(cases):
@@ -226,8 +344,10 @@ def migrate_gold_v2(source: Path, out: Path, *, rubric_version: str) -> dict:
             "gate_reasons start empty: v2 recorded no gate reasons.",
         ],
     }
-    write_new_text(content, out)
-    write_new_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", manifest_path)
+    _write_migration_outputs([
+        (out, content),
+        (manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"),
+    ])
     return manifest
 
 

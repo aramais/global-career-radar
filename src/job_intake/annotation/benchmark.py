@@ -214,9 +214,10 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict:
     return result
 
 
-def read_jsonl(path: Path) -> list[dict]:
+def parse_jsonl(content: str) -> list[dict]:
+    """Parse one captured JSONL text, preserving line and duplicate-key checks."""
     rows = []
-    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for index, line in enumerate(content.splitlines(), start=1):
         if not line.strip():
             continue
         try:
@@ -227,6 +228,10 @@ def read_jsonl(path: Path) -> list[dict]:
             raise ValueError(f"JSONL line {index} must be an object")
         rows.append(row)
     return rows
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    return parse_jsonl(path.read_text(encoding="utf-8"))
 
 
 def main(argv: list[str] | None = None) -> int:

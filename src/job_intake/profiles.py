@@ -16,6 +16,7 @@ from job_intake.annotation.prefilter import prompts_version as prefilter_prompts
 from job_intake.annotation.text import SOURCE_UNITS_VERSION
 from job_intake.filtering import FilterRules, RuleEngine
 from job_intake.scoring.pre_score import DeterministicScorer, SearchProfiles
+from job_intake.utils.identifiers import STREAM_ID_PATTERN
 from job_intake.utils.text import stable_hash
 
 ROLE_POLICY_VERSION = "role-first-v3-title-boundaries"
@@ -76,7 +77,7 @@ def load_streams(rules: dict[str, Any], config: dict[str, Any]) -> list[SearchSt
         if not isinstance(item, dict):
             raise ValueError("Each search stream must be a mapping")
         profile_id = str(item.get("id", ""))
-        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", profile_id) or profile_id == "other":
+        if not re.fullmatch(STREAM_ID_PATTERN, profile_id) or profile_id == "other":
             raise ValueError(f"Invalid stream id: {profile_id!r}")
         if profile_id in seen:
             raise ValueError(f"Duplicate stream id: {profile_id}")

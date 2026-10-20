@@ -6,10 +6,8 @@ Never instantiate the pipeline/database service: those can initialize or migrate
 from __future__ import annotations
 
 import json
-import os
 import re
 import sqlite3
-import tempfile
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +18,7 @@ from sqlalchemy.exc import ArgumentError
 
 from job_intake.annotation.ai import _ERROR_CODES
 from job_intake.annotation.benchmark import evaluate_reviews, read_jsonl
+from job_intake.annotation.cohorts import write_new_text
 from job_intake.annotation.evaluation import evaluate_records
 from job_intake.annotation.jev import normalize_jev_review
 from job_intake.annotation.service import _drafts
@@ -438,6 +437,24 @@ def run_evaluation(
     return report
 
 
+def report_destinations(
+    outputs: list[Path], *, protected_paths: list[Path],
+) -> tuple[Path, ...]:
+    """Protect input identities and refuse occupied names before publishing any file."""
+    # Resolve directory aliases, not final symlinks: each final name itself must
+    # be free, including a dangling symlink whose target does not exist.
+    expanded = (path.expanduser() for path in outputs)
+    paths = tuple(path.parent.resolve() / path.name for path in expanded)
+    identities = {path.resolve() for path in paths}
+    if len(identities) != len(paths):
+        raise ValueError("Report destinations must be distinct and must not overwrite each other")
+    if identities & {path.expanduser().resolve() for path in protected_paths}:
+        raise ValueError("Report must not overwrite inputs: database, config, log or gold")
+    if any(path.exists() or path.is_symlink() for path in paths):
+        raise ValueError("Report output already exists; choose new paths")
+    return paths
+
+
 def write_report(report: dict, output: Path, *, protected_paths: list[Path]) -> Path:
     return write_text_report(
         json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
@@ -446,23 +463,6 @@ def write_report(report: dict, output: Path, *, protected_paths: list[Path]) -> 
 
 
 def write_text_report(content: str, output: Path, *, protected_paths: list[Path]) -> Path:
-    """Atomically replace a report without overwriting source inputs."""
-    path = output.expanduser().resolve()
-    if path in {entry.expanduser().resolve() for entry in protected_paths}:
-        raise ValueError("Report must not overwrite the database, config, log or gold inputs")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".",
-            suffix=".tmp", delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-    return path
+    """Publish a complete new report exclusively, preserving all existing evidence."""
+    (path,) = report_destinations([output], protected_paths=protected_paths)
+    return write_new_text(path, content)

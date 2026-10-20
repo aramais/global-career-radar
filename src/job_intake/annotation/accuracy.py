@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
 import sqlite3
-import tempfile
 import unicodedata
 from collections import Counter, defaultdict
 from datetime import UTC, date, datetime
@@ -19,17 +17,20 @@ from pathlib import Path
 from urllib.parse import quote
 
 from job_intake.annotation.benchmark import read_jsonl
+from job_intake.annotation.cohorts import write_new_text
 from job_intake.annotation.eval_runner import (
     _object_json,
     evaluate_log,
     read_saved_records,
+    report_destinations,
     sqlite_path,
-    write_report,
 )
 from job_intake.annotation.schema import _language_entities
 from job_intake.annotation.text import TEXT_VERSION, source_hash
 from job_intake.config.settings import AppConfig, load_yaml_mapping
 from job_intake.labeling.metrics import has_relevance, relevance_scale
+from job_intake.labeling.numeric import is_finite_score
+from job_intake.labeling.schema import LABELS_SCHEMA, PREDICTION_SCHEMA
 from job_intake.models.job import JobRecord, JobStatus
 from job_intake.profiles import load_streams
 
@@ -346,8 +347,7 @@ def read_saved_predictions(
                 and row.get("decision") in {"pass", "review", "reject"}
                 and (label == "other" or (
                     row.get("tier") in {"A", "B", "C"}
-                    and type(row.get("fit_score")) in {int, float}
-                    and math.isfinite(row["fit_score"])
+                    and is_finite_score(row.get("fit_score"))
                 ))
             )]
             current = valid[0] if len(valid) == 1 and source_current is not False else {}
@@ -355,8 +355,7 @@ def read_saved_predictions(
             gate = current.get("eligibility_status")
             gate = gate if gate in {"eligible", "ineligible", "unknown"} else None
             raw_score = current.get("raw_fit_score")
-            raw_score = raw_score if type(raw_score) in {int, float} \
-                and math.isfinite(raw_score) and not unscored else None
+            raw_score = raw_score if is_finite_score(raw_score) and not unscored else None
             cap_reasons, components = None, None
             try:
                 parsed = json.loads(current.get("score_cap_reasons") or "null")
@@ -467,8 +466,7 @@ def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
         case
         for case in labeled
         if prediction(case).get("tier") in {"A", "B", "C"}
-        and type(prediction(case).get("fit_score")) in {int, float}
-        and math.isfinite(prediction(case)["fit_score"])
+        and is_finite_score(prediction(case).get("fit_score"))
     ]
     ranked = sorted(
         rankable,
@@ -647,8 +645,10 @@ def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
         },
         "ranking": [case["job_uid"] for case in ranked[:20]],
     }
-    # Additive unified 0–3 scale, only when some prediction carries a relevance.
-    if has_relevance(predictions):
+    # Explicit v3 inputs can carry only tags/gates or abstain on relevance entirely.
+    if has_relevance(predictions) or any(case.get("schema") == LABELS_SCHEMA for case in cases) \
+            or any(isinstance(row, dict) and row.get("schema") == PREDICTION_SCHEMA
+                   for row in predictions.values()):
         result["relevance_scale"] = relevance_scale(cases, predictions)
     return result
 
@@ -1285,6 +1285,9 @@ def run_relevance_accuracy(
         config, cases, allow_source_snapshot=allow_source_snapshot,
     )
     versions, classifier_version = _profile_versions(config)
+    if variant == "labels" and versions is None:
+        raise ValueError("Labels evaluation requires the current rules and search profiles "
+                         "to validate $.role_label")
     validated = validate_gold_v3(
         rows, cases, profile_ids=list(versions) if versions is not None else None,
         source_history=read_source_history(config.database_url, cases),
@@ -1311,7 +1314,9 @@ def run_relevance_accuracy(
         from job_intake.annotation.text import source_hash
 
         prediction_rows = read_jsonl(predictions)
-        supplied = check_prediction_rows(prediction_rows)
+        supplied = check_prediction_rows(
+            prediction_rows, profile_ids=list(versions) if versions is not None else None,
+        )
         # A cohort evaluates a subset; predictions for the rest of the gold are set aside.
         outside = sorted(uid for uid in supplied if uid not in records) if cohort else []
         for uid, row in supplied.items():
@@ -1542,33 +1547,28 @@ def accuracy_markdown(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_accuracy_report(
-    report: dict, output: Path, *, protected_paths: list[Path] | None = None
+def accuracy_report_destinations(
+    output: Path, *, protected_paths: list[Path] | None = None,
 ) -> tuple[Path, Path]:
-    """Write atomic JSON and Markdown siblings, validating both destinations first."""
-    output = output.expanduser().resolve()
-    markdown = output.with_suffix(".md")
-    protected = {path.expanduser().resolve() for path in protected_paths or []}
-    if output == markdown or output in protected or markdown in protected:
-        raise ValueError("Accuracy outputs must be distinct and must not overwrite inputs")
-    content = accuracy_markdown(report)
-    json_path = write_report(report, output, protected_paths=list(protected))
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=markdown.parent,
-            prefix=markdown.name + ".",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(markdown)
-    finally:
-        if temporary:
-            temporary.unlink(missing_ok=True)
+    """Pin the parent, protect input aliases, and refuse both occupied final names."""
+    output = output.expanduser()
+    json_path, markdown = report_destinations(
+        [output, output.with_suffix(".md")], protected_paths=protected_paths or [],
+    )
     return json_path, markdown
+
+
+def write_accuracy_report(
+    report: dict, output: Path, *, protected_paths: list[Path] | None = None,
+) -> tuple[Path, Path]:
+    """Publish new JSON and Markdown exclusively, including the saved variant.
+
+    Each file is complete before becoming visible; the pair is not a transaction.
+    A Markdown failure can leave a complete JSON, requiring new paths for retry.
+    """
+    output, markdown = accuracy_report_destinations(output, protected_paths=protected_paths)
+    content = accuracy_markdown(report)
+    json_content = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    write_new_text(output, json_content)
+    write_new_text(markdown, content)
+    return output, markdown

@@ -13,17 +13,21 @@ import copy
 import json
 import re
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
+
+from jsonschema import Draft202012Validator
 
 from job_intake.config.settings import load_yaml_mapping
 from job_intake.labeling.schema import (
-    DOMAIN_REQUIREMENTS,
     INDUSTRIES,
     PREFERRED_FOCUS,
     REASON_MAX,
     RELEVANCE_VALUES,
     TAG_VALUES,
+    prediction_schema,
 )
+from job_intake.utils.identifiers import STREAM_ID_PATTERN
 from job_intake.utils.text import stable_hash
 
 DEFAULT_RUBRIC_PATH = Path("config/labeling_rubric.yaml")
@@ -221,6 +225,16 @@ def precedents_hash(precedents: list[dict]) -> str:
     return _hash(precedents)
 
 
+@cache
+def _precedent_domain_validator() -> Draft202012Validator:
+    """Share domain constraints; precedent source lines replace nested evidence."""
+    schema = prediction_schema()["properties"]["tags"]["properties"]["domain_fit"]
+    schema["required"] = [field for field in schema["required"] if field != "evidence"]
+    for field in ("evidence", "basis"):
+        schema["properties"].pop(field)
+    return Draft202012Validator(schema)
+
+
 def _precedent_errors(row: object, role_ids: set[str] | None) -> str | None:
     if not isinstance(row, dict) or set(row) != _PRECEDENT_FIELDS:
         return "precedent fields must be exactly " + ", ".join(sorted(_PRECEDENT_FIELDS))
@@ -242,19 +256,17 @@ def _precedent_errors(row: object, role_ids: set[str] | None) -> str | None:
             or not {"role_label", "relevance", "function_core"} <= set(labels):
         return "labels need role_label, relevance and function_core; no other fields"
     role = labels["role_label"]
-    if not isinstance(role, str) or (role_ids is not None and role not in role_ids | {"other"}):
+    if not isinstance(role, str) or re.fullmatch(STREAM_ID_PATTERN, role) is None:
+        return "labels.role_label must use the stream ID syntax"
+    if role_ids is not None and role not in role_ids | {"other"}:
         return "labels.role_label must be an enabled stream ID or other"
     if type(labels["relevance"]) is not int or labels["relevance"] not in RELEVANCE_VALUES:
         return "labels.relevance must be an integer 0–3"
     if labels["function_core"] not in TAG_VALUES["function_core"]:
         return "labels.function_core is not a v3 value"
     domain = labels.get("domain_fit", {"requirement": "none", "industry": "other"})
-    if not isinstance(domain, dict) or set(domain) - {
-        "requirement", "industry", "required_domain", "domain",
-    } or domain.get("requirement") not in DOMAIN_REQUIREMENTS \
-            or domain.get("industry") not in INDUSTRIES \
-            or domain.get("required_domain", "other") not in INDUSTRIES:
-        return "labels.domain_fit must use v3 requirement and industry values"
+    if not _precedent_domain_validator().is_valid(domain):
+        return "labels.domain_fit must satisfy the v3 domain constraints"
     focus = labels.get("preferred_focus", [])
     if not isinstance(focus, list) or len(set(map(str, focus))) != len(focus) \
             or any(item not in PREFERRED_FOCUS for item in focus):
@@ -270,6 +282,8 @@ def load_precedents(
 
     Precedents come only from registered calibration or development cohorts, cover
     every relevance value and never carry gold notes. A holdout overlap is refused.
+    Role syntax always follows the shared stream ID grammar; supplied role_ids
+    additionally restrict membership to the enabled taxonomy and other.
     Each later display to a model is recorded by the caller with
     ``cohorts.record_example_exposure``.
     """

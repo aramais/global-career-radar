@@ -25,7 +25,12 @@ from pathlib import Path
 
 import yaml
 
-from job_intake.annotation.eval_runner import read_saved_records, write_report
+from job_intake.annotation.eval_runner import (
+    read_saved_records,
+    report_destinations,
+    write_report,
+    write_text_report,
+)
 from job_intake.config.settings import AppConfig
 from job_intake.models.job import JobRecord
 
@@ -498,26 +503,11 @@ def render_rules_diff_markdown(report: dict) -> str:
 def write_rules_diff_report(
     report: dict, output: Path, *, protected_paths: list[Path],
 ) -> tuple[Path, Path]:
-    """Atomically write both JSON and Markdown, protecting all inputs first."""
-    output = output.expanduser().resolve()
-    markdown = output.with_suffix(".md")
-    protected = {path.expanduser().resolve() for path in protected_paths}
-    if output == markdown or output in protected or markdown in protected:
-        raise ValueError("Rules-diff reports must not overwrite the database or other inputs")
+    """Publish new JSON/Markdown files; the pair is not a filesystem transaction."""
+    output, markdown = report_destinations(
+        [output, output.with_suffix(".md")], protected_paths=protected_paths,
+    )
     summary = render_rules_diff_markdown(report)
     json_path = write_report(report, output, protected_paths=protected_paths + [markdown])
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=markdown.parent, prefix=markdown.name + ".",
-            suffix=".tmp", delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(summary)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(markdown)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    write_text_report(summary, markdown, protected_paths=protected_paths + [output])
     return json_path, markdown

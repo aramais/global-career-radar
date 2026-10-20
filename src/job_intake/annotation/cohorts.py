@@ -6,8 +6,10 @@ import copy
 import fcntl
 import hashlib
 import json
+import os
 import random
 import re
+import tempfile
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -56,13 +58,48 @@ def read_object(path: Path) -> dict:
     return result
 
 
-def write_new(path: Path, value: dict) -> Path:
-    """Exclusive creation prevents an experiment from replacing its own evidence."""
-    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+def write_new_text(path: Path, content: str) -> Path:
+    """Publish complete UTF-8 text exclusively; pre-link failures leave no output.
+
+    The sibling staging file is flushed, fsynced and closed before its hard link
+    becomes visible. Existing lexical paths, including dangling symlinks, and
+    concurrent publications are refused without replacement. Directory entries
+    are not fsynced: this promises atomic visibility, not power-loss durability.
+    A cleanup failure after linking can leave a complete output and its staging
+    link; an existing output is never removed to roll back a reported error.
+    Staging is removed only with verified ownership; unavailable inode identity
+    can leave an orphan rather than risk deleting another process's file.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8") as stream:
-        stream.write(payload + "\n")
+    temporary = None
+    identity = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".",
+            suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            info = os.fstat(stream.fileno())
+            identity = info.st_dev, info.st_ino
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)
+    finally:
+        if temporary is not None and identity is not None:
+            try:
+                info = temporary.lstat()
+                if (info.st_dev, info.st_ino) == identity:
+                    temporary.unlink()
+            except FileNotFoundError:
+                pass
     return path
+
+
+def write_new(path: Path, value: dict) -> Path:
+    """Serialize JSON before creating artifacts, then publish it exclusively."""
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+    return write_new_text(path, payload + "\n")
 
 
 def validate_cohort(manifest: dict) -> dict:

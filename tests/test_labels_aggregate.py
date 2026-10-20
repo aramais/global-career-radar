@@ -106,10 +106,6 @@ def test_result_is_clamped_to_rubric_range():
     ("argenx", "analytics-leadership",
      tags(industry="pharma_biotech", requirement="preferred", required_domain="pharma_biotech"),
      2),
-    # Gold: "minus 2 for required pharma data" — the pharma practice is the industry.
-    ("Tiger Analytics Inc.", "analytics-leadership",
-     tags(industry="pharma_biotech", requirement="required", required_domain="pharma_biotech"),
-     1),
     # Gold: "just analytics in betting".
     ("BVGroup", "analytics-leadership", tags(industry="gaming_betting"), 1),
     # Gold: required esports experience in a disliked industry; the US gate is separate.
@@ -117,8 +113,22 @@ def test_result_is_clamped_to_rubric_range():
      tags(industry="gaming_betting", requirement="required", required_domain="gaming_betting"),
      0),
 ])
-def test_gold_control_cases(company, role, label, expected):
+def test_gold_control_cases_with_explicit_synthetic_tags(company, role, label, expected):
     assert rules_relevance(role, label, RUBRIC, company=company) == expected
+
+
+def test_required_domain_does_not_replace_employer_industry():
+    # These are synthetic facts, not a re-labeling of the historical human decision.
+    consultancy = tags(industry="consulting_outsourcing", requirement="required",
+                       required_domain="pharma_biotech")
+    assert rules_relevance(TARGET, consultancy, RUBRIC, company="Tiger Analytics Inc.") == 0
+    # A genuine preferred focus can upgrade the base before the same domain penalty.
+    consultancy["preferred_focus"]["values"] = ["experimentation_causal"]
+    assert rules_relevance(TARGET, consultancy, RUBRIC, company="Tiger Analytics Inc.") == 1
+    # A pharmaceutical employer is a different fact from a consulting client's domain.
+    pharmaceutical_employer = tags(industry="pharma_biotech", requirement="required",
+                                  required_domain="pharma_biotech")
+    assert rules_relevance(TARGET, pharmaceutical_employer, RUBRIC) == 1
 
 
 def test_proposed_domain_preferences_neither_upgrade_nor_penalize():

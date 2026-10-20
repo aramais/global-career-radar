@@ -173,6 +173,101 @@ def test_precedents_validate_cohort_balance_and_privacy(precedents):
         load_precedents(write(foreign), registry=registry)
 
 
+@pytest.mark.parametrize("role", [
+    "", "  ", "\t", "\n", "new_role\n", "NEW_ROLE", "_bad", "-bad", "bad id", "bad.id",
+    None, 0, False, [], {},
+])
+@pytest.mark.parametrize("with_taxonomy", [False, True])
+def test_registered_precedents_refuse_invalid_role_syntax(precedents, role, with_taxonomy):
+    rows, _, registry, write = precedents
+    invalid = copy.deepcopy(rows)
+    invalid[0]["labels"]["role_label"] = role
+    options = {"role_ids": ["analytics-leadership"]} if with_taxonomy else {}
+    with pytest.raises(RubricError, match=r"invalid_precedent: line 1: labels\.role_label.*syntax"):
+        load_precedents(write(invalid), registry=registry, **options)
+
+
+@pytest.mark.parametrize("role", ["bad id", "new_role\n", "_bad", "Analytics"])
+def test_registered_precedents_refuse_invalid_syntax_even_if_allowlisted(precedents, role):
+    rows, _, registry, write = precedents
+    invalid = copy.deepcopy(rows)
+    invalid[0]["labels"]["role_label"] = role
+    with pytest.raises(RubricError, match=r"invalid_precedent: line 1: labels\.role_label.*syntax"):
+        load_precedents(write(invalid), registry=registry,
+                        role_ids=["analytics-leadership", role])
+
+
+@pytest.mark.parametrize("role", [
+    "analytics-leadership", "new_role", "new--role", "new-role-", "0", "r0", "other",
+])
+@pytest.mark.parametrize("with_taxonomy", [False, True])
+def test_registered_precedents_accept_shared_role_syntax(precedents, role, with_taxonomy):
+    rows, _, registry, write = precedents
+    valid = copy.deepcopy(rows)
+    valid[0]["labels"]["role_label"] = role
+    enabled = ["analytics-leadership", *([] if role == "other" else [role])]
+    options = {"role_ids": enabled} if with_taxonomy else {}
+    assert load_precedents(write(valid), registry=registry, **options) == valid
+
+
+@pytest.mark.parametrize("role", ["new_role", "new--role", "new-role-", "0", "r0"])
+def test_registered_precedents_still_require_enabled_membership_when_supplied(precedents, role):
+    rows, _, registry, write = precedents
+    valid_syntax = copy.deepcopy(rows)
+    valid_syntax[0]["labels"]["role_label"] = role
+    path = write(valid_syntax)
+    assert load_precedents(path, registry=registry) == valid_syntax
+    with pytest.raises(RubricError, match=r"labels\.role_label must be an enabled stream ID"):
+        load_precedents(path, registry=registry, role_ids=["analytics-leadership"])
+
+
+@pytest.mark.parametrize("domain", [
+    {"requirement": "required", "industry": "fintech", "required_domain": "other"},
+    {"requirement": "preferred", "industry": "fintech", "required_domain": "other"},
+    *({"requirement": "required", "industry": "fintech", "required_domain": "other",
+       "domain": value} for value in (None, "", "   ", "x" * 61, [], {"arbitrary": "value"})),
+    {"requirement": "required", "industry": "fintech"},
+    {"requirement": "preferred", "industry": "fintech", "required_domain": None},
+    {"requirement": "required", "industry": "fintech", "required_domain": "unknown"},
+    {"requirement": "none", "industry": "fintech", "required_domain": "fintech"},
+    {"requirement": "none", "industry": "fintech", "required_domain": "other",
+     "domain": "A domain"},
+    {"requirement": "none", "industry": "fintech", "domain": {"arbitrary": "value"}},
+    {"requirement": "none", "industry": "unknown"},
+    {"requirement": "unknown", "industry": "fintech"},
+    {"requirement": "none"},
+    {"industry": "fintech"},
+    {"requirement": "none", "industry": "fintech", "extra": "unexpected"},
+    None,
+])
+def test_registered_precedents_refuse_invalid_domain_facts(precedents, domain):
+    rows, _, registry, write = precedents
+    invalid = copy.deepcopy(rows)
+    invalid[0]["labels"]["domain_fit"] = domain
+    with pytest.raises(RubricError, match=r"invalid_precedent: line 1: labels\.domain_fit"):
+        load_precedents(write(invalid), registry=registry,
+                        role_ids=["analytics-leadership"])
+
+
+@pytest.mark.parametrize("domain", [
+    {"requirement": "none", "industry": "fintech"},
+    {"requirement": "none", "industry": "fintech", "required_domain": None},
+    {"requirement": "preferred", "industry": "fintech", "required_domain": "fintech"},
+    {"requirement": "required", "industry": "consulting_outsourcing",
+     "required_domain": "pharma_biotech"},
+    {"requirement": "preferred", "industry": "fintech", "required_domain": "other",
+     "domain": "A specific domain"},
+    {"requirement": "required", "industry": "fintech", "required_domain": "other",
+     "domain": "x" * 60},
+])
+def test_registered_precedents_preserve_valid_domain_facts(precedents, domain):
+    rows, _, registry, write = precedents
+    valid = copy.deepcopy(rows)
+    valid[0]["labels"]["domain_fit"] = domain
+    assert load_precedents(write(valid), registry=registry,
+                           role_ids=["analytics-leadership"]) == valid
+
+
 def test_precedents_from_holdout_are_refused(tmp_path, precedents, monkeypatch):
     rows, _, _, write = precedents
     holdout = tmp_path / "holdout.jsonl"

@@ -17,17 +17,23 @@ from job_intake.annotation.cohorts import (
     read_object,
     select_cases,
     write_new,
+    write_new_text,
 )
 from job_intake.annotation.eval_runner import read_saved_records
 from job_intake.annotation.gold import validate_gold
 from job_intake.annotation.text import source_hash
 from job_intake.config.settings import AppConfig
 from job_intake.labeling.metrics import has_relevance
+from job_intake.labeling.numeric import is_finite_score
+from job_intake.labeling.schema import LABELS_SCHEMA
 from job_intake.models.job import JobRecord, JobStatus
 
 BUNDLE_SCHEMA = "frozen-evaluation-v1"
 RUN_SCHEMA = "frozen-evaluation-run-v1"
+TASK_METRICS_VERSION = "frozen-task-metrics-v2"
+LEGACY_TASK_METRICS_VERSION = "frozen-task-metrics-v1"
 GATE_VERSION = "audit-quality-gates-v2"
+GATE_COVERAGE_VERSION = "frozen-gate-coverage-v1"
 DEFAULT_POLICY = {
     "version": GATE_VERSION,
     "minimum_cases": 160,
@@ -237,12 +243,29 @@ def load_bundle(path: Path) -> dict:
 
 
 def task_metrics(
-    cases: list[dict], predictions: dict[str, dict], *, random_seed: int = 1729
+    cases: list[dict], predictions: dict[str, dict], *, random_seed: int = 1729,
+    version: str = TASK_METRICS_VERSION,
+    relevance_scale_version: str | None = None,
 ) -> dict:
-    """Profession and hiring are orthogonal; rejecting inaccessible jobs is not role loss."""
+    """Measure independent tasks; v1 only replays immutable historical runs."""
+    if not isinstance(version, str) or version not in {
+        TASK_METRICS_VERSION, LEGACY_TASK_METRICS_VERSION,
+    }:
+        raise ValueError(f"Unsupported frozen task metrics version: {version}")
     result = evaluate_vacancies(cases, predictions)
+    result["task_metrics_version"] = version
+    if relevance_scale_version is not None and "relevance_scale" in result:
+        from job_intake.labeling.metrics import relevance_scale
+
+        result["relevance_scale"] = relevance_scale(
+            cases, predictions, version=relevance_scale_version,
+        )
     labeled = [row for row in cases if type(row.get("relevance")) is int]
     relevant = [row for row in labeled if row["relevance"] >= 2]
+    role_relevant = relevant if version == LEGACY_TASK_METRICS_VERSION else [
+        row for row in relevant
+        if isinstance(row.get("role_label"), str) and row["role_label"].strip()
+    ]
     available = [row for row in relevant if row.get("gate_outcome") == "eligible"]
     unavailable = [row for row in cases if row.get("gate_outcome") == "ineligible"]
     eligible = [row for row in cases if row.get("gate_outcome") == "eligible"]
@@ -260,8 +283,8 @@ def task_metrics(
     selected = [row for row in labeled if actionable(row)]
     result["independent_axes"] = {
         "role_recall": proportion(
-            sum(pred(row).get("role_label") == row.get("role_label") for row in relevant),
-            len(relevant),
+            sum(pred(row).get("role_label") == row.get("role_label") for row in role_relevant),
+            len(role_relevant),
         ),
         "actionable_p1_recall": proportion(sum(map(actionable, available)), len(available)),
         "actionable_p1_precision": proportion(
@@ -283,8 +306,7 @@ def task_metrics(
     ranked = [
         row
         for row in rank_cases
-        if type(pred(row).get("fit_score")) in {int, float}
-        and math.isfinite(pred(row)["fit_score"])
+        if is_finite_score(pred(row).get("fit_score"))
         and pred(row).get("tier") in {"A", "B", "C"}
     ]
     ranked.sort(
@@ -324,6 +346,29 @@ def task_metrics(
     return result
 
 
+def _bundle_uses_v3_labels(bundle: dict) -> bool:
+    return any(row["label"].get("schema") == LABELS_SCHEMA for row in bundle["rows"])
+
+
+def _is_v3_prediction(row: dict) -> bool:
+    # These discriminators belong to v3 rows, regardless of the experiment name.
+    # Legacy frozen predictions may already carry relevance, so it is not enough.
+    return bool({"schema", "labeler", "variant"} & row.keys())
+
+
+def _validate_v3_predictions(bundle: dict, predictions: list[dict], *, variant: str) -> None:
+    from job_intake.labeling.predictions import check_prediction_rows
+
+    if any(not isinstance(row, dict) for row in predictions):
+        raise ValueError("Prediction rows must be objects")
+    # A v3 bundle requires normalized v3 outputs for every experiment. Legacy
+    # bundles can also receive v3 rows: their own discriminators trigger checking.
+    requires_v3 = _bundle_uses_v3_labels(bundle) or variant in {"labels", "rules"}
+    check_prediction_rows([
+        row for row in predictions if requires_v3 or _is_v3_prediction(row)
+    ])
+
+
 def create_run(
     bundle: dict,
     *,
@@ -348,6 +393,7 @@ def create_run(
         ]
     if not isinstance(predictions, list):
         raise ValueError("Predictions must be an array")
+    _validate_v3_predictions(bundle, predictions, variant=variant)
     seen = set()
     for row in predictions:
         uid = row.get("job_uid")
@@ -438,8 +484,19 @@ def validate_run(bundle: dict, run: dict) -> None:
         for uid, row in predictions.items()
     ):
         raise ValueError("Run predictions do not bind to frozen sources")
-    computed = task_metrics([row["label"] for row in bundle["rows"]], predictions)
     recorded = run.get("evaluation")
+    scale = recorded.get("relevance_scale") if isinstance(recorded, dict) else None
+    scale_version = scale.get("version") if isinstance(scale, dict) else None
+    # A recorded metrics version selects numeric replay, never a validation bypass.
+    _validate_v3_predictions(bundle, list(predictions.values()), variant=run["variant"])
+    computed = task_metrics(
+        [row["label"] for row in bundle["rows"]], predictions,
+        version=_recorded_task_metrics_version(run),
+        relevance_scale_version=scale_version,
+    )
+    # An absent marker identifies the original formula; never upgrade saved evidence.
+    if isinstance(recorded, dict) and "task_metrics_version" not in recorded:
+        computed.pop("task_metrics_version")
     # Additive route coverage is independently recomputable from frozen outputs.
     # Keep old immutable v1 reports valid without changing their recorded metrics.
     if (
@@ -456,6 +513,130 @@ def validate_run(bundle: dict, run: dict) -> None:
         raise ValueError("Run metrics disagree with recorded outputs")
 
 
+def _recorded_task_metrics_version(run: dict) -> str:
+    recorded = run.get("evaluation")
+    if not isinstance(recorded, dict):
+        raise ValueError("Run metrics disagree with recorded outputs")
+    return recorded.get("task_metrics_version", LEGACY_TASK_METRICS_VERSION)
+
+
+def _gate_prediction_coverage(cases: list[dict], predictions: dict[str, dict], *,
+                              version: str) -> dict[str, dict]:
+    """Comparison-only coverage of each metric's own human sample and inputs.
+
+    Historical task metrics remain immutable. Their shared accuracy coverage uses
+    complete human decisions, which is narrower than several independent tasks.
+    """
+    from job_intake.annotation.accuracy import _NEGATIVES, _value
+    from job_intake.annotation.gold import TAG_VALUES
+
+    gates = {"eligible", "ineligible", "unknown"}
+    labeled = [row for row in cases if type(row.get("relevance")) is int]
+    relevant = [row for row in labeled if row["relevance"] >= 2]
+    role_relevant = relevant if version == LEGACY_TASK_METRICS_VERSION else [
+        row for row in relevant
+        if isinstance(row.get("role_label"), str) and row["role_label"].strip()
+    ]
+
+    def pred(row: dict) -> dict:
+        return predictions.get(row["job_uid"], {})
+
+    def role(row: dict) -> bool:
+        value = pred(row).get("role_label")
+        return isinstance(value, str) and bool(value.strip())
+
+    def gate(row: dict) -> bool:
+        return pred(row).get("gate_outcome") in gates
+
+    def tag(row: dict, name: str) -> bool:
+        return _value(pred(row).get("tags", {}).get(name)) in TAG_VALUES[name]
+
+    def coverage(rows: list[dict], present) -> dict:
+        return proportion(sum(present(row) for row in rows), len(rows))
+
+    result = {
+        "profession_accuracy": coverage(
+            [row for row in cases if isinstance(row.get("role_label"), str)], role),
+        "eligibility_accuracy": coverage(
+            [row for row in cases if row.get("gate_outcome") in gates], gate),
+        "role_recall": coverage(role_relevant, role),
+        "actionable_p1_recall": coverage(
+            [row for row in relevant if row.get("gate_outcome") == "eligible"],
+            lambda row: gate(row) and pred(row).get("decision") in {"pass", "review", "reject"}
+            and pred(row).get("tier") in {"A", "B", "C"}),
+        "blocker_recall": coverage(
+            [row for row in cases if row.get("gate_outcome") == "ineligible"], gate),
+        "false_block_rate": coverage(
+            [row for row in cases if row.get("gate_outcome") == "eligible"], gate),
+    }
+    ranking = coverage(
+        [row for row in labeled if row.get("role_label") != "other"],
+        lambda row: pred(row).get("tier") in {"A", "B", "C"}
+        and is_finite_score(pred(row).get("fit_score")),
+    )
+    result.update({f"ndcg@{k}": ranking for k in (5, 10)})
+    for name in ("project_management", "people_interaction", "decision_influence"):
+        result["scope." + name] = coverage(
+            [row for row in cases if _value(row.get("tags", {}).get(name)) is not None],
+            lambda row, name=name: tag(row, name),
+        )
+    negative_pairs = [(row, name) for row in cases for name, values in _NEGATIVES.items()
+                      if _value(row.get("tags", {}).get(name)) in values]
+    result["negative_restriction_recall"] = proportion(
+        sum(tag(row, name) for row, name in negative_pairs), len(negative_pairs),
+    )
+    return result
+
+
+def _repeat_prediction_coverage(cases: list[dict], predictions: dict[str, dict]) -> dict:
+    """Observed human axes only; identical abstentions do not prove repeatability.
+
+    Legacy outputs need no ordinal field, but an explicit relevance or v3 record
+    must cover a known human relevance. Unlabeled tags are never required.
+    """
+    from job_intake.annotation.accuracy import _value
+    from job_intake.annotation.gold import TAG_VALUES as LEGACY_TAG_VALUES
+    from job_intake.labeling.metrics import _focus_values
+    from job_intake.labeling.schema import DOMAIN_REQUIREMENTS, INDUSTRIES, TAG_VALUES
+
+    observations = []
+    for row in cases:
+        predicted = predictions.get(row["job_uid"], {})
+        if isinstance(row.get("role_label"), str):
+            value = predicted.get("role_label")
+            observations.append(isinstance(value, str) and bool(value.strip()))
+        if row.get("gate_outcome") in {"eligible", "ineligible", "unknown"}:
+            observations.append(predicted.get("gate_outcome") in
+                                {"eligible", "ineligible", "unknown"})
+        if type(row.get("relevance")) is int and (
+            row.get("schema") == LABELS_SCHEMA or _is_v3_prediction(predicted)
+            or "relevance" in predicted
+        ):
+            value = predicted.get("relevance")
+            observations.append(type(value) is int and value in range(4))
+        human_tags, machine_tags = row.get("tags", {}), predicted.get("tags", {})
+        if row.get("schema") != LABELS_SCHEMA:
+            for name, label in human_tags.items():
+                if name in LEGACY_TAG_VALUES and _value(label) is not None:
+                    observations.append(_value(machine_tags.get(name)) in LEGACY_TAG_VALUES[name])
+            continue
+        for name, values in TAG_VALUES.items():
+            if _value(human_tags.get(name)) is not None:
+                observations.append(_value(machine_tags.get(name)) in values)
+        domain = human_tags.get("domain_fit", {})
+        machine_domain = machine_tags.get("domain_fit", {})
+        for field, values in (("requirement", DOMAIN_REQUIREMENTS), ("industry", INDUSTRIES)):
+            if domain.get(field) is not None:
+                observations.append(machine_domain.get(field) in values)
+        if domain.get("requirement") in {"preferred", "required"}:
+            observations.append(machine_domain.get("requirement") == "none" or (
+                machine_domain.get("requirement") in {"preferred", "required"}
+                and machine_domain.get("required_domain") in INDUSTRIES))
+        if _focus_values(human_tags.get("preferred_focus")) is not None:
+            observations.append(_focus_values(machine_tags.get("preferred_focus")) is not None)
+    return proportion(sum(observations), len(observations))
+
+
 def compare_runs(
     bundle: dict,
     baseline: dict,
@@ -466,11 +647,19 @@ def compare_runs(
 ) -> dict:
     for run in (baseline, candidate, *([repeat] if repeat else [])):
         validate_run(bundle, run)
+    versions = {
+        _recorded_task_metrics_version(run)
+        for run in (baseline, candidate, *([repeat] if repeat else []))
+    }
+    if len(versions) != 1:
+        raise ValueError("Cannot compare runs with different frozen task metrics versions")
+    metrics_version = versions.pop()
     baseline, candidate = copy.deepcopy(baseline), copy.deepcopy(candidate)
     repeat = copy.deepcopy(repeat) if repeat else None
     for run in (baseline, candidate, *([repeat] if repeat else [])):
         run["evaluation"] = task_metrics(
-            [row["label"] for row in bundle["rows"]], run["predictions"]
+            [row["label"] for row in bundle["rows"]], run["predictions"],
+            version=metrics_version,
         )
     if baseline["run_id"] == candidate["run_id"]:
         raise ValueError("Baseline/candidate require separate recorded runs")
@@ -479,13 +668,18 @@ def compare_runs(
     policy = bundle["gate_policy"]
     independent = independent_holdout(bundle.get("cohort"), log=exposure_log)
     gates = []
+    cases = [row["label"] for row in bundle["rows"]]
+    prediction_coverage = {
+        name: _gate_prediction_coverage(cases, run["predictions"], version=metrics_version)
+        for name, run in (("baseline", baseline), ("candidate", candidate), ("repeat", repeat))
+        if run is not None
+    }
 
     def gate(
         name: str,
         before: dict,
         after: dict,
         *,
-        coverage: list[str],
         lower: bool = False,
         tolerance: float | None = None,
         minimum: int | None = None,
@@ -501,10 +695,14 @@ def compare_runs(
             or before.get("value") is None
             or after.get("value") is None
             or any(
-                run["evaluation"]["task_prediction_coverage"][task]["numerator"]
-                != run["evaluation"]["task_prediction_coverage"][task]["denominator"]
-                for run in (baseline, candidate)
-                for task in coverage
+                prediction_coverage[run][name]["numerator"]
+                != prediction_coverage[run][name]["denominator"]
+                for run in ("baseline", "candidate")
+            )
+            or any(
+                "required_n" in metric and (metric.get("status") != "measured"
+                                            or metric.get("prediction_n") != metric["required_n"])
+                for metric in (before, after)
             )
         ):
             status = "insufficient_evidence"
@@ -525,11 +723,13 @@ def compare_runs(
                 "candidate": after,
                 "N": n,
                 "minimum_cases": required,
+                "prediction_coverage": {
+                    run: prediction_coverage[run][name] for run in ("baseline", "candidate")
+                },
             }
         )
 
     before, after = baseline["evaluation"], candidate["evaluation"]
-    cases = [row["label"] for row in bundle["rows"]]
     for name, observed, minimum in (
         ("human_decisions", after["counts"]["decision_labeled"], policy["minimum_cases"]),
         ("human_relevant", after["counts"]["relevant"], policy.get("minimum_relevant", 0)),
@@ -567,24 +767,17 @@ def compare_runs(
         "profession_accuracy",
         before["role_classification"]["accuracy"],
         after["role_classification"]["accuracy"],
-        coverage=["role_classification"],
     )
     gate(
         "eligibility_accuracy",
         before["eligibility"]["accuracy"],
         after["eligibility"]["accuracy"],
-        coverage=["eligibility"],
     )
     for name in ("role_recall", "actionable_p1_recall", "blocker_recall", "false_block_rate"):
         gate(
             name,
             before["independent_axes"][name],
             after["independent_axes"][name],
-            coverage=["role_classification"]
-            if name == "role_recall"
-            else ["eligibility", "decision", "ranking"]
-            if name == "actionable_p1_recall"
-            else ["eligibility", "decision"],
             lower=name == "false_block_rate",
             tolerance=policy["maximum_false_block_increase"]
             if name == "false_block_rate"
@@ -598,23 +791,12 @@ def compare_runs(
             "scope." + tag,
             before["tags"][tag]["accuracy"],
             after["tags"][tag]["accuracy"],
-            coverage=["tags." + tag],
             minimum=policy.get("minimum_full_tag_cases", policy["minimum_cases"]),
         )
     gate(
         "negative_restriction_recall",
         before["negative_restrictions"]["recall"],
         after["negative_restrictions"]["recall"],
-        coverage=[
-            "tags." + tag
-            for tag in (
-                "hiring_geography",
-                "work_mode",
-                "working_language",
-                "work_authorization",
-                "vacancy_closed",
-            )
-        ],
         minimum=policy.get("minimum_blind_cases", policy["minimum_cases"]),
     )
     for k in (5, 10):
@@ -624,7 +806,6 @@ def compare_runs(
             name,
             {**old, "ideal_dcg": old["denominator"], "denominator": old["required_n"]},
             {**new, "ideal_dcg": new["denominator"], "denominator": new["required_n"]},
-            coverage=["ranking"],
             minimum=policy.get("minimum_blind_cases", policy["minimum_cases"]),
         )
     for name, field, ratio in (
@@ -676,7 +857,12 @@ def compare_runs(
         from job_intake.annotation.accuracy import compare_stability
 
         stability = compare_stability(candidate["predictions"], repeat["predictions"])
-        if has_relevance(candidate["predictions"]) or has_relevance(repeat["predictions"]):
+        if _bundle_uses_v3_labels(bundle) or any(
+            has_relevance(run["predictions"])
+            or run["variant"] in {"labels", "rules"}
+            or any(_is_v3_prediction(row) for row in run["predictions"].values())
+            for run in (candidate, repeat)
+        ):
             from job_intake.labeling.metrics import compare_stability as labels_stability
 
             stability["labels_v3"] = labels_stability(candidate["predictions"],
@@ -684,6 +870,15 @@ def compare_runs(
         expected = {row["job_uid"] for row in bundle["rows"]}
         comparable = set(candidate["predictions"]) & set(repeat["predictions"])
         complete = comparable == expected and len(expected) >= policy["minimum_cases"]
+        repeat_coverage = {
+            name: _repeat_prediction_coverage(cases, run["predictions"])
+            for name, run in (("candidate", candidate), ("repeat", repeat))
+        }
+        complete = complete and all(
+            metric["numerator"] == metric["denominator"]
+            for name in ("candidate", "repeat")
+            for metric in (*prediction_coverage[name].values(), repeat_coverage[name])
+        )
         # Legacy predictions carry no relevance, so its comparison is None == None for them.
         fields = ("role_label", "gate_outcome", "decision", "tier", "fit_score", "tags", "route",
                   "relevance")
@@ -702,6 +897,7 @@ def compare_runs(
             else "insufficient_evidence"
         )
         stability["exact_repeat_agreement"] = proportion(unchanged, len(expected))
+        stability["human_prediction_coverage"] = repeat_coverage
     gates.append(
         {
             "name": "repeat_run_stability",
@@ -726,6 +922,8 @@ def compare_runs(
     )
     result = {
         "schema": "frozen-quality-comparison-v1",
+        "task_metrics_version": metrics_version,
+        "gate_coverage_version": GATE_COVERAGE_VERSION,
         "bundle_id": bundle["bundle_id"],
         "gate_policy": policy,
         "baseline_run": baseline["run_hash"],
@@ -815,9 +1013,10 @@ def comparison_markdown(report: dict) -> str:
 
 def write_comparison_report(report: dict, path: Path) -> tuple[Path, Path]:
     markdown = path.with_suffix(".md")
-    if path.suffix != ".json" or path.exists() or markdown.exists():
+    if path.suffix != ".json" or any(
+        target.exists() or target.is_symlink() for target in (path, markdown)
+    ):
         raise ValueError("Use new JSON and Markdown report destinations")
     write_new(path, report)
-    with markdown.open("x", encoding="utf-8") as stream:
-        stream.write(comparison_markdown(report))
+    write_new_text(markdown, comparison_markdown(report))
     return path, markdown

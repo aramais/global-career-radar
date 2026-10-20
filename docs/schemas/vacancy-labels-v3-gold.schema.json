@@ -26,15 +26,19 @@
     },
     "job_uid": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "source_hash": {
       "type": "string",
-      "pattern": "^[0-9a-f]{64}$"
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
     },
     "text_version": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "source": {
       "type": "object",
@@ -183,7 +187,8 @@
         "string",
         "null"
       ],
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "first_labeled_at": {
       "anyOf": [
@@ -227,10 +232,14 @@
         "string",
         "null"
       ],
-      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "pattern": "^[a-z0-9][a-z0-9_-]*(?![\\s\\S])",
       "description": "An enabled search_profiles stream ID or other; checked against the current role taxonomy by the validator."
     },
     "relevance": {
+      "type": [
+        "integer",
+        "null"
+      ],
       "enum": [
         0,
         1,
@@ -290,7 +299,35 @@
                 "implied"
               ]
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "value"
+                ],
+                "properties": {
+                  "value": {
+                    "enum": [
+                      "restricted_elsewhere"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": "explicit"
+                  },
+                  "quote": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  }
+                }
+              }
+            }
+          ]
         },
         "work_mode": {
           "type": "object",
@@ -311,6 +348,8 @@
             },
             "office_location": {
               "type": "string",
+              "minLength": 1,
+              "pattern": "\\S",
               "maxLength": 80
             },
             "quote": {
@@ -322,7 +361,35 @@
                 "implied"
               ]
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "value"
+                ],
+                "properties": {
+                  "value": {
+                    "enum": [
+                      "office_elsewhere"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": "explicit"
+                  },
+                  "quote": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  }
+                }
+              }
+            }
+          ]
         },
         "working_language": {
           "type": "object",
@@ -351,7 +418,36 @@
                 "implied"
               ]
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "value"
+                ],
+                "properties": {
+                  "value": {
+                    "enum": [
+                      "other_language_required",
+                      "portuguese_only"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": "explicit"
+                  },
+                  "quote": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  }
+                }
+              }
+            }
+          ]
         },
         "function_core": {
           "type": "object",
@@ -441,6 +537,7 @@
             "domain": {
               "type": "string",
               "minLength": 1,
+              "pattern": "\\S",
               "maxLength": 60
             },
             "quote": {
@@ -497,7 +594,50 @@
                 "type": "null"
               }
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "required_domain"
+                ],
+                "properties": {
+                  "required_domain": {
+                    "const": "other"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "domain"
+                ]
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "requirement"
+                ],
+                "properties": {
+                  "requirement": {
+                    "const": "required"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": "explicit"
+                  },
+                  "quote": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  }
+                }
+              }
+            }
+          ]
         },
         "preferred_focus": {
           "type": "object",
@@ -536,5 +676,123 @@
     "notes": {
       "type": "string"
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "gate_outcome"
+        ],
+        "properties": {
+          "gate_outcome": {
+            "const": "eligible"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "gate_reasons": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "anyOf": [
+          {
+            "required": [
+              "tags"
+            ],
+            "properties": {
+              "tags": {
+                "minProperties": 1
+              }
+            }
+          },
+          {
+            "required": [
+              "gate_reasons"
+            ],
+            "properties": {
+              "gate_reasons": {
+                "minItems": 1
+              }
+            }
+          },
+          {
+            "required": [
+              "role_label"
+            ],
+            "properties": {
+              "role_label": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          {
+            "required": [
+              "relevance"
+            ],
+            "properties": {
+              "relevance": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          {
+            "required": [
+              "gate_outcome"
+            ],
+            "properties": {
+              "gate_outcome": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "properties": {
+          "method": {
+            "enum": [
+              "blind",
+              "curated",
+              "assisted_llm"
+            ]
+          },
+          "first_labeled_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "string",
+                "format": "date-time"
+              }
+            ]
+          },
+          "labeled_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "string",
+                "format": "date-time"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
 }

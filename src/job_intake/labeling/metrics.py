@@ -1,9 +1,10 @@
 """Unified 0–3 relevance metrics for human gold and any machine labeler.
 
-Only cases with an integer human relevance enter. A missing prediction stays in the
-denominator of coverage, exact/±1 agreement, the confusion matrix and recall; the
-ordinal statistics (MAE, QWK, Spearman) are computed on covered pairs and report
-their own N. All shares use ``accuracy.proportion`` with a Wilson interval.
+Ordinal and ranking metrics use cases with an integer human relevance. Tags and
+gates use their own human-labeled cases, including partial gold rows. A missing
+prediction stays in the denominator of coverage, exact/±1 agreement, recall and
+P@k; MAE, QWK and Spearman use covered pairs and report their own N. All shares use
+``accuracy.proportion`` with a Wilson interval.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import math
 import random
 from collections import Counter
 
+from job_intake.labeling.numeric import is_finite_score
 from job_intake.labeling.schema import (
     CONFIDENCE,
     DOMAIN_REQUIREMENTS,
@@ -22,7 +24,8 @@ from job_intake.labeling.schema import (
     TAG_VALUES,
 )
 
-METRICS_VERSION = "relevance-scale-v1"
+METRICS_VERSION = "relevance-scale-v2"
+LEGACY_METRICS_VERSION = "relevance-scale-v1"
 _GATE_ORDER = {"eligible": 0, "unknown": 1, "ineligible": 2}
 _CONFIDENCE_ORDER = {value: index for index, value in enumerate(CONFIDENCE)}
 _RANDOM_SEED = 1729
@@ -91,9 +94,9 @@ def spearman(pairs: list[tuple[int, int]]) -> float | None:
 def queue_order(rows: list[tuple[str, dict]]) -> list[str]:
     """Review queue: relevance ↓, gate eligible → unknown → ineligible, confidence ↓,
     fit_score ↓, job_uid. Rows without an integer relevance are not queued."""
-    def score(row: dict) -> float:
+    def score(row: dict) -> int | float:
         value = row.get("fit_score")
-        return -value if type(value) in {int, float} and math.isfinite(value) else math.inf
+        return -value if is_finite_score(value) else math.inf
 
     queued = [(uid, row) for uid, row in rows if _relevance(row) is not None]
     queued.sort(key=lambda item: (
@@ -127,12 +130,33 @@ def _class_metrics(pairs: list[tuple[str, str | None]], classes: list[str]) -> d
 
 
 def _tag_field(row: dict, tag: str, field: str) -> str | None:
-    label = row.get("tags", {}).get(tag) if isinstance(row.get("tags"), dict) else None
+    label = _tag_label(row, tag)
     value = label.get(field) if isinstance(label, dict) else None
+    if tag == "domain_fit" and field == "required_domain" and (
+        not isinstance(label, dict) or label.get("requirement") not in {"preferred", "required"}
+    ):
+        return None
     return value if isinstance(value, str) else None
 
 
-def _tag_metrics(cases: list[dict], predictions: dict[str, dict]) -> dict:
+def _tag_label(row: dict, tag: str) -> dict | None:
+    tags = row.get("tags") if isinstance(row, dict) else None
+    label = tags.get(tag) if isinstance(tags, dict) else None
+    return label if isinstance(label, dict) else None
+
+
+def _focus_values(label: dict | None) -> set[str] | None:
+    """Keep a valid empty set distinct from a missing or malformed prediction."""
+    values = label.get("values") if isinstance(label, dict) else None
+    if not isinstance(values, list) or any(
+        not isinstance(value, str) or value not in PREFERRED_FOCUS for value in values
+    ) or len(set(values)) != len(values):
+        return None
+    return set(values)
+
+
+def _tag_metrics(cases: list[dict], predictions: dict[str, dict], *, legacy: bool = False
+                 ) -> dict:
     """Human-labeled v3 tags only; other gold schemas use different tag enums."""
     from job_intake.annotation.accuracy import proportion
 
@@ -141,6 +165,9 @@ def _tag_metrics(cases: list[dict], predictions: dict[str, dict]) -> dict:
         ("domain_fit.requirement", "domain_fit", "requirement", list(DOMAIN_REQUIREMENTS)),
         ("domain_fit.industry", "domain_fit", "industry", list(INDUSTRIES)),
     ]
+    if not legacy:
+        fields.append(("domain_fit.required_domain", "domain_fit", "required_domain",
+                       list(INDUSTRIES)))
     result = {}
     for name, tag, field, classes in fields:
         pairs = [
@@ -150,17 +177,22 @@ def _tag_metrics(cases: list[dict], predictions: dict[str, dict]) -> dict:
         result[name] = {"N": len(pairs), **_class_metrics(pairs, classes)}
     tp = fp = fn = exact = covered = n = 0
     for case in v3:
-        label = case.get("tags", {}).get("preferred_focus")
-        if not isinstance(label, dict) or not isinstance(label.get("values"), list):
+        label = _tag_label(case, "preferred_focus")
+        gold = set(label["values"]) if legacy and isinstance(label, dict) \
+            and isinstance(label.get("values"), list) else _focus_values(label)
+        if gold is None:
             continue
         n += 1
-        gold = set(label["values"])
-        predicted_label = predictions.get(case["job_uid"], {}).get("tags", {}).get(
-            "preferred_focus")
-        predicted = predicted_label.get("values") if isinstance(predicted_label, dict) else None
-        covered += isinstance(predicted, list)
-        predicted = set(predicted) if isinstance(predicted, list) else set()
-        exact += isinstance(predicted_label, dict) and gold == predicted
+        predicted_label = _tag_label(predictions.get(case["job_uid"], {}), "preferred_focus")
+        if legacy:
+            values = predicted_label.get("values") if isinstance(predicted_label, dict) else None
+            predicted = set(values) if isinstance(values, list) else None
+        else:
+            predicted = _focus_values(predicted_label)
+        covered += predicted is not None
+        exact += (isinstance(predicted_label, dict) if legacy else predicted is not None) \
+            and gold == (predicted if predicted is not None else set())
+        predicted = predicted if predicted is not None else set()
         tp += len(gold & predicted)
         fp += len(predicted - gold)
         fn += len(gold - predicted)
@@ -191,13 +223,18 @@ def _ndcg(cases: list[dict], ranked: list[dict], k: int, baselines: list[list[di
     }
 
 
-def relevance_scale(cases: list[dict], predictions: dict[str, dict]) -> dict:
-    """Only cases with int relevance; a missing prediction is an error in the denominator."""
+def relevance_scale(
+    cases: list[dict], predictions: dict[str, dict], *, version: str = METRICS_VERSION,
+) -> dict:
+    """Measure each human-labeled axis; v1 exists only to verify immutable old runs."""
     from job_intake.annotation.accuracy import proportion
 
-    labeled = [case for case in cases
-               if isinstance(case, dict) and isinstance(case.get("job_uid"), str)
-               and _relevance(case) is not None]
+    if version not in {METRICS_VERSION, LEGACY_METRICS_VERSION}:
+        raise ValueError(f"Unsupported relevance metrics version: {version}")
+    legacy = version == LEGACY_METRICS_VERSION
+    cases = [case for case in cases if isinstance(case, dict)
+             and isinstance(case.get("job_uid"), str)]
+    labeled = [case for case in cases if _relevance(case) is not None]
     n = len(labeled)
 
     def predicted(case: dict) -> int | None:
@@ -227,12 +264,20 @@ def relevance_scale(cases: list[dict], predictions: dict[str, dict]) -> dict:
     precision_at, ndcg_at = {}, {}
     for k in (5, 10):
         top = ranked[:k]
+        required = min(k, n)
+        if legacy:
+            status = "not_applicable" if not top else "measured" if len(top) == k else "partial"
+        else:
+            status = "not_applicable" if not required else \
+                "measured" if len(top) == required else "partial"
         precision_at[str(k)] = {
-            **proportion(sum(case["relevance"] >= 2 for case in top), len(top)), "k": k,
-            "status": "not_applicable" if not top else "measured" if len(top) == k else "partial",
+            **proportion(sum(case["relevance"] >= 2 for case in top),
+                         len(top) if legacy else required), "k": k,
+            "status": status,
         }
         ndcg_at[str(k)] = _ndcg(labeled, ranked, k, baselines)
-    gated = [case for case in labeled if case.get("gate_outcome") in _GATE_ORDER]
+    axis_cases = labeled if legacy else cases
+    gated = [case for case in axis_cases if case.get("gate_outcome") in _GATE_ORDER]
 
     def gate(case: dict) -> object:
         return predictions.get(case["job_uid"], {}).get("gate_outcome")
@@ -240,7 +285,7 @@ def relevance_scale(cases: list[dict], predictions: dict[str, dict]) -> dict:
     blockers = [case for case in gated if case["gate_outcome"] == "ineligible"]
     eligible = [case for case in gated if case["gate_outcome"] == "eligible"]
     return {
-        "version": METRICS_VERSION,
+        "version": version,
         "N": n,
         "coverage": proportion(len(pairs), n),
         "exact": proportion(sum(gold == value for gold, value in pairs), n),
@@ -267,7 +312,7 @@ def relevance_scale(cases: list[dict], predictions: dict[str, dict]) -> dict:
         "ndcg_at": {**ndcg_at, "random_seed": _RANDOM_SEED, "random_repeats": _RANDOM_REPEATS},
         "queue_order": ("relevance desc, gate eligible>unknown>ineligible, confidence desc, "
                         "fit_score desc, job_uid"),
-        "tags": _tag_metrics(labeled, predictions),
+        "tags": _tag_metrics(axis_cases, predictions, legacy=legacy),
         "gate": {
             "N": len(gated),
             "blocker_recall": proportion(sum(gate(case) == "ineligible" for case in blockers),
@@ -284,28 +329,28 @@ def _stability_value(row: dict, field: str) -> str | int | None:
     if field == "relevance":
         return _relevance(row)
     tag, _, part = field.partition(".")
-    label = row.get("tags", {}).get(tag) if isinstance(row.get("tags"), dict) else None
+    label = _tag_label(row, tag)
     if not isinstance(label, dict):
         return None
     if tag == "preferred_focus":
-        values = label.get("values")
-        return ",".join(sorted(map(str, values))) if isinstance(values, list) else None
-    value = label.get(part or "value")
-    return value if isinstance(value, str) else None
+        values = _focus_values(label)
+        return ",".join(sorted(values)) if values is not None else None
+    return _tag_field(row, tag, part or "value")
 
 
 def compare_stability(run_a: dict[str, dict], run_b: dict[str, dict]) -> dict:
     """Cohen's kappa between two v3 prediction runs: relevance and each of the 6 tags.
 
-    ``domain_fit`` is compared by requirement and industry; ``preferred_focus`` by the
-    exact set. Only pairs present in both runs count; a single category has undefined
-    kappa. Callers establish that the runs are independent and source-matched.
+    ``domain_fit`` is compared by requirement, industry and applicable required_domain;
+    requirement=none has no required_domain observation. ``preferred_focus`` uses its
+    exact set. Only valid pairs present in both runs count; a single category has
+    undefined kappa. Callers establish that runs are independent and source-matched.
     """
     from job_intake.annotation.accuracy import proportion
 
     uids = sorted(set(run_a) | set(run_b))
     fields = ["relevance", *TAG_VALUES, "domain_fit.requirement", "domain_fit.industry",
-              "preferred_focus"]
+              "domain_fit.required_domain", "preferred_focus"]
     results = {}
     for field in fields:
         pairs = [(_stability_value(run_a.get(uid, {}), field),

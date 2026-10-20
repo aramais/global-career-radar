@@ -756,7 +756,11 @@ def eval_accuracy(
     ] = None,
 ) -> None:
     """Measure a baseline or v3 predictions against human labels without API calls or DB writes."""
-    from job_intake.annotation.accuracy import run_accuracy, write_accuracy_report
+    from job_intake.annotation.accuracy import (
+        accuracy_report_destinations,
+        run_accuracy,
+        write_accuracy_report,
+    )
 
     output = output or Path(f"data/local/eval/accuracy-{variant}.json")
     try:
@@ -765,7 +769,7 @@ def eval_accuracy(
             settings, config, gold, prices or settings.rules_path.parent / "eval_prices.yaml",
             log, cohort, predictions,
         )
-        _eval_destinations([output, output.with_suffix(".md")], protected)
+        accuracy_report_destinations(output, protected_paths=protected)
         report = run_accuracy(settings, gold=gold, variant=variant, prices=prices, log=log,
                               cohort=cohort, allow_source_snapshot=source_snapshot,
                               predictions=predictions)
@@ -781,7 +785,7 @@ def eval_accuracy(
             journal = exposure_log or manifest.get("exposure_log")
             if journal:
                 protected.append(Path(journal))
-                _eval_destinations([output, output.with_suffix(".md")], protected)
+                accuracy_report_destinations(output, protected_paths=protected)
         paths = write_accuracy_report(report, output, protected_paths=protected)
         if manifest:
             from job_intake.annotation.cohorts import record_report_exposure

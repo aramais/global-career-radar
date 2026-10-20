@@ -6,20 +6,15 @@ explicit table that every report states. The pipeline never applies this table.
 
 from __future__ import annotations
 
-import math
-import re
-
 from job_intake.annotation.text import source_hash
+from job_intake.labeling.numeric import is_finite_score
 from job_intake.labeling.schema import (
     DECISIONS,
     GATE_OUTCOMES,
-    GATE_REASONS,
     PREDICTION_SCHEMA,
-    RELEVANCE_VALUES,
-    STATUSES,
-    TAG_NAMES,
     TIERS,
 )
+from job_intake.labeling.schema_validation import json_schema_errors
 from job_intake.models.job import JobRecord
 
 BASELINE_LABELER = "rules:tier-map-v1"
@@ -60,41 +55,26 @@ def baseline_predictions(rows: list[tuple[str, JobRecord]], saved: dict[str, dic
             "decision": prediction.get("decision")
             if prediction.get("decision") in DECISIONS else None,
             "tier": prediction.get("tier") if prediction.get("tier") in TIERS else None,
-            "fit_score": score if type(score) in {int, float} and math.isfinite(score) else None,
+            "fit_score": score if is_finite_score(score) else None,
         })
     return result
 
 
-def check_prediction_rows(rows: list[dict]) -> dict[str, dict]:
-    """Structural check of supplied v3 prediction rows; returns them by job_uid."""
+def check_prediction_rows(
+    rows: list[dict], *, profile_ids: list[str] | None = None,
+) -> dict[str, dict]:
+    """Validate the full closed v3 schema before any row reaches evaluation."""
+    if not isinstance(rows, list):
+        raise ValueError("V3 predictions must be a list of records")
+    allowed_roles = None if profile_ids is None else {*profile_ids, "other", None}
     result = {}
     for index, row in enumerate(rows, start=1):
-        problem = None
-        if not isinstance(row, dict) or row.get("schema") != PREDICTION_SCHEMA:
-            problem = f"schema must be {PREDICTION_SCHEMA}"
-        elif not isinstance(row.get("job_uid"), str) or not row["job_uid"] \
-                or row["job_uid"] in result:
-            problem = "job_uid must be nonempty and unique"
-        elif not isinstance(row.get("source_hash"), str) \
-                or not re.fullmatch(r"[0-9a-f]{64}", row["source_hash"]):
-            problem = "source_hash must be a SHA-256 digest"
-        elif not isinstance(row.get("labeler"), str) \
-                or not re.fullmatch(r"(?:rules|llm|embedding):\S+", row["labeler"]):
-            problem = "labeler must be rules:, llm: or embedding: with a name"
-        elif row.get("status") not in STATUSES:
-            problem = "unknown status"
-        elif row.get("relevance") is not None and (
-            type(row["relevance"]) is not int or row["relevance"] not in RELEVANCE_VALUES
-        ):
-            problem = "relevance must be an integer 0–3 or null"
-        elif row.get("gate_outcome") not in (*GATE_OUTCOMES, None):
-            problem = "unknown gate_outcome"
-        elif not isinstance(row.get("gate_reasons"), list) \
-                or any(reason not in GATE_REASONS for reason in row["gate_reasons"]):
-            problem = "gate_reasons must be closed reason codes"
-        elif not isinstance(row.get("tags"), dict) or set(row["tags"]) - set(TAG_NAMES):
-            problem = "tags must use only the six v3 tags"
-        if problem:
-            raise ValueError(f"Invalid v3 prediction at row {index}: {problem}")
+        if problems := json_schema_errors(row, kind="prediction"):
+            raise ValueError(f"Invalid v3 prediction at row {index}: {problems[0]['message']}")
+        if allowed_roles is not None and row["role_label"] not in allowed_roles:
+            raise ValueError(f"Invalid v3 prediction at row {index}: "
+                             "$.role_label must be an enabled profile ID, other or null")
+        if row["job_uid"] in result:
+            raise ValueError(f"Invalid v3 prediction at row {index}: $.job_uid must be unique")
         result[row["job_uid"]] = row
     return result

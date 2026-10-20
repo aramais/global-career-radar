@@ -106,6 +106,17 @@ border:1px solid var(--line);border-radius:8px;padding:16px}.gold-editor-grid{di
 grid-template-columns:minmax(0,1.35fr) minmax(270px,1fr);gap:24px}.gold-form label{margin-bottom:14px}
 .gold-nav{display:flex;gap:8px;justify-content:space-between;margin-top:18px;flex-wrap:wrap}
 .gold-saved-labels{margin-top:10px}.gold-editor-status{min-height:1.5em;margin:10px 0}
+.gold-tag{border:1px solid var(--line);border-radius:9px;padding:14px;margin:14px 0}
+.gold-tag legend{font-size:.93rem;font-weight:700;padding:0 5px}.gold-check{display:flex;align-items:flex-start;
+gap:9px;font-size:.85rem;line-height:1.4}.gold-check input{width:auto;margin:3px 0 0;flex:none}
+.gold-tag .gold-check,.gold-reasons .gold-check{margin-bottom:9px}.gold-tag textarea{min-height:65px}
+.gold-tag.is-unlabeled{background:#f8fafc}.gold-quote-tools{background:white;
+border:1px solid var(--line);border-radius:8px;padding:12px;margin:12px 0;z-index:1}
+.gold-quote-tools label{margin-bottom:8px}.gold-shortcuts{font-size:.78rem;color:var(--muted)}
+.gold-source-value{white-space:pre-wrap;overflow-wrap:anywhere}
+.gold-reasons{border:0;padding:0;margin:0 0 15px}.gold-reasons legend{font-size:.85rem;margin-bottom:8px}
+@media(min-width:701px){.gold-source-v3{position:sticky;top:12px;align-self:start}
+.gold-source-v3 .gold-description{max-height:42vh}}
 @media(max-width:1050px){.filters{grid-template-columns:repeat(3,1fr)}
 .job-filter-grid{grid-template-columns:repeat(3,1fr)}.grid-cards{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:700px){.wrap{padding:18px 16px}.top{align-items:flex-start}.top .status{display:none}
@@ -1440,17 +1451,193 @@ function tickGoldReview(activity = false, visible = null) {
   return tickReviewClock(editor.reviewClock,reviewNow(),isVisible,activity);
 }
 function goldLabels(labels = {}) {
-  return {role_label:labels.role_label ?? null,relevance:labels.relevance ?? null,
+  const result = {role_label:labels.role_label ?? null,relevance:labels.relevance ?? null,
     gate_outcome:labels.gate_outcome ?? null,notes:labels.notes ?? ''};
+  if (Object.hasOwn(labels,'tags') || Object.hasOwn(labels,'gate_reasons')) {
+    result.tags = JSON.parse(JSON.stringify(labels.tags || {}));
+    result.gate_reasons = [...(labels.gate_reasons || [])];
+  }
+  return result;
 }
 function goldPayload(values, version) {
-  return {expected_version:version,role_label:values.role_label || null,
+  const result = {expected_version:version,role_label:values.role_label || null,
     relevance:values.relevance === '' || values.relevance === null ? null : Number(values.relevance),
     gate_outcome:values.gate_outcome || null,notes:values.notes ?? ''};
+  if (Object.hasOwn(values,'tags')) {
+    result.tags = values.tags;
+    result.gate_reasons = values.gate_outcome === 'eligible' ? [] : values.gate_reasons;
+  }
+  return result;
 }
 function goldFormValues(form) {
-  return Object.fromEntries(['role_label','relevance','gate_outcome','notes']
+  const result = Object.fromEntries(['role_label','relevance','gate_outcome','notes']
     .map((name) => [name,form.elements.namedItem(name).value]));
+  if (form.goldTagControls) {
+    result.tags = goldTagsFromForm(form);
+    const reasons = form.goldGateReasons.filter((item) => item.input.checked).map((item) => item.value);
+    result.gate_reasons = JSON.stringify(goldCanonical(reasons)) === JSON.stringify(goldCanonical(form.goldOriginalReasons))
+      ? [...form.goldOriginalReasons] : reasons;
+  }
+  return result;
+}
+function goldCanonical(value) {
+  if (Array.isArray(value)) return value.map(goldCanonical).sort((a,b) => String(a).localeCompare(String(b)));
+  if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort()
+    .map((key) => [key,goldCanonical(value[key])]));
+  return value;
+}
+function goldIsV3(detail) {
+  return detail?.schema === 'vacancy-labels-v3';
+}
+const GOLD_TAG_TITLES = {hiring_eligibility:'География найма',work_mode:'Формат работы',
+  working_language:'Рабочий язык',function_core:'Содержание работы',domain_fit:'Отрасль и опыт в домене',
+  preferred_focus:'Предпочтительные задачи'};
+const GOLD_VALUE_LABELS = {
+  unspecified:'В описании неясно',open_to_brazil:'Найм из Бразилии разрешён',
+  restricted_elsewhere:'Найм ограничен другими странами',remote:'Удалённо',office_sao_paulo:'Офис или гибрид в городе Сан-Паулу',
+  office_elsewhere:'Офис или гибрид в другом городе',english:'Английский',
+  portuguese_with_english:'Португальский и рабочий английский',portuguese_only:'Только португальский',
+  other_language_required:'Обязателен другой язык',analytics_for_decisions:'Аналитика для принятия решений',
+  analytics_reporting:'Преимущественно отчётность и BI',solo_analysis:'Индивидуальный анализ без взаимодействия',
+  product_without_analytics:'Продуктовая работа без аналитического ядра',non_analytics:'Не аналитическая функция',
+  marketplace_classifieds:'Маркетплейсы и классифайды',ecommerce_retail:'Электронная коммерция и ритейл',
+  mobility:'Мобильность и транспорт',fintech:'Финтех',saas_b2b:'B2B SaaS',consumer_apps:'Потребительские приложения',
+  gaming_betting:'Игры, беттинг и азартные игры',healthtech:'Цифровое здравоохранение',pharma_biotech:'Фармацевтика и биотех',
+  cybersecurity:'Кибербезопасность',hardware_iot:'Оборудование и IoT',consulting_outsourcing:'Консалтинг и аутсорсинг',
+  public_sector_education:'Госсектор и образование',other:'Другая отрасль',none:'Не требуется',preferred:'Желателен',
+  required:'Обязателен',pricing_monetization:'Ценообразование и монетизация',
+  experimentation_causal:'Эксперименты и причинный анализ',unit_economics_pnl_finance:'Юнит-экономика, P&L и финансы',
+  marketplace_economics:'Экономика маркетплейса',explicit:'Прямо сказано в источнике',implied:'Следует из контекста',
+  hiring_region_restricted:'Найм ограничен другим регионом',work_authorization_required:'Нужно разрешение на работу',
+  office_outside_sp:'Офис вне города Сан-Паулу',
+  vacancy_closed:'Вакансия закрыта',personal_constraint:'Личное ограничение'};
+function goldOptions(values, blank = 'Не выбрано') {
+  return [{value:'',label:blank},...(values || []).map((value) => ({value,label:GOLD_VALUE_LABELS[value] || value}))];
+}
+function goldCheck(text, name, checked) {
+  const control = input('', 'checkbox', name); control.checked = Boolean(checked);
+  const label = el('label',null,'gold-check'); label.append(control,el('span',text));
+  return {label,input:control};
+}
+function goldTagsFromForm(form) {
+  const result = {};
+  Object.entries(form.goldTagControls).forEach(([name,controls]) => {
+    if (!controls.enabled.checked) return;
+    const original = controls.original || {}, tag = {};
+    if (name === 'preferred_focus') tag.values = controls.choices.filter((item) => item.input.checked).map((item) => item.value);
+    else if (name === 'domain_fit') {
+      tag.industry = controls.industry.value; tag.requirement = controls.requirement.value;
+      if (controls.required_domain.value) tag.required_domain = controls.required_domain.value;
+      else if (tag.requirement === 'none' && Object.hasOwn(original,'required_domain')) tag.required_domain = null;
+      if (controls.domain.value) tag.domain = controls.domain.value;
+    } else {
+      tag.value = controls.value.value;
+      if (controls.office_location?.value) tag.office_location = controls.office_location.value;
+    }
+    tag.quote = controls.quote.value;
+    if (controls.basis.value) tag.basis = controls.basis.value;
+    result[name] = JSON.stringify(goldCanonical(tag)) === JSON.stringify(goldCanonical(original))
+      ? JSON.parse(JSON.stringify(original)) : tag;
+  });
+  return result;
+}
+function syncGoldTagStates(form) {
+  if (!form.goldTagControls) return;
+  Object.values(form.goldTagControls).forEach((controls) => {
+    controls.fields.forEach((node) => node.disabled = !controls.enabled.checked || Boolean(goldEditor?.saving));
+    controls.group.classList.toggle('is-unlabeled',!controls.enabled.checked);
+    if (controls.required_domain) controls.required_domain.disabled = !controls.enabled.checked
+      || controls.requirement.value === 'none' || Boolean(goldEditor?.saving);
+  });
+  const eligible = form.elements.namedItem('gate_outcome').value === 'eligible';
+  form.goldGateReasons.forEach((item) => {
+    item.input.disabled = eligible || Boolean(goldEditor?.saving);
+    if (eligible) item.input.checked = false;
+  });
+}
+function renderGoldTags(form, labels, options) {
+  form.goldTagControls = {}; form.goldGateReasons = [];
+  form.goldOriginalReasons = [...(labels.gate_reasons || [])];
+  const reasons = el('fieldset',null,'gold-reasons'); reasons.append(el('legend','Причины ограничений найма'));
+  (options.gate_reasons || []).forEach((value) => {
+    const choice = goldCheck(GOLD_VALUE_LABELS[value] || value,'gate_reason_' + value,
+      (labels.gate_reasons || []).includes(value));
+    form.goldGateReasons.push({...choice,value}); reasons.append(choice.label);
+  });
+  form.append(reasons,el('h3','Факты из вакансии'),el('p',
+    'Отмечайте только те признаки, которые хотите разметить. Для ограничивающих значений нужна точная цитата.','help'));
+  Object.entries(GOLD_TAG_TITLES).forEach(([name,title]) => {
+    const original = labels.tags?.[name], spec = options.tags?.[name] || {};
+    const group = el('fieldset',null,'gold-tag'); group.append(el('legend',title));
+    const mark = goldCheck('Признак размечен','tag_' + name + '_enabled',Boolean(original)); group.append(mark.label);
+    const controls = {enabled:mark.input,group,original,fields:[]};
+    const add = (title,node) => { controls.fields.push(node); group.append(field(title,node)); return node; };
+    if (name === 'preferred_focus') {
+      controls.choices = (spec.values || []).map((value) => {
+        const choice = goldCheck(GOLD_VALUE_LABELS[value] || value,'tag_' + name + '_' + value,
+          original?.values?.includes(value));
+        controls.fields.push(choice.input); group.append(choice.label); return {...choice,value};
+      });
+      group.append(el('p','Размеченный признак без выбранных задач означает: таких задач в роли нет.','help'));
+    } else if (name === 'domain_fit') {
+      controls.industry = add('Отрасль работодателя',select(goldOptions(spec.industries),original?.industry || '', 'tag_' + name + '_industry'));
+      controls.requirement = add('Опыт в домене',select(goldOptions(spec.requirements),original?.requirement || '', 'tag_' + name + '_requirement'));
+      controls.required_domain = add('Какой опыт нужен',select(goldOptions(spec.industries),original?.required_domain || '', 'tag_' + name + '_required_domain'));
+      controls.domain = add('Уточнение другой отрасли',input(original?.domain || '', 'text','tag_' + name + '_domain'));
+      controls.domain.maxLength = spec.domain_max || 60;
+      controls.requirement.addEventListener('change',() => {
+        if (controls.requirement.value === 'none') controls.required_domain.value = '';
+        syncGoldTagStates(form);
+      });
+    } else {
+      controls.value = add('Значение',select(goldOptions(spec.values),original?.value || '', 'tag_' + name + '_value'));
+      if (name === 'work_mode') {
+        controls.office_location = add('Город или место офиса',input(original?.office_location || '', 'text','tag_' + name + '_office_location'));
+        controls.office_location.maxLength = 80;
+      }
+    }
+    controls.quote = add('Цитата из источника',textArea(original?.quote || '', 'tag_' + name + '_quote'));
+    controls.basis = add('Как подтверждается факт',select(goldOptions(options.basis,'Не указано'),original?.basis || '', 'tag_' + name + '_basis'));
+    mark.input.addEventListener('change',() => syncGoldTagStates(form));
+    form.goldTagControls[name] = controls; form.append(group);
+  });
+  form.elements.namedItem('gate_outcome').addEventListener('change',() => syncGoldTagStates(form));
+}
+function goldSelectedQuote(selection = typeof window.getSelection === 'function' ? window.getSelection() : null) {
+  const source = goldEditor?.quoteSource;
+  if (!source || !selection || selection.isCollapsed || !selection.rangeCount) return '';
+  const range = selection.getRangeAt(0);
+  if (!source.contains(range.startContainer) || !source.contains(range.endContainer)) return '';
+  if (!goldEditor.quoteBlocks.some((block) => block.contains(range.startContainer)
+      && block.contains(range.endContainer))) return '';
+  return String(selection).trim();
+}
+function insertGoldQuote() {
+  if (!goldEditor || goldEditor.saving || !goldEditor.detail.can_save) return false;
+  const quote = goldSelectedQuote();
+  if (!quote) { goldEditorMessage('Выделите цитату внутри одного блока основного текста вакансии.'); return false; }
+  const controls = goldEditor.form.goldTagControls[goldEditor.quoteTarget.value];
+  if (!controls) return false;
+  controls.enabled.checked = true; controls.quote.value = quote; syncGoldTagStates(goldEditor.form);
+  goldEditorMessage('Цитата вставлена. Проверьте выбранное значение признака.'); return true;
+}
+function handleGoldShortcut(event) {
+  if (!goldEditor || view !== 'gold' || $('modalShade').hidden || goldEditor.saving
+      || !goldEditor.detail.can_save || event.repeat || event.isComposing
+      || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return false;
+  let target = event.target || document.activeElement;
+  while (target) {
+    if (target.isContentEditable || ['INPUT','TEXTAREA','SELECT','BUTTON','A','SUMMARY'].includes(target.tagName)) return false;
+    target = target.parentElement;
+  }
+  const key = String(event.key).toLowerCase(), form = goldEditor.form;
+  if (/^[0-3]$/.test(key)) form.elements.namedItem('relevance').value = key;
+  else if ({e:'eligible',i:'ineligible',u:'unknown'}[key]) {
+    form.elements.namedItem('gate_outcome').value = {e:'eligible',i:'ineligible',u:'unknown'}[key];
+    syncGoldTagStates(form);
+  } else if (key === 'enter') { event.preventDefault(); saveGold(true); return true; }
+  else return false;
+  event.preventDefault(); tickGoldReview(true); return true;
 }
 function goldDescription(source) {
   const raw = String(source.description_raw || '');
@@ -1471,6 +1658,37 @@ function goldDescription(source) {
   if (source.description_clean && String(source.description_clean).trim()) return String(source.description_clean);
   return readable;
 }
+function goldCanonicalDescription(source) {
+  // source_units binds description_clean when nonempty, otherwise literal raw.
+  // Display these exact characters for selection; formatting-only list markers
+  // or decoded raw HTML cannot safely become part of the saved quote.
+  return [source.description_clean,source.description_raw]
+    .find((value) => typeof value === 'string' && value) || '';
+}
+function goldCanonicalSourceFacts(source) {
+  // Keep this whitelist aligned with annotation.text.source_units. Labels live
+  // outside quote blocks; metadata values remain separate, literal source strings.
+  const facts = [];
+  for (const [field,title] of [
+    ['title','Название вакансии'],['company','Компания'],
+    ['location_text','Местоположение'],['remote_text','Удалённая работа'],
+    ['employment_type','Тип занятости'],['salary_text','Оплата'],['timezone_text','Часовой пояс'],
+  ]) {
+    if (typeof source[field] === 'string' && source[field]) facts.push([title,source[field]]);
+  }
+  const metadata = source.source_metadata;
+  if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
+    for (const [field,title] of [
+      ['applicant_location_requirements','Требования к местоположению кандидата'],
+      ['working_language','Требования к рабочему языку'],
+    ]) {
+      const values = Array.isArray(metadata[field]) ? metadata[field] : [metadata[field]];
+      for (const value of values)
+        if (typeof value === 'string' && value) facts.push([title,value]);
+    }
+  }
+  return facts;
+}
 function goldQuery(offset = goldOffset) {
   return '/api/gold?' + new URLSearchParams({status:$('goldStatusFilter').value || 'all',
     q:$('goldQuery').value.trim(),offset:String(offset),limit:'100'}).toString();
@@ -1479,22 +1697,28 @@ function goldMessage(message, kind = '') {
   $('goldMessage').textContent = message; $('goldMessage').hidden = !message;
   $('goldMessage').className = 'gold-message ' + kind;
 }
-async function refreshGold(reset = true) {
+async function refreshGold(reset = true, navigation = null, offset = null) {
+  if (navigation && !resumeGoldNavigation(navigation)) return false;
   if (reset && goldEditor && !closeModal()) return false;
   if (reset) goldOffset = 0;
+  navigation = navigation || goldNavigationContext(goldOpening);
   const request = ++goldSequence; goldLoading = true;
+  navigation.sequence = request;
+  const current = () => request === goldSequence && view === 'gold'
+    && resumeGoldNavigation(navigation);
   goldMessage('Загрузка выборки…'); renderGoldPagination();
   try {
-    const page = await api(goldQuery());
-    if (request !== goldSequence) return false;
+    const page = await api(goldQuery(offset ?? goldOffset));
+    if (!current()) return false;
     if (!page.cases.length && page.offset > 0 && page.total > 0) {
-      goldOffset = Math.floor((page.total - 1) / 100) * 100;
-      return await refreshGold(false);
+      const lastOffset = Math.floor((page.total - 1) / 100) * 100;
+      return await refreshGold(false,navigation,lastOffset);
     }
     goldPage = page; goldOffset = page.offset; goldMessage('');
-    if (view === 'gold') renderGoldList();
+    renderGoldList();
     return true;
-  } catch (error) { if (request === goldSequence) goldMessage(errorMessage(error),'error'); return false; }
+  } catch (error) { if (current()) goldMessage(errorMessage(error),'error'); return false; }
+  // A superseded owner still releases its own loading state, never a newer request's.
   finally { if (request === goldSequence) { goldLoading = false; renderGoldPagination(); } }
 }
 function renderGoldPagination() {
@@ -1540,22 +1764,45 @@ function renderGoldList() {
   }
   renderGoldPagination(); updateGoldNavigation();
 }
+function goldDraftSignature(editor = goldEditor) {
+  return editor?.form ? JSON.stringify(goldCanonical(goldLabels(goldPayload(goldFormValues(editor.form),'')))) : null;
+}
 function goldIsDirty() {
-  return Boolean(goldEditor?.form && JSON.stringify(goldLabels(goldPayload(goldFormValues(goldEditor.form),'')))
-    !== JSON.stringify(goldEditor.savedLabels));
+  return Boolean(goldEditor?.form && goldDraftSignature()
+    !== JSON.stringify(goldCanonical(goldEditor.savedLabels)));
 }
 function discardGoldChanges() {
   return !goldIsDirty() || window.confirm('Есть несохранённая разметка. Отменить изменения и продолжить?');
 }
-async function openGold(uid, discardConfirmed = false) {
-  if (goldEditor?.saving || (!discardConfirmed && !discardGoldChanges())) return false;
-  const request = ++goldOpening;
+function goldNavigationContext(request = ++goldOpening) {
+  return {request,sequence:goldSequence,editor:goldEditor,draft:goldDraftSignature()};
+}
+function resumeGoldNavigation(navigation) {
+  if (navigation.request !== goldOpening || navigation.sequence !== goldSequence
+      || view !== 'gold' || navigation.editor !== goldEditor || goldEditor?.saving) return false;
+  if (navigation.draft !== goldDraftSignature()) {
+    goldMessage('');
+    goldEditorMessage('Изменения остаются в форме. Для перехода нажмите ещё раз.');
+    return false;
+  }
+  return true;
+}
+async function openGold(uid, navigation = null, page = null) {
+  if (!navigation) {
+    if (goldEditor?.saving || !discardGoldChanges()) return false;
+    navigation = goldNavigationContext();
+  }
+  if (!resumeGoldNavigation(navigation)) return false;
   goldMessage('Загрузка вакансии…');
   try {
     const detail = await api('/api/gold/' + encodeURIComponent(uid));
-    if (request !== goldOpening || view !== 'gold') return false;
-    goldMessage(''); renderGoldEditor(detail); return true;
-  } catch (error) { if (request === goldOpening) goldMessage(errorMessage(error),'error'); return false; }
+    if (!resumeGoldNavigation(navigation)) return false;
+    // Commit the destination queue and editor together, without another await.
+    if (page) { goldPage = page; goldOffset = page.offset; }
+    goldMessage(''); renderGoldEditor(detail);
+    if (page) renderGoldList();
+    return true;
+  } catch (error) { if (resumeGoldNavigation(navigation)) goldMessage(errorMessage(error),'error'); return false; }
 }
 function goldEditorMessage(message, kind = '') {
   if (!goldEditor?.message) return;
@@ -1569,16 +1816,27 @@ function regionalVariantFacts(variants) {
 }
 function renderGoldEditor(detail, message = '') {
   activeId = null;
-  goldEditor = {detail,savedLabels:goldLabels(detail.labels),saving:false,form:null,message:null,
-    reviewClock:detail.mode === 'discovery' ? newReviewClock() : null,
+  const v3 = goldIsV3(detail), initialLabels = {...detail.labels};
+  if (v3) { initialLabels.tags = initialLabels.tags || {}; initialLabels.gate_reasons = initialLabels.gate_reasons || []; }
+  goldEditor = {detail,savedLabels:goldLabels(initialLabels),saving:false,form:null,message:null,
+    reviewClock:detail.schema || detail.mode === 'discovery' ? newReviewClock() : null,
     anchorIndex:(goldPage?.cases || []).findIndex((item) => item.job_uid === detail.job_uid),pageOffset:goldOffset};
   const source = detail.source || {};
   const body = showModal(source.title || 'Разметка вакансии',source.company || 'Компания не указана');
   const layout = el('div',null,'gold-editor-grid'), original = el('section'), form = el('form',null,'gold-form');
+  if (v3) original.className = 'gold-source-v3';
   form.setAttribute('aria-label','Ваша разметка вакансии');
   original.append(sourceLink(source.original_url || source.apply_url,'Открыть исходную вакансию'));
   const location = [source.location_text,source.remote_text].filter(Boolean).join(' · ');
-  if (location) original.append(el('p',location,'small muted'));
+  const quoteSource = el('div',null,'gold-quote-source'), quoteBlocks = [];
+  const quoteBlock = (text,cls,title = '') => {
+    if (title) quoteSource.append(el('p',title,'small muted'));
+    const node = el('div',text,cls); quoteBlocks.push(node); quoteSource.append(node); return node;
+  };
+  if (v3) {
+    for (const [title,value] of goldCanonicalSourceFacts(source))
+      quoteBlock(value,'small gold-source-value',title);
+  } else if (location) quoteSource.append(el('p',location,'small muted'));
   const variants = regionalVariantFacts(detail.regional_variants);
   if (variants.length) {
     const section = el('section',null,'detail-section'); section.append(el('h3','Региональные версии'));
@@ -1588,9 +1846,32 @@ function renderGoldEditor(detail, message = '') {
     });
     original.append(section);
   }
-  original.append(el('h3','Исходное описание'),el('div',goldDescription(source) || 'Текст источника недоступен. Откройте исходную ссылку.', 'gold-description'));
+  const description = v3 ? goldCanonicalDescription(source) : goldDescription(source);
+  if (description) quoteBlock(description,'gold-description');
+  else original.append(el('p','Текст источника недоступен. Откройте исходную ссылку.','help'));
+  original.append(el('h3','Исходное описание'),quoteSource);
+  goldEditor.quoteSource = quoteSource; goldEditor.quoteBlocks = quoteBlocks;
+  if (v3) {
+    const rawPreview = typeof source.description_raw === 'string'
+      ? goldDescription({description_raw:source.description_raw}) : '';
+    if (rawPreview && rawPreview !== description) {
+      const fullSource = el('details'); fullSource.append(el('summary','Полное исходное оформление'),
+        el('p','Для вставки цитаты выделите фразу в основном тексте выше.','help'),
+        el('div',rawPreview,'gold-description'));
+      original.append(fullSource);
+    }
+    const tools = el('div',null,'gold-quote-tools');
+    const target = select(Object.entries(GOLD_TAG_TITLES).map(([value,label]) => ({value,label})),
+      'hiring_eligibility','gold_quote_target');
+    const insert = button('Вставить выделенную цитату',insertGoldQuote,'inline-button');
+    insert.disabled = !detail.can_save;
+    insert.addEventListener('pointerdown',(event) => event.preventDefault());
+    tools.append(field('Цитата для признака',target),insert,
+      el('p','Выделите нужную фразу в исходном тексте и выберите признак.','help'));
+    original.append(tools); goldEditor.quoteTarget = target;
+  }
   const roles = [{value:'',label:'Пока не размечено'},...(goldPage?.profiles || [])];
-  const labels = goldLabels(detail.labels);
+  const labels = goldLabels(initialLabels);
   if (labels.role_label && !roles.some((item) => item.value === labels.role_label)) roles.push({value:labels.role_label,label:labels.role_label});
   form.append(field('Профессия',select(roles,labels.role_label || '','role_label')),
     field('Личная релевантность',select([
@@ -1602,6 +1883,8 @@ function renderGoldEditor(detail, message = '') {
       {value:'unknown',label:'Неясно из описания'}],labels.gate_outcome || '','gate_outcome')),
     field('Комментарий: что подходит или мешает',textArea(labels.notes,'notes')),
     el('p','Релевантность — про саму роль. Ограничения по стране, языку и формату найма отмечайте отдельно. Можно сохранить часть полей.','help'));
+  if (v3) renderGoldTags(form,labels,detail.label_options || goldPage?.label_options || {});
+  form.append(el('p','Вне полей ввода: 0–3 — релевантность, E/I/U — подходят / не подходят / неясно, Enter — сохранить и следующая.','gold-shortcuts'));
   const status = el('p',message,'gold-message gold-editor-status'); status.setAttribute('role','status');
   const conflicts = el('div',null,'row'); conflicts.hidden = true;
   const reload = button('Загрузить актуальную версию',() => openGold(detail.job_uid),'inline-button'); conflicts.append(reload);
@@ -1625,6 +1908,7 @@ function renderGoldEditor(detail, message = '') {
   layout.append(original,form); body.append(layout);
   goldEditor.form = form; goldEditor.message = status; goldEditor.conflicts = conflicts;
   goldEditor.saveButtons = [save,saveNext]; goldEditor.navButtons = [previous,next];
+  syncGoldTagStates(form);
   updateGoldNavigation();
   form.addEventListener('submit',(event) => { event.preventDefault(); saveGold(false); });
 }
@@ -1656,41 +1940,59 @@ async function goldNeighborUID(direction) {
 }
 async function moveGold(direction) {
   if (!goldEditor || goldEditor.saving || !discardGoldChanges()) return;
+  const navigation = goldNavigationContext();
   try {
     const next = await goldNeighborUID(direction);
+    if (!resumeGoldNavigation(navigation)) return false;
     if (!next) { goldEditorMessage('В этом направлении больше нет вакансий.'); return; }
-    if (await openGold(next.uid,true) && next.page) {
-      goldPage = next.page; goldOffset = next.page.offset; renderGoldList();
-    }
-  } catch (error) { goldEditorMessage(errorMessage(error),'error'); }
+    return await openGold(next.uid,navigation,next.page);
+  } catch (error) { if (resumeGoldNavigation(navigation)) goldEditorMessage(errorMessage(error),'error'); return false; }
 }
 async function saveGold(andNext = false) {
   const editor = goldEditor;
   if (!editor || editor.saving || !editor.detail.can_save) return false;
+  if (typeof editor.form.reportValidity === 'function' && !editor.form.reportValidity()) return false;
   const payload = goldPayload(goldFormValues(editor.form),editor.detail.version);
   if (editor.reviewClock) payload.review_seconds = tickGoldReview();
+  // Saving invalidates any older detail/page GET even if the PATCH later fails.
+  const request = ++goldOpening;
+  goldMessage('');
+  const ownsSave = () => goldEditor === editor && request === goldOpening && view === 'gold';
+  let saved = false, navigation = null;
   editor.saving = true;
   editor.form.querySelectorAll('button,input,select,textarea').forEach((node) => node.disabled = true);
   goldEditorMessage('Сохранение…'); editor.conflicts.hidden = true;
   try {
     let next = null, nextError = false;
     if (andNext) { try { next = await goldNeighborUID(1); } catch (_) { nextError = true; } }
+    if (!ownsSave()) return false;
     const result = await api('/api/gold/' + encodeURIComponent(editor.detail.job_uid),'PATCH',payload);
-    if (goldEditor !== editor) return false;
+    saved = true;
+    if (!ownsSave()) return true;
     renderGoldEditor(result,'Разметка сохранена.'); goldEditor.message.classList.add('success');
-    await refreshGold(false);
+    navigation = goldNavigationContext(request);
+    await refreshGold(false,navigation);
+    if (!resumeGoldNavigation(navigation)) return true;
     if (andNext && next) {
       // A saved row can leave the filter and shift the successor across a page boundary.
       // Use the refreshed queue; a prefetched page only provides an offset hint.
+      let destinationPage = null;
       if (!goldPage.cases.some((item) => item.job_uid === next.uid) && next.page) {
         const page = await api(goldQuery(next.page.offset));
-        goldPage = page; goldOffset = page.offset; renderGoldList();
+        if (!resumeGoldNavigation(navigation)) return true;
+        destinationPage = page;
       }
-      await openGold(next.uid);
+      await openGold(next.uid,navigation,destinationPage);
     } else if (andNext) goldEditorMessage(nextError ? 'Разметка сохранена. Не удалось загрузить следующую вакансию; попробуйте навигацию ещё раз.'
       : 'Разметка сохранена. Это последняя вакансия в текущей выборке.','success');
     return true;
   } catch (error) {
+    if (saved) {
+      if (navigation && resumeGoldNavigation(navigation))
+        goldEditorMessage('Разметка сохранена. Не удалось загрузить следующую вакансию; попробуйте навигацию ещё раз.','success');
+      return true;
+    }
+    if (!ownsSave()) return false;
     if (error.status === 409) {
       goldEditorMessage('Запись изменена в другом окне. Ваши изменения остаются в форме. Загрузите актуальную версию перед повторным сохранением.','error');
       editor.conflicts.hidden = false;
@@ -1701,6 +2003,7 @@ async function saveGold(andNext = false) {
     if (goldEditor === editor) {
       editor.form.querySelectorAll('button,input,select,textarea').forEach((node) => node.disabled = false);
       editor.saveButtons.forEach((node) => node.disabled = !editor.detail.can_save);
+      syncGoldTagStates(editor.form);
       updateGoldNavigation();
     }
   }
@@ -1789,6 +2092,7 @@ $('importButton').addEventListener('click',openImport);
 $('modalShade').addEventListener('click',(event) => { if (event.target === $('modalShade')) closeModal(); });
 document.addEventListener('keydown',(event) => {
   if ($('modalShade').hidden) return;
+  if (handleGoldShortcut(event)) return;
   if (event.key === 'Escape') closeModal();
   if (event.key === 'Tab') {
     const nodes = [...$('modal').querySelectorAll('button,input,select,textarea,a[href]')]

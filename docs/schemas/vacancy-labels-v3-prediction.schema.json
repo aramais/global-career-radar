@@ -22,19 +22,23 @@
     },
     "job_uid": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "source_hash": {
       "type": "string",
-      "pattern": "^[0-9a-f]{64}$"
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
     },
     "labeler": {
       "type": "string",
-      "pattern": "^(?:rules|llm|embedding):\\S+$"
+      "pattern": "^(?:rules|llm|embedding):\\S+(?![\\s\\S])"
     },
     "variant": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "status": {
       "enum": [
@@ -49,7 +53,8 @@
         "string",
         "null"
       ],
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "rubric_status": {
       "enum": [
@@ -63,23 +68,29 @@
         "string",
         "null"
       ],
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "aggregation_version": {
       "type": [
         "string",
         "null"
       ],
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "role_label": {
       "type": [
         "string",
         "null"
       ],
-      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+      "pattern": "^[a-z0-9][a-z0-9_-]*(?![\\s\\S])"
     },
     "relevance": {
+      "type": [
+        "integer",
+        "null"
+      ],
       "enum": [
         0,
         1,
@@ -144,7 +155,30 @@
                 "implied"
               ]
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "value"
+                ],
+                "properties": {
+                  "value": {
+                    "enum": [
+                      "restricted_elsewhere"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": "explicit"
+                  }
+                }
+              }
+            }
+          ]
         },
         "work_mode": {
           "type": "object",
@@ -165,6 +199,8 @@
             },
             "office_location": {
               "type": "string",
+              "minLength": 1,
+              "pattern": "\\S",
               "maxLength": 80
             },
             "evidence": {
@@ -182,7 +218,30 @@
                 "implied"
               ]
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "value"
+                ],
+                "properties": {
+                  "value": {
+                    "enum": [
+                      "office_elsewhere"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": "explicit"
+                  }
+                }
+              }
+            }
+          ]
         },
         "working_language": {
           "type": "object",
@@ -217,7 +276,31 @@
                 "implied"
               ]
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "value"
+                ],
+                "properties": {
+                  "value": {
+                    "enum": [
+                      "other_language_required",
+                      "portuguese_only"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": "explicit"
+                  }
+                }
+              }
+            }
+          ]
         },
         "function_core": {
           "type": "object",
@@ -313,6 +396,7 @@
             "domain": {
               "type": "string",
               "minLength": 1,
+              "pattern": "\\S",
               "maxLength": 60
             },
             "evidence": {
@@ -375,7 +459,45 @@
                 "type": "null"
               }
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "required_domain"
+                ],
+                "properties": {
+                  "required_domain": {
+                    "const": "other"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "domain"
+                ]
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "requirement"
+                ],
+                "properties": {
+                  "requirement": {
+                    "const": "required"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": "explicit"
+                  }
+                }
+              }
+            }
+          ]
         },
         "preferred_focus": {
           "type": "object",
@@ -418,6 +540,10 @@
       }
     },
     "rules_relevance": {
+      "type": [
+        "integer",
+        "null"
+      ],
       "enum": [
         0,
         1,
@@ -427,6 +553,10 @@
       ]
     },
     "llm_relevance": {
+      "type": [
+        "integer",
+        "null"
+      ],
       "enum": [
         0,
         1,
@@ -443,6 +573,7 @@
       "additionalProperties": false,
       "properties": {
         "llm": {
+          "type": "integer",
           "enum": [
             0,
             1,
@@ -451,6 +582,7 @@
           ]
         },
         "rules": {
+          "type": "integer",
           "enum": [
             0,
             1,
@@ -459,6 +591,7 @@
           ]
         },
         "max": {
+          "type": "integer",
           "enum": [
             0,
             1,
@@ -467,6 +600,7 @@
           ]
         },
         "min": {
+          "type": "integer",
           "enum": [
             0,
             1,
@@ -504,7 +638,8 @@
         "string",
         "null"
       ],
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "p2_candidate": {
       "type": [
@@ -541,7 +676,19 @@
         "required": [
           "stage",
           "model"
-        ]
+        ],
+        "properties": {
+          "stage": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          }
+        }
       }
     },
     "latency_ms": {
@@ -557,5 +704,26 @@
         "type": "object"
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "gate_outcome"
+        ],
+        "properties": {
+          "gate_outcome": {
+            "const": "eligible"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "gate_reasons": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ]
 }

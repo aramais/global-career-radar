@@ -25,6 +25,7 @@ from job_intake.annotation.cohorts import (
     union_search_frames,
     validate_cohort,
     write_new,
+    write_new_text,
 )
 from job_intake.annotation.experiments import (
     declare_experiment,
@@ -288,11 +289,10 @@ def union_frame(
 ) -> None:
     try:
         result = union_search_frames(read_jsonl(baseline), read_jsonl(candidate))
-        output.parent.mkdir(parents=True, exist_ok=True)
         import json
 
-        with output.open("x", encoding="utf-8") as stream:
-            stream.write("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in result))
+        write_new_text(output, "".join(json.dumps(row, ensure_ascii=False) + "\n"
+                                       for row in result))
     except (OSError, ValueError, TypeError, KeyError) as exc:
         _error(exc)
     typer.echo("Union frame written; baseline-only and unprocessed results retained")

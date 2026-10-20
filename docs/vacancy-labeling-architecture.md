@@ -1,6 +1,8 @@
 # Design doc: этап разметки вакансий `labels-v3`
 
-_Статус: проект к реализации. Дата: 20.10.2026. Ветка `feature/vacancy-tags`, ревизия `8bb3a2a`._
+_Статус: P0 и P1 реализованы; критические, высокие и средние находки семи аудитов
+20.10.2026 закрыты (§15–§21). P2–P4 не начаты. Исходный проект: ревизия `8bb3a2a`, ветка
+`feature/vacancy-tags`. Ниже разделены реализованные P0–P1 и будущие фазы._
 _Решения пользователя от 20.10.2026 внесены (§13). Канон критериев — career-orientation:
 [вектор поиска](</Users/admin/Documents/aramais-vault/codex/projects/career-orientation/codex/areas/job-search-vector.md#оценка-релевантности-вакансий--2026-10-20>)
 и [ответы пользователя](</Users/admin/Documents/aramais-vault/codex/projects/career-orientation/codex/external/intake/2026-10-20_vacancy-labeling-criteria.md>)._
@@ -40,8 +42,29 @@ _Решения пользователя от 20.10.2026 внесены (§13). 
    не логировать и не сохранять в отчёты. Тексты исключений провайдера в аудит не
    попадают: использовать `error_diagnostic`.
 4. **Gold и эталонные файлы не перезаписывать.** Новые выходы — только по новым
-   путям, атомарно, с отказом при занятом пути. Так уже работают `gold migrate`
-   и `write_new`.
+   путям, атомарно, с отказом при занятом пути. `write_new` сериализует JSON и
+   использует общий `write_new_text`, который полностью записывает соседний
+   staging-файл, выполняет flush/fsync и закрывает его до эксклюзивной
+   публикации hardlink. Занятый final, включая dangling symlink и конкурирующую
+   публикацию, не заменяется; ошибка до публикации удаляет только свой staging
+   с подтверждённой inode identity, оставляя final свободным для повтора. Если
+   identity определить не удалось, staging остаётся, а исходная ошибка сохраняется.
+   Гарантия относится к атомарной видимости полного файла, а не к сохранности
+   directory entry при потере питания. Markdown frozen-сравнения и JSONL
+   union-frame используют тот же publisher. JSON и Markdown сравнения не являются
+   одной файловой транзакцией: ошибка второго файла может оставить полный JSON
+   без Markdown, но не частично опубликованный файл.
+   Общие evaluation JSON/text writers, включая отчёт `gold validate`, используют
+   тот же exclusive publisher. JSON/Markdown accuracy, rules-diff и
+   compare-role-classifier проверяют оба пути до первой публикации.
+   JSON/Markdown `eval accuracy` публикуются эксклюзивно во всех вариантах
+   (`saved`, `rules`, `labels`), включая прямой вызов writer. Оба пути проверяются
+   на занятость до вычисления отчёта в CLI и до первой публикации в writer;
+   symlink, в том числе dangling, считается занятым. Canonical resolve применяется
+   для защиты входов; финальное имя output сохраняется для lexical occupied check.
+   Имена выходов по умолчанию прежние: при повторе нужен новый `--output`.
+   Ручное сохранение в Gold UI (§10) изменяет выбранную строку
+   существующего gold по явному действию человека, с проверкой версии и backup.
 5. **Eval и экспорт предсказаний читают SQLite только через `mode=ro` и
    `PRAGMA query_only=ON`.** Записывать в рабочую базу могут только `label` без
    `--export` и `annotate` / `reevaluate`, через существующий repository.
@@ -54,8 +77,9 @@ _Решения пользователя от 20.10.2026 внесены (§13). 
 9. **Прежнее поведение — по умолчанию.** `labeling.enabled: false`. Двухпроходная
    разметка, prefilter и все существующие тесты остаются рабочими.
 10. **Стиль кода** — как в соседних модулях: dataclass-конфиги, `emit_progress`,
-    атомарная запись через временный файл и `replace`, ошибки с кодами, тесты на
-    pytest.
+    атомарная запись через временный файл: `replace` для разрешённой замены,
+    эксклюзивная публикация для нового неизменяемого выхода; ошибки с кодами,
+    тесты на pytest.
 
 **Готово** — когда выполнены критерии фазы (§12), проходят
 `.venv/bin/pytest` и `.venv/bin/ruff check src tests`, а `architecture.md`, `README.md`
@@ -142,7 +166,8 @@ JobRecord
 | Модуль | Статус | Ответственность |
 | --- | --- | --- |
 | `src/job_intake/labeling/__init__.py` | новый | пустой пакет |
-| `labeling/schema.py` | новый | enum, dataclass `LabelResult` / `TagValue`, JSON Schema gold и предсказаний v3, валидатор записей |
+| `labeling/schema.py`, `labeling/schema_validation.py` | P0 | enum, JSON Schema gold и предсказаний v3, структурная валидация Draft 2020-12 и семантический валидатор gold; `LabelResult` / `TagValue` добавляются с P2 |
+| `utils/identifiers.py` | S-M1 | общий синтаксис stream ID для loader и схем v3, без изменения ID или enabled membership |
 | `labeling/rubric.py` | новый | загрузка `config/labeling_rubric.yaml`, хеши частей рубрики, прецеденты |
 | `labeling/gates.py` | новый | S1: бесплатные решения без LLM |
 | `labeling/prompt.py` | новый | статическая политика, компактный источник, прецеденты, схема ответа с enum `unit_id` |
@@ -155,14 +180,14 @@ JobRecord
 | `annotation/scope.py` | новый (перенос) | `duty_unit_ids()` — перенос `prefilter._duty_unit_ids` без изменения поведения; prefilter импортирует отсюда |
 | `annotation/ai.py` | изменение | регистрация схемы `labels_v3` в `_gemini_schema`, `_anthropic_schema`; строгий `json_schema` для OpenAI при зарегистрированной схеме |
 | `config/settings.py` | изменение | `LabelingConfig`, `AppConfig.labeling`, разбор YAML |
-| `config/labeling_rubric.yaml` | новый | рубрика, агрегация, отраслевые предпочтения — всё `status: proposed` |
+| `config/labeling_rubric.yaml` | P0 | решения 20.10: подтверждённые разделы `confirmed`; только `strong_companies` — `proposed`, `names: []` |
 | `config/settings.yaml` | изменение | блок `labeling:` с `enabled: false` |
 | `pipeline.py` | изменение | вызов S1–S4 в `_evaluate_record`, ветки `mode` |
 | `scoring/tiering.py` | изменение | параметр `tier_source` |
 | `storage/database.py`, `storage/models.py`, repository | изменение | аддитивные колонки `relevance`, `labels_status`, `labels_version` |
 | `cli.py` | изменение | команда `label`, `gold migrate-v3`, `eval accuracy --variant labels` |
 | `annotation/accuracy.py`, `annotation/frozen_eval.py` | изменение | блок `relevance_scale` в метриках, когда в предсказаниях есть `relevance` |
-| `annotation/gold_ui.py`, `crm/index.html` | изменение | поля 6 тегов, `gate_reasons`, хранилище v3 |
+| `annotation/gold_ui.py`, `crm/index.html` | P1 | шесть тегов, `gate_reasons`, v2/v3 store, слепая форма, цитаты, горячие клавиши и журнал времени |
 | `crm/` (сериализация вакансии) | изменение | `relevance`, `labels_status`, сортировка |
 
 ## 4. Схема `vacancy-labels-v3`
@@ -206,7 +231,7 @@ JobRecord
 | `work_mode` | `value`: `remote` · `office_sao_paulo` · `office_elsewhere` · `unspecified`; `office_location`: str ≤ 80 | любые, кроме `company` |
 | `working_language` | `value`: `english` · `portuguese_with_english` (португальский обязателен, компания международная и роль взаимодействует по-английски) · `portuguese_only` · `other_language_required` · `unspecified` | `requirements`, `role`, `source_metadata.*`; для `english` с `basis: implied` — весь текст объявления |
 | `function_core` | `value`: `analytics_for_decisions` · `analytics_reporting` · `solo_analysis` · `product_without_analytics` · `non_analytics` · `unspecified` | только `duty_unit_ids()` и title |
-| `domain_fit` | `industry`: отрасль работодателя из `INDUSTRIES`; `requirement`: `none` / `preferred` / `required` — требование опыта в домене; `required_domain`: домен этого требования из `INDUSTRIES` (`other` + `domain`: str ≤ 60) | `requirements` для `requirement` / `required_domain`; любые для `industry` |
+| `domain_fit` | `industry`: отрасль работодателя из `INDUSTRIES`; `requirement`: `none` / `preferred` / `required` — требование опыта в домене; `required_domain`: домен этого требования из `INDUSTRIES` (при `other` обязателен непустой `domain`: str ≤ 60) | `requirements` для `requirement` / `required_domain`; любые для `industry` |
 | `preferred_focus` | `values`: подмножество `pricing_monetization`, `experimentation_causal`, `unit_economics_pnl_finance`, `marketplace_economics` | только `duty_unit_ids()` |
 
 **Доказательства:**
@@ -247,12 +272,30 @@ JobRecord
 - Отсутствующий тег означает «не размечен».
 - `method: curated` — позитив, отобранный пользователем (в v2 это было `assisted`).
   `assisted_llm` — разметка с подсказкой модели; пока не используется.
+- Необязательный `label_scope` сохраняет provenance v2: `blind_decisions`, `full_tags`
+  или `constraints`. Частичная разметка тега или gate не требует заполнения relevance.
+- Необязательные `office_location` и `domain`, если присутствуют в сохранённой строке,
+  должны содержать непробельный текст в пределах своих лимитов; пустые детали опускаются.
 
 ### 4.4 Строка предсказания v3
 
 Одна строка на вакансию. Совместима с `frozen_eval.create_run`: обязательны
-`job_uid` и `source_hash`. Поля `decision`, `tier`, `fit_score` дублируются для
-существующих метрик.
+`job_uid` и `source_hash`. Обязательны также `schema`, `labeler`, `variant`, `status`,
+`role_label`, `relevance`, `gate_outcome`, `gate_reasons` и `tags`; nullable-решение
+передаётся явно. Поля `decision`, `tier`, `fit_score` дублируются для существующих метрик.
+Перед оценкой проверяется вся закрытая схема, включая вложенные теги, enum и типы;
+булево значение не считается integer, NaN/Infinity запрещены во всей JSON-структуре.
+Ошибки содержат номер строки и путь поля, без вывода значения. Дубли причин и
+`personal_constraint` у машины запрещены. Проверка привязки к source остаётся отдельной.
+Перед labels-eval `role_label` дополнительно сверяется с текущими enabled streams
+плюс `other`/`null`; отсутствие файлов правил/профилей не отключает проверку, а
+останавливает labels-eval. Структурный checker может получать `profile_ids` от caller.
+Синтаксис ID общий с loader профилей: `[a-z0-9][a-z0-9_-]*` с проверкой всей строки.
+JSON Schema не сужает его до kebab-case; членство в enabled streams проверяется
+отдельно. Стабильные ID и конфигурация критериев при этом не меняются.
+Целый `fit_score` поддерживается без преобразования в float, включая числа за
+пределами float; конечные float допустимы, bool/NaN/Infinity — нет. Это технический
+контракт представления и сортировки, не изменение весов или критериев.
 
 ```json
 {"schema": "vacancy-labels-v3-prediction", "job_uid": "…", "source_hash": "…",
@@ -274,11 +317,32 @@ JobRecord
 
 - `gold_schema()`;
 - `prediction_schema()`;
-- `response_schema(unit_ids: list[str], role_ids: list[str])` — для провайдера.
+- `response_schema(unit_ids: list[str], role_ids: list[str], *,
+  duty_unit_ids: list[str] | None = None, title_unit_ids: list[str] | None = None)` —
+  для провайдера. P2 обязан передавать явные duty/title ID. Совместимый fallback без
+  duty-ID разрешает все source-ID и сам по себе не обеспечивает ограничение секций.
 
 Снимки первых двух сохранить в
 `docs/schemas/vacancy-labels-v3-{gold,prediction}.schema.json`. Тест сверяет снимок
-с функцией.
+с функцией. Схемы и позитивные/негативные примеры проверяются через runtime-зависимость
+`jsonschema` (`Draft202012Validator`). Общая структурная проверка используется и
+для gold, и для предсказаний. Схемы кодируют непустые детали, условие `other + domain`,
+цитату и explicit basis ограничивающего human-тега, provenance размеченной строки и
+пустые gate reasons при eligible. Допустимо отсутствие basis в ручной строке;
+если basis указан у ограничивающего значения, он должен быть explicit.
+
+Семантические проверки остаются в runtime: текущая таксономия ролей, соответствие
+source/hash, уникальное дословное связывание цитаты и хронология provenance. Для
+машины доказательность, разрешённые секции и нормализация фактов — будущий S3 (P2),
+а не замена структурной проверки P0. Ошибки gold сохраняют существующие коды;
+структурный backstop дополняет ручной валидатор.
+
+Даты provenance сохраняют исходную точность. Date-time требует явного offset
+(час 00–23, минуты 00–59) или Z; проверяются календарь, время и полный формат.
+Два date-time сравниваются как UTC-моменты, включая дробные секунды длиннее шести
+знаков. Если хотя бы одно значение date-only, сравниваются выраженные календарные
+даты: равный день допустим, внутридневной порядок неизвестен. Старым датам не
+приписываются полночь или timezone; исторический gold не переписывается.
 
 **Схема ответа модели** (порядок полей важен: сначала факты, затем `reason`, затем
 решения):
@@ -290,14 +354,15 @@ JobRecord
               "confidence"],
  "properties": {
   "hiring_eligibility": {"type": "object", "additionalProperties": false,
-     "required": ["value", "evidence"],
+     "required": ["value", "evidence", "basis"],
      "properties": {"value": {"type": "string", "enum": ["open_to_brazil", "restricted_elsewhere", "unspecified"]},
-                    "evidence": {"type": "array", "maxItems": 3, "items": {"type": "string", "enum": ["<unit_ids>"]}}}},
+                    "evidence": {"type": "array", "maxItems": 3, "items": {"type": "string", "enum": ["<unit_ids>"]}},
+                    "basis": {"type": "string", "enum": ["explicit", "implied"]}}},
   "work_mode": {"…": "как выше + office_location: string"},
   "working_language": {"…": "…"},
   "function_core": {"…": "evidence enum = только duty_unit_ids + title unit"},
   "domain_fit": {"type": "object", "additionalProperties": false,
-     "required": ["requirement", "industry", "domain", "evidence"], "properties": {"…": "…"}},
+     "required": ["requirement", "industry", "required_domain", "domain", "evidence", "basis"], "properties": {"…": "…"}},
   "preferred_focus": {"type": "object", "additionalProperties": false,
      "required": ["values", "evidence"],
      "properties": {"values": {"type": "array", "uniqueItems": true, "items": {"type": "string", "enum": ["pricing_monetization", "experimentation_causal", "unit_economics_pnl_finance", "marketplace_economics"]}},
@@ -314,6 +379,9 @@ JobRecord
 - Если список ID пуст, `maxItems: 0`.
 - Схема не зависит от строк источника, кроме enum ID. Так уже устроен
   `_gemini_schema` для prefilter.
+- Компактный ответ провайдера может иметь `domain=""` или `office_location=""`;
+  перед сохранением P2/S3 удаляет пустые детали. В gold/prediction-файле, напротив,
+  присутствующая деталь непустая, а `required_domain=other` требует описания домена.
 
 ## 5. Конфигурация
 
@@ -418,11 +486,18 @@ p2:
 
 `pharma_biotech` одновременно входит в интересные отрасли и не входит в
 `own_domains`. Поэтому биотех как отрасль даёт плюс, а обязательная фарма-экспертиза —
-минус. Так согласуются оценки argenx (2) и Tiger Analytics (1).
+минус. Для синтетических тегов argenx `industry=pharma_biotech`, requirement=preferred
+дают 3−1=2. Историческое человеческое решение Tiger Analytics=1 сохраняется в gold,
+но не доказывается подстановкой отрасли pharma practice в поле industry работодателя.
+При `industry=consulting_outsourcing`, required_domain=pharma_biotech и requirement=required
+без других повышений формула даёт 2−2=0; с подтверждённым preferred_focus — 3−2=1.
+Эти проверки показывают формулу на явных синтетических фактах, а не переразмечают
+вакансию. Для сверки с человеческим решением нужен подтверждённый набор тегов;
+менять штрафы или трактовку industry ради воспроизведения одной оценки нельзя.
 
-`rubric.py` возвращает три независимых хеша:
+`rubric.py` возвращает два хеша и независимый идентификатор версии:
 
-| Хеш | Что включает |
+| Идентификатор | Что включает |
 | --- | --- |
 | `prompt_rubric_hash` | `anchors`, `level_note`, `employer_note`, `gate_note`, `domain_preferences`, `strong_companies.names` при `status: confirmed` — то, что попадает в промпт |
 | `aggregation_hash` | `aggregation`, `domain_preferences`, `strong_companies`, `p2` |
@@ -455,6 +530,16 @@ p2:
   **не копируются**.
 - Генератор прецедентов не нужен: файл собирает пользователь или исполнитель по его
   поручению. Нужен только валидатор (`rubric.load_precedents`).
+- `labels.role_label` всегда проверяется по общему синтаксису stream ID
+  (`utils.identifiers.STREAM_ID_PATTERN`), включая default `role_ids=None`.
+  Пустые значения, whitespace, uppercase и переводы строк отклоняются. Переданный
+  `role_ids` дополнительно ограничивает принадлежность enabled streams;
+  `other` допустим. Без taxonomy loader проверяет формат, не угадывая membership.
+- Упрощённый `labels.domain_fit` проверяется по общим ограничениям доменного факта:
+  `preferred|required` требует `required_domain`, при `other` — непустой `domain`
+  до 60 символов; для `none` допустимо отсутствие/null `required_domain`. Типы,
+  enum и неизвестные поля проверяются; вложенные evidence/basis не нужны, поскольку
+  прецедент хранит исходные `lines` отдельно.
 
 ## 6. Поток и интерфейсы
 
@@ -601,7 +686,8 @@ def validate_tags(raw: dict, units: list[dict], role_ids: list[str]
 ```python
 AGGREGATION_VERSION = "labels-aggregation-v1"
 
-def rules_relevance(role_label: str, tags: dict, rubric: Rubric) -> int: ...
+def rules_relevance(role_label: str | None, tags: dict, rubric: Rubric,
+                    *, company: str | None = None) -> int: ...
 def gate_outcome(tags: dict, evaluation: JobEvaluation, gates: GateResult
                  ) -> tuple[str, list[str], bool]:   # (outcome, reasons, llm_only_block)
 def escalation_triggers(first: dict, rules_rel: int, classification: dict,
@@ -767,41 +853,124 @@ error_diagnostic(error, stage="tag"))`, `relevance = rules_relevance` по те�
 ### 6.7 `labeling/metrics.py`
 
 ```python
-def relevance_scale(cases: list[dict], predictions: dict[str, dict]) -> dict:
-    """Только по cases с int relevance; пропуск предсказания — ошибка (в знаменателе)."""
+METRICS_VERSION = "relevance-scale-v2"
+def relevance_scale(cases: list[dict], predictions: dict[str, dict], *,
+                    version: str = METRICS_VERSION) -> dict: ...
 ```
+
+**Выборки и пропуски.** Ordinal-метрики и ranking используют только human relevance
+0–3. Missing включается в знаменатели coverage, exact, ±1 и recall; для P@k
+знаменатель `min(k, N)` этих gold-строк, даже если предсказаний меньше. Precision≥2
+считается по действительно предсказанным relevance≥2. MAE, QWK и Spearman используют
+только покрытые пары и показывают собственный N рядом с общим покрытием.
+Теги и gate имеют независимые выборки по соответствующей человеческой метке;
+`relevance=null` не исключает такую строку. Отсутствующий тег не становится
+`unspecified` и не совпадает с явно пустым набором `preferred_focus.values=[]`.
 
 **Возвращаемые метрики:**
 
 - `coverage` — `proportion`;
 - `exact` — доля точных совпадений;
 - `within_one` — доля совпадений ±1;
-- `mae`;
+- `mae` по покрытым парам;
 - `qwk` — квадратично взвешенная κ; при одном классе — `None`, `note`;
 - `spearman`;
-- `confusion` 4×4 со строкой `missing`;
+- `confusion` 4×4 human×predicted и отдельный объект `missing` по human-классам;
+  Markdown показывает missing колонкой;
 - `relevant`: `recall`, `precision`, `f1` для порога ≥2 по **предсказанной
   relevance**, не по tier;
 - `precision_at` для k ∈ {5, 10}: очередь сортируется по (relevance ↓, gate:
   eligible → unknown → ineligible, confidence ↓, fit_score ↓, job_uid);
+  знаменатель — `min(k, N)`, недостаток предсказаний помечается partial;
 - `ndcg_at` для k ∈ {5, 10} со `random_baseline` — переиспользовать подход
   `frozen_eval.task_metrics`;
 - `tags` — accuracy и macro-F1 по каждому из 6 тегов (для `preferred_focus` —
   micro-F1 по меткам множества), только по cases, где тег размечен человеком;
-- `gate` — существующие `blocker_recall`, `false_block_rate` и доля `unknown`.
+  `domain_fit` разложен на `requirement`, `industry` и `required_domain`.
+  Последний измеряется только при human requirement=preferred|required;
+  none/null не является наблюдением требуемого домена;
+- `gate` — существующие `blocker_recall`, `false_block_rate` и доля `unknown`,
+  с собственным N по human gate, независимо от human relevance.
 
 Все доли — через `accuracy.proportion` (интервал Уилсона).
 
 `compare_stability(run_a, run_b)` — κ Коэна по `relevance` и каждому тегу; при
-необходимости дополнить существующий `accuracy.compare_stability`.
+`domain_fit` отдельно по requirement, industry и required_domain. Последний
+сравним, когда оба прогона задают preferred|required и конкретный required_domain;
+none/null не образует пару. Показаны N пар и missing.
 
 **Встраивание.**
 
-- `accuracy.evaluate_vacancies`: если хотя бы одно предсказание имеет int
-  `relevance`, добавить ключ `relevance_scale`.
+- `accuracy.evaluate_vacancies`: добавить `relevance_scale`, если есть предсказанная
+  integer relevance либо явно указан v3 schema в gold/предсказании. Последнее
+  сохраняет метрики частичных тегов/gate даже при всех relevance=null или без прогнозов.
 - `frozen_eval.task_metrics`: то же, плюс строка в `comparison_markdown`.
 
 Существующие ключи отчёта не меняются.
+
+Frozen create/validate проверяют v3 независимо от имени экспериментального варианта:
+v3 gold в bundle требует нормализованных v3 строк; на legacy bundle проверка
+включается по маркерам строки `schema`, `labeler` или `variant`, а также по
+run variant `labels`/`rules`. Legacy строки без этих маркеров на v2 bundle сохраняют
+прежний контракт. Версия метрик не отключает проверку формата. При repeat-сравнении
+v3 `labels_v3` stability измеряется и для tag-only прогнозов с `relevance=null`.
+
+Новые отчёты используют `relevance-scale-v2`. Явный пересчёт
+`version="relevance-scale-v1"` предназначен только для проверки неизменяемых
+исторических frozen-прогонов: сохраняет прежние знаменатели, выборки и набор полей.
+`validate_run` выбирает версию из сохранённого `evaluation.relevance_scale.version`;
+неизвестная версия отклоняется. Старые прогоны без этого блока остаются валидными.
+Сохранённые отчёты автоматически не обновляются и не выдаются за новые измерения.
+
+Отдельная версия общих frozen-метрик — `frozen-task-metrics-v2`, записывается в
+`evaluation.task_metrics_version` новых run. В ней `independent_axes.role_recall`
+использует только human relevance≥2 с непустой размеченной ролью, включая `other`.
+Строка без human role не является целью этой метрики; отсутствие/воздержание
+предсказания по известной роли остаётся ошибкой в её знаменателе. Нет целей — N0,
+value=null. Версия не меняет пользовательскую шкалу релевантности или критерии.
+Исторические run без marker воспроизводятся как `frozen-task-metrics-v1`; явная
+v1 допустима для replay, неизвестная версия отклоняется. Marker входит в run hash.
+Baseline/candidate/repeat разных task-версий сравнивать нельзя: для нового
+сравнения создают новые run одной версии из исходных предсказаний, сохраняя старые
+файлы. Версия `relevance-scale-v1|v2` выбирается независимо и не отключает v3 checker.
+
+**Полнота frozen quality-gates.** Сравнение пересчитывает покрытие по собственной
+human-выборке каждой метрики, а не использует более узкий общий decision sample.
+В JSON сравнения добавлен `gate_coverage_version: frozen-gate-coverage-v1`;
+численные формулы `task_metrics`, версии и хеши сохранённых run не меняются.
+Новый вердикт по старым predictions может стать `insufficient_evidence`, не меняя
+исторического артефакта. `DEFAULT_POLICY` и все его пороги сохранены.
+
+| Gate | Human-выборка | Требуемое предсказание |
+| --- | --- | --- |
+| Profession accuracy | Все размеченные роли | Непустая роль |
+| Eligibility accuracy | Все размеченные gate | Допустимый gate |
+| Role recall | Выборка своей task-версии; v2: relevance≥2 и известная роль | Непустая роль |
+| Actionable P1 recall | Relevance≥2 и human eligible, даже без human role | Gate, decision и tier; score не требуется |
+| Blocker recall / false block rate | Human ineligible / eligible, независимо от relevance/role | Только gate; decision и score не требуются |
+| Scope tag accuracy | Наблюдения соответствующего human-тега | Допустимое значение этого тега |
+| Negative restriction recall | Только human-negative пары строка/тег | Допустимое значение соответствующего тега |
+| NDCG@5/10 | Все human integer relevance, кроме role=other; role=null не исключает | Конечный score и tier |
+
+Для baseline и candidate неполное покрытие даёт `insufficient_evidence`.
+Каждый metric gate выводит собственный `prediction_coverage` по обоим прогонам.
+NDCG дополнительно требует `status=measured` и `prediction_n=required_n`.
+`repeat_run_stability` требует нужные поля задач и наблюдаемые human role/gate/tags
+в candidate и repeat; одинаковые пропуски не доказывают повторяемость. При известном
+human relevance у v3 также проверяется ordinal prediction; legacy output без поля
+relevance его не требует.
+Не размеченные человеком теги не становятся обязательными. Явные отрицательные
+ответы (domain requirement=none, пустой preferred_focus) остаются ответами, а не
+пропусками. Их правильность и повторяемость — отдельные свойства.
+
+Граница P0 frozen-пути: `create_run` принимает структурно проверенные v3-предсказания;
+явная схема, а также варианты labels/rules требуют полной проверки, поэтому отсутствие
+или опечатка schema не обходят её. `validate_run` также проверяет v3-структуру перед
+пересчётом новых метрик; исторический replay v1 сохраняет прежний контракт.
+Но `build_bundle` всё ещё использует v2 gold validator. `load_bundle` проверяет
+digest/policy/source binding и сам по себе не доказывает корректность схемы labels.
+Поддержанный schema-aware build/save/load для v3 gold — предпосылка P2; принятие
+вручную подготовленного бандла не закрывает эту предпосылку.
 
 ### 6.8 `labeling/predictions.py`
 
@@ -831,6 +1000,34 @@ def migrate_gold_v2(source: Path, out: Path, *, rubric_version: str) -> dict:
 
 Сейчас человеческих тегов v2 нет, но маппинг нужен для полноты и покрыт тестом.
 
+Версия таблицы переноса — `v2-to-v3-tags-v3`. `country_required` превращается в
+open_to_brazil/restricted_elsewhere только при точном совпадении нормализованного
+названия/кода с поддерживаемой таблицей страны или однозначного региона без Brazil.
+Неподдержанный текст, placeholders и смешанные/неопределённые регионы не доказывают
+ограничение и отражаются в dropped tags с причиной. Таблица алиасов задаёт возможности
+парсера, а не новые предпочтения пользователя; неподдержанную страну нельзя считать чужой
+только потому, что это непустая строка.
+`office_sao_paulo` назначается только явной форме названия города São Paulo:
+упоминание штата/агломерации или одного Brazil без города не считается городом.
+`office_elsewhere` требует распознанного города и допустимых административных
+уточнений всей строки. Поддерживаются Campinas, Santos, São Caetano do Sul и Barueri
+с уточнениями SP/Brazil, а также London с уточнениями UK. Это консервативная таблица
+алиасов парсера, не полный справочник городов и не новый критерий пользователя.
+Неподдержанные города/фразы и альтернативы не угадываются: `Location TBD`, `TBC`,
+`London / São Paulo`, `São Paulo / London` и `Santos / São Paulo` не переносятся
+и учитываются в dropped tags с причиной. Campinas, São Paulo как город+штат
+по-прежнему даёт office_elsewhere; неизвестные случаи требуют ручной проверки.
+
+Вход читается один раз в bytes; JSONL и входной SHA вычисляются из одного снимка.
+Оба выхода полностью подготавливаются и fsync-ятся до публикации. Каждый публикуется
+атомарным hardlink без перезаписи. При обрабатываемой ошибке публикации выполняется
+rollback собственных выходов с проверкой inode/dev; чужой файл, обнаруженный вместо
+своего, не удаляется. Два пути не становятся видимыми одной атомарной операцией:
+при аварийном завершении процесса/ОС возможен неполный комплект. Это не crash-atomic
+транзакция и не изоляция от сторонних изменений путей между проверкой и удалением.
+После такой аварии исходник сохраняется, существующие выходы не перезаписываются;
+для нового запуска выбирается новый путь и проверяется полный manifest.
+
 ## 7. CLI
 
 | Команда | Назначение | Пишет в SQLite |
@@ -844,6 +1041,14 @@ def migrate_gold_v2(source: Path, out: Path, *, rubric_version: str) -> dict:
 
 **Правила CLI:**
 
+- `eval accuracy --variant labels` полностью проверяет структурную prediction schema
+  до метрик и записи отчётов; source binding и защита входных путей обязательны отдельно.
+- `eval accuracy` для `saved|rules|labels` требует новые JSON и Markdown пути.
+  При занятом любом из них команда отказывает до вычисления/записи exposure.
+  Эксклюзивная публикация дополнительно предотвращает замену пути, занятого после
+  preflight. Повтор с прежним default filename требует нового `--output`.
+- `gold validate` также создаёт отчёт по новому пути через общий evaluation writer.
+  Существующие JSON/text отчёты eval не заменяются; повтор требует нового output.
 - `--ai` без `--max-cost` — ошибка `BadParameter`.
 - `--max-cost` > 5 — подтверждение `typer.confirm`, если stdin — TTY. Иначе ошибка.
 - `--concurrency` по умолчанию 1, максимум 8. В режиме `--export` вызовы идут через
@@ -943,53 +1148,113 @@ skip_two_pass = labels is not None and self.config.labeling.mode == "labels"
 
 ## 10. CRM и UI эталона
 
-**Сериализация вакансии** (найти место, где отдаются `eligibility_status` и `tier`):
+**Сериализация вакансии — будущая P3** (место, где отдаются `eligibility_status` и `tier`):
 
 - добавить `relevance`, `labels_status`, `labels_v3.tags`, `gate_reasons`,
   `escalated`;
 - сортировка списка по умолчанию не меняется. Новая сортировка «по релевантности» —
   отдельная опция UI.
 
-**Gold UI** (`annotation/gold_ui.py`, `crm/index.html`):
+**Gold UI — реализованная P1** (`annotation/gold_ui.py`, `crm/index.html`):
 
 - `GoldLabelStore` различает v2 и v3 по `schema` первой строки.
+- Смешанные и неизвестные схемы отклоняются. List/detail/save возвращают `schema`,
+  для v3 — `label_options` с допустимыми тегами, причинами gate и basis.
 - Для v3 `_LABEL_FIELDS` дополняется `gate_reasons` и `tags`. Для каждого из 6 тегов —
   select с enum §4.2 и необязательное поле цитаты: выделение текста в исходнике
   вставляет цитату.
+- Выделяемый основной текст точно соответствует canonical source-полям
+  (`description_clean`, иначе literal `description_raw`). Выделение ограничено
+  одним блоком источника; заголовки UI, ссылки, составные подписи и добавленные
+  маркеры списков не становятся доказательствами. Полный raw-текст в читаемом
+  оформлении доступен отдельно для чтения.
+- Отдельными точными блоками с подписями показываются title/company/location/remote,
+  employment/salary/timezone и строки `source_metadata.applicant_location_requirements`
+  и `source_metadata.working_language`. Элементы списка metadata не склеиваются;
+  подпись не входит в цитату. Прочие metadata, нестроковые значения и машинные
+  оценки не выводятся как source-факты.
+- Отметка «Признак размечен» отличает отсутствие тега от явного `unspecified`.
+  Для `preferred_focus` — набор флажков, в том числе явный пустой список; для
+  `domain_fit` — отдельные industry, requirement, required_domain и domain.
+  Частичные теги допустимы; прогресс означает заполнение трёх решений.
 - Валидация при сохранении — `labeling.schema.validate_gold_row`.
 - Путь по умолчанию — `gold/vacancy-labels-v3.jsonl` рядом с SQLite, если он
   существует, иначе прежний v2.
+- Выбор ленивый и фиксируется до перезапуска хранилища; `--gold PATH` явно
+  открывает v2 и при наличии v3. Автоматической миграции данных нет.
+- Default и explicit path разрешаются до одного canonical target перед pin/lock.
+  При symlink редактируется target, ссылка сохраняется; stores используют общий
+  lock и version, stale same-row save получает 409.
 - Машинные метки, tier, score и `labels_v3` в карточку разметки **не передаются**:
   разметка остаётся слепой.
 - Горячие клавиши `0`–`3` для relevance, `e` / `i` / `u` для gate, `Enter` —
-  «Сохранить и следующая».
-- Поле `review_seconds` пишется в журнал UI, не в gold-строку.
+  «Сохранить и следующая». Они действуют вне полей ввода и интерактивных контролов.
+  Native `summary` raw-preview и его потомки также исключены: Enter сохраняет
+  штатное раскрытие и не запускает save/next.
+- Навигация не блокирует ввод во время загрузки. Если после начала перехода
+  человек изменил метки, устаревший переход отменяется, форма и её правки
+  сохраняются. Для перехода нужно нажать ещё раз; новое действие использует
+  обычное подтверждение отмены текущей несохранённой разметки. Ранее данное
+  подтверждение не разрешает отбрасывать более поздние изменения.
+- Ответы detail/page и продолжение «Сохранить и следующая» применяются только
+  к актуальной форме и действию. Поздний ответ, ошибка, обновление выборки или
+  подсказка следующей страницы не отменяют более поздний выбор карточки,
+  закрытие редактора или переход в другой раздел. Успешное сохранение исходной
+  карточки остаётся успешным, даже если последующая навигация устарела.
+- Поле `review_seconds` (конечное число 0–1800) пишется в audit JSON журнала UI,
+  не в gold-строку. Без изменения меток JSONL и дата не переписываются; длительность
+  сохраняется отдельным атомарным событием с дедупликацией uid/version/seconds.
+- Сохраняются source binding, блокировка, контроль версии и backup. Первая
+  человеческая метка v3 заполняет human/blind provenance, `first_labeled_at` и
+  недостающий `rubric_version` из `labeling_rubric.yaml` рядом с rules-конфигом.
+- Изменённая v3-строка получает полный aware `labeled_at` São Paulo с микросекундами;
+  `first_labeled_at` сохраняется точно. Legacy v2 по-прежнему пишет date-only.
 
 ## 11. Тесты
 
-Все тесты — без сети, с фейковыми клиентами по образцу `tests/test_prefilter.py::FakeClient`.
+Все тесты — без внешней сети, с фейковыми клиентами по образцу
+`tests/test_prefilter.py::FakeClient`; HTTP-регрессии используют только loopback.
 
 | Файл | Обязательные случаи |
 | --- | --- |
-| `tests/test_labels_schema.py` | enum и обязательные поля; снимок `docs/schemas` = функция; человеку без цитаты можно `unspecified`, нельзя `restricted_elsewhere`; `null` ≠ 0 |
+| `tests/test_labels_rubric.py` | YAML/hash/nested proposed и registered precedent guards; A6-M1: общий role ID syntax без taxonomy и с ней, валидные новые IDs/other, отдельная enabled membership, сохранность domain/balance/holdout validation |
+| `tests/test_labels_accuracy_outputs.py` | A6-C1: новые JSON/MD во всех accuracy variants и прямом writer; existing frozen-reference/gold/report, occupied second path, symlink/dangling, concurrent publisher; безопасный отказ, неизменность входов и per-file failure boundary |
+| `tests/test_eval_report_outputs.py` | A6-C1 shared writer: gold validate не заменяет frozen-reference; JSON/text и paired rules-diff/classifier outputs отказывают занятым путям, защищают inputs и используют exclusive publication |
+| `tests/test_labels_schema.py` | enum и обязательные поля; стандартная проверка gold/prediction schemas и паритет структурных ограничений с runtime; снимок `docs/schemas` = функция; человеку без цитаты можно `unspecified`, нельзя restrictive; `other` требует domain; пустые детали, implied restrictive, provenance, `null` ≠ 0; строгие date/offset, UTC chronology, точные fractions и mixed calendar precision |
 | `tests/test_labels_prompt.py` | детерминизм байтов; статический префикс одинаков для разных вакансий; enum `unit_id` = units; для `function_core` только duty-ID и title; нет весов и порогов профилей; `notes` прецедентов не попадают |
 | `tests/test_labels_ai_schema.py` | `_gemini_schema` и `_anthropic_schema` для `LABELS_FORMAT` возвращают схему labels, **не** claims; OpenAI получает `json_schema strict`; прочие промпты без изменений |
 | `tests/test_labels_validate.py` | неизвестный ID; company-секция для `function_core`; «No English required» → не `english`; implied `english` сохраняется; implied `portuguese_only` понижается до `unspecified`; «may lead» → `unspecified`; «experience leading teams» → не duty; вопрос «?» → понижение; пустые доказательства → `unspecified` |
-| `tests/test_labels_aggregate.py` | таблица `rules_relevance` §6.5: каждая строка базы; потолок `other`; повышение до 3 только при base 2 (фокус, интересная отрасль, сильная компания — компания только при `confirmed`); −1 за нелюбимую отрасль; −1 / −2 за чужой домен; свой домен без штрафа; ограничение 0–3. Контрольные теги по оценкам gold: argenx → 2, Tiger Analytics → 1, BVGroup → 1, PrizePicks → 0. `normalize_company`; `p2_candidate`; все 6 триггеров эскалации. `gate_outcome`: блокер правил главнее; LLM-only блокер без подтверждения → `unknown`; `portuguese_with_english` не блокер; `portuguese_only` — блокер; implied `english` допускает `eligible`. 4 политики `final_relevance` |
+| `tests/test_labels_aggregate.py` | P0: таблица `rules_relevance` §6.5, каждая база; потолок `other`; повышение только при base=2; подтверждённость company; отраслевые/доменные штрафы и clamp. Синтетические теги argenx → 2, BVGroup → 1, PrizePicks → 0; consultancy industry и required pharma domain проверяются раздельно, без обещания воспроизвести историческую оценку Tiger по неполным фактам. `normalize_company`, `p2_candidate`. P2: все 6 триггеров, gate precedence/LLM confirmation/языки и 4 final policies |
 | `tests/test_labels_gates.py` | closed; неполное описание; слишком длинный текст; title-family только при `aggregation.status: confirmed` |
 | `tests/test_labels_tagger.py` | полный hit; reuse фактов при смене рубрики без API; смена `aggregation` не инвалидирует кеш; ошибка `tag` → `rules_only` и вакансия сохранена; ошибка `escalate` → результат первой стадии; невалидный ответ не кешируется; строки ledger на ретраи; `BudgetExceeded` до вызова; нет цены → отказ |
-| `tests/test_labels_metrics.py` | QWK = 1 при совпадении, известное значение на ручном примере, `None` при одном классе; пропуск предсказания в знаменателе; P@k и порядок сортировки; recall и precision по relevance, а не по tier |
-| `tests/test_labels_gold_v3.py` | перенос решений 1:1; `assisted → curated`; отказ при занятом `out`; manifest с SHA-256 |
+| `tests/test_labels_metrics.py` | QWK = 1/ручной пример/один класс None; связанные ранги Spearman; численный NDCG; P@k с N≥k и predictions<k, включая отсутствие всех прогнозов; очередь; recall/precision по relevance; независимые partial tag/gate метки; required_domain в качестве и κ; повреждённый focus не равен пустому; явная совместимость v1/v2 |
+| `tests/test_labels_gold_v3.py` | решения/source/provenance 1:1; `assisted → curated`; отказ занятым путям; manifest SHA по единому чтению; неизвестная страна; город/штат/агломерация São Paulo; ошибки подготовки/публикации пары, rollback своего inode и сохранение чужого файла |
+| `tests/test_labels_frozen_compatibility.py` | новый run использует v2; сохранённый relevance-scale-v1 проверяется без изменения; неизвестная версия и повреждённое v3-предсказание отклоняются в create/validate; опечатка/отсутствие schema не обходят проверку labels; partial-only gold учитывается даже без прогнозов |
+| `tests/test_labels_frozen_role_recall.py` | R-H1: валидный partial gold без human role, mixed known/unknown, missing/abstention; новый marker/hash/JSON roundtrip; независимо заданный literal legacy metric; unknown/mixed versions и replay без изменения файлов |
+| `tests/test_labels_frozen_coverage.py` | F-H1: собственные human-выборки и необходимые поля каждого gate, partial NDCG, одинаковые пропуски baseline/candidate/repeat; неизменные численные метрики и replay |
+| `tests/test_cohorts_atomic.py` | F-C1: новый выход полностью записан и закрыт до эксклюзивной публикации; ошибки write/flush/fsync/close/link, безопасный повтор, занятые пути и конкурентная публикация без перезаписи; fstat failure не удаляет inode неизвестного владельца |
 | `tests/test_labels_pipeline.py` | `enabled: false` → вывод `run` / `reevaluate` идентичен прежнему (сравнить сериализацию `EvaluatedJob`); `shadow` не меняет tier и decision; `labels` + `score` не меняет tier; `labels` + `relevance` + `status: confirmed` → A ⇔ 3; в `labels` annotator не делает платных вызовов, а prefilter не вызывается; смена роли пересобирает stream |
-| `tests/test_labels_cli.py` | `--ai` без `--max-cost` → ошибка; `--export` не пишет в SQLite (сверка mtime и SHA файла); `--job-uid` + `--limit` → ошибка; предсказания принимаются `frozen_eval.create_run` |
+| `tests/test_labels_cli.py` | P0: migrate/validate/accuracy без API и записи в SQLite; защита входов; source binding; обязательные/лишние поля, вложенные enum, NaN/Infinity, повреждённые confidence/focus и human-only причины отклоняются до отчёта; baseline принимается frozen.create_run. P2: `--ai` без `--max-cost`, read-only `--export`, несовместимые `--job-uid`/`--limit` |
+| `tests/test_labels_gold_ui.py` | P1: schema-aware v2/v3, частичные шесть тегов, gate reasons, provenance, строгая валидация, blind whitelist, default path и фиксация выбора, audit-only время и no-op, сохранность v2/SQLite/остальных строк; same-target symlink, общий lock/version, aware timestamp rollover и сохранность first date |
+| `tests/test_labels_gold_web_ui.py` | P1: DOM-форма, отсутствие/unspecified/пустой focus, поля domain, цитаты только из source, metadata-only DOM→quote→store binding, подписи вне цитат, SUMMARY/потомки вне hotkeys, время, dirty tracking и сохранение порядка массивов |
+| `tests/test_labels_gold_navigation.py` | A7-M1: ввод после начала detail/page GET, новые правки после разрешённого discard, сохранность полного draft и повторный переход с accept/decline; stale response/error, новый editor, close/view/save и save-next refresh/offset не отменяют более позднее действие. Настоящие JS-функции в Node Element harness, без утверждения о browser DOM/native events |
+| `tests/test_labels_gold_web_server.py` | P1: настоящий локальный HTTP GET/PATCH v3, полный tag payload, partial save, blind read model, журнал, отказ invalid/stale без записи, явный v2 при наличии v3; canonical symlink stale409, UTC timestamp rollover и metadata-only цитаты |
 | `tests/test_prefilter*.py` | без изменений: после переноса `duty_unit_ids` в `annotation/scope.py` все проходят |
+
+Регрессии повторного аудита также покрывают неизвестные фразы и все альтернативы
+офисной локации (включая São Paulo после разделителя), custom frozen variants и
+v1 replay с повреждённой v3 строкой, tag-only repeat, сортировку и полный CLI/frozen
+JSON roundtrip с `fit_score=±10**400`. CLI отвергает неизвестную/отключённую роль,
+принимает новую enabled роль, `other` и `null` и не пропускает проверку при отсутствии
+таксономии. `test_labels_rubric.py` проверяет domain_fit через настоящий registered
+loader с восемью сбалансированными примерами, без подмены cohort/holdout guard.
 
 ## 12. Фазы и критерии готовности
 
 | Фаза | Объём | Готово, когда |
 | --- | --- | --- |
-| **P0. Схема, метрики, базовый уровень** (без API) | `labeling/schema.py`, `rubric.py` + `config/labeling_rubric.yaml` (`status: proposed`), `metrics.py`, `predictions.baseline_predictions`, `gold_v3.py`, CLI `gold migrate-v3`, `gold validate` для v3, `eval accuracy --variant rules`; встраивание `relevance_scale` в accuracy и frozen | тесты зелёные; создан `vacancy-labels-v3.jsonl` из текущего v2-labeled по новому пути; отчёт базового уровня `rules` с QWK, recall и precision, P@k |
-| **P1. UI разметки v3** (без API) | `gold_ui` v3, 6 тегов, горячие клавиши, слепота | пользователь размечает карточку v3 в CRM; запись проходит валидатор; v2-файлы открываются как раньше |
+| **P0. Схема, метрики, базовый уровень** (без API) | schema + Draft 2020-12 validation; rubric + подтверждённые разделы §5.2 (strong_companies proposed); metrics v2 с read-only пересчётом исторического v1; baseline; миграция; CLI migrate/validate/accuracy rules\|labels; hooks accuracy/frozen. Dataclasses LabelResult/TagValue и label_predictions — P2 | тесты зелёные; v3 создан по новому пути с manifest, исходник сохранён; baseline с QWK, recall/precision, P@k; регрессии высокого/среднего уровня аудита закрыты без изменения критериев и рабочих данных |
+| **P1. UI разметки v3 — реализована** (без вызовов моделей) | `gold_ui` v3, 6 тегов, причины gate, цитаты, горячие клавиши, слепота, журнал времени | карточка v3 сохраняется через CRM с полной валидацией; v2-файлы открываются как раньше; проверено на временных данных, рабочий эталон не переразмечен |
 | **P2. Теггер, только экспорт** | `scope.py` (перенос), `gates.py`, `prompt.py`, регистрация схем в `ai.py`, `validate.py`, `aggregate.py`, `tagger.py`, ledger, бюджет, `LabelingConfig`, CLI `label --export` | тесты зелёные; `label --export --bundle … --max-cost` с фейковым клиентом в тесте. **Реальный пилот — только по команде пользователя:** Gemini 3.5 Flash-Lite, 3.8 Flash и каскад Flash-Lite → 3.8 Flash, по 3 прогона на калибровке; победитель — один прогон на holdout; **общий лимит $3** (U6, U7) |
 | **P3. Pipeline и хранение** | `pipeline.py`, `tiering.py`, колонки, repository, `label` без `--export`, `--offline`, `reevaluate`, сериализация CRM, P2 из labels и новая версия `purpose_rubric.yaml` (§8) | `enabled: false` → прежний вывод бит в бит; `shadow` пишет `labels_v3` без изменения tier; документация обновлена |
 | **P4. Задел** (по отдельному поручению) | эмбеддинги + голова для `role_label`; дистилляция при 1–2 тыс. меток | не начинать без поручения |
@@ -1049,3 +1314,304 @@ skip_two_pass = labels is not None and self.config.labeling.mode == "labels"
 | Стоимость вне контроля при ретраях | ledger на каждую попытку, `BudgetGuard` до вызова, `--max-cost` обязателен |
 | Личные данные в промпте | прецеденты без `notes`; рубрика на английском без личных обстоятельств; тест на отсутствие `notes` |
 | Рост сложности `_evaluate_record` | вся логика в `labeling/*`; в pipeline — вызов, ветка `mode` и пересборка stream |
+
+## 15. Исправления высокого и среднего уровня по аудиту 20.10.2026
+
+Исторический [отчёт-аудит](audit-labels-v3-implementation-2026-10-20.md) описывает
+ревизию `d63d5db` и не переписывается задним числом. Исправления ниже не меняют YAML
+критериев, оценки человека или рабочие gold/SQLite/отчёты; проверки миграции и eval
+пишут только во временные каталоги. Низкие находки не включены в этот объём.
+
+| ID аудита | Исправление | Регрессионная проверка |
+| --- | --- | --- |
+| H1 | P@k делится на min(k,N), пропуски снижают результат | `test_labels_metrics.py`: predictions<k, все missing; frozen новый v2 denominator |
+| H2 | Только однозначная география/страна; неподдержанное значение отражено как dropped | `test_labels_gold_v3.py`: Campinas/SP state, broad regions, отсутствующая/неизвестная страна и поддержанные city/country формы |
+| H3 | Полный closed-schema/finite JSON checker перед accuracy и новым frozen eval; malformed focus не exact | `test_labels_prediction_validation.py`, CLI, frozen create/validate и focus metrics |
+| H4 | Одно чтение source для SHA и разбора | `test_labels_gold_v3.py`: подмена пути после captured read не меняет разобранные строки |
+| M1 | required_domain измеряется в качестве и κ | `test_labels_metrics.py`: ошибочный required_domain при совпавших requirement/industry |
+| M2 | Независимые human-выборки тегов/gate и v3 hook без ordinal-предсказаний | partial tag/gate direct и frozen, с пустыми prediction rows |
+| M3 | other требует непробельного domain | schema/runtime/CLI позитивные и негативные примеры |
+| M4 | Staging двух файлов до публикации, rollback своих inode при обычной ошибке | ошибка staging/второй публикации; чужой файл не удаляется; предел crash-контракта — §6.9 |
+| M5 | Общая Draft 2020-12 структура и согласованные gold-ограничения | стандартный validator, runtime parity, snapshot, nullable/provenance/restrictive/empty-detail случаи |
+| M6 | Отрасль работодателя отделена от требуемого домена в контрольном примере | `test_required_domain_does_not_replace_employer_industry`; историческое Tiger=1 не переразмечается |
+
+Поддержка создания v3 gold-бандлов, реестр прецедентов, LabelingConfig, S3/теггер,
+UI и pipeline остаются предпосылками/работой следующих фаз (§12), а не скрыто
+объявленными результатами этого исправления.
+
+Проверка исправлений: **2964 passed** в полном `.venv/bin/pytest` (39,01 с),
+`.venv/bin/ruff check src tests --no-cache` — pass. Для HTTP-тестов разрешены локальные
+порты; внешние соединения, `.env` и запись тестового Python в репозиторий блокировались.
+Миграция/validate/rules eval проверены с выходами только во временном каталоге:
+171 строка, valid=True, baseline N=54, QWK=0,373134, recall≥2=12/17; для 44 blind —
+recall 7/7, precision 7/19. Все три сохранённых frozen-прогона проходят validate_run.
+Полученный v3 JSONL побайтно совпал с существующим снимком. SHA-256 рабочей SQLite,
+10 gold JSONL и восьми YAML-конфигов (**19 файлов**) до и после совпал. Эти результаты
+подтверждают исправления P0 и сохранность данных, но не заменяют гейты будущего пилота.
+
+## 16. Исправления по повторному аудиту labels-v3
+
+[Повторный аудит](audit-labels-v3-implementation-2026-10-20-2.md) сохраняется как
+исторический отчёт. Закрыты его высокая и пять средних находок; низкие замечания
+не входят в этот объём. Критерии пользователя, YAML, рабочие gold/SQLite и прежние
+отчёты не менялись. Уточнения реализованного контракта внесены в §4.4, §5.3, §6.7,
+§6.9 и §11.
+
+| ID повторного аудита | Исправление | Регрессионная проверка |
+| --- | --- | --- |
+| A-H1 | Нет office_elsewhere по умолчанию: распознаётся вся строка города и уточнений; неизвестность/альтернативы → dropped, tag map v3 | 146 случаев gold migration, включая полный v2→v3/manifest для Location TBD/TBC и São Paulo в разных позициях списка |
+| A-M1 | Проверка v3 по bundle/маркерам строки, независимо от experiment variant и версии replay-метрик | custom/labels/labeler/bundle markers, create/validate до метрик, implied blocker, malformed v3/v1; legacy без v3-маркеров остаётся валидным |
+| A-M2 | Labels stability включается для v3 tag-only repeat без ordinal relevance | два function_core, N=0 relevance, paired=2 и κ=1 на v2/v3 bundle |
+| A-M3 | Конечность int проверяется без float conversion во всех score-путях baseline/accuracy/queue/frozen | точный mixed int/float порядок и JSON roundtrip ±10**400 через CLI/create_run/validate_run; NaN/Infinity/bool по-прежнему отклоняются |
+| A-M4 | Precedent domain_fit использует общие v3 ограничения вместо неполной ручной проверки | 26 новых valid/invalid случаев настоящего registered loader; other+domain, none/null, тип/длина/пустота/extra fields |
+| A-M5 | Labels-eval сверяет роли с enabled streams; отсутствие таксономии останавливает оценку | неизвестная/disabled роль отвергается до отчёта; новая enabled роль, other/null принимаются; SQLite/входы неизменны |
+
+Итоговый полный прогон: **3057 passed** (39,62 с), включая 93 новых регрессионных
+случая относительно повторного аудита; `.venv/bin/ruff check src tests --no-cache`
+и `git diff --check` — pass. Для полного pytest разрешены локальные HTTP-порты;
+внешние соединения, реальные `.env` и запись тестового Python в репозиторий
+блокировались. Предварительный sandbox-прогон упёрся в те же девять HTTP-проверок;
+он не подменяет итоговый зелёный результат.
+
+Read-only проверки с выходами только во временном каталоге: миграция 171 строки,
+valid=True, JSONL побайтно равен рабочему v3-снимку; baseline N=54,
+QWK=0,373134, recall≥2=12/17; blind44 — recall7/7, precision7/19. Все три сохранённых
+frozen-прогона проходят validate_run. SHA-256 рабочей SQLite, десяти gold JSONL и
+восьми YAML-конфигов (**19 файлов**) совпал до/после. Рабочий v3-снимок повторно
+не записывался; изменилась только версия технической таблицы в новом временном
+manifest. Гейты будущего пилота и работы P1/P2 этим не объявляются выполненными.
+
+## 17. Третий аудит и реализация P1
+
+Средняя находка **S-M1** [третьего аудита](audit-labels-v3-implementation-2026-10-20-3.md)
+закрыта: loader профилей, runtime и обе JSON Schema используют общий синтаксис
+stream ID из `utils/identifiers.py`. Принимаются ID с `_`, повторным или конечным
+`-`, разрешённые loader; пробелы, переносы строк и посторонние символы отклоняются.
+Проверка принадлежности enabled streams сохранена. Добавлены 22 регрессионных
+случая schema/CLI; ID, YAML и критерии не менялись. Низкие находки третьего аудита
+в этот объём не входят, исторические отчёты сохранены.
+
+**P1 выполнена:** Gold UI различает v2/v3, выбирает существующий v3 по умолчанию,
+редактирует шесть фактических тегов, причины gate и три человеческих решения.
+Доступны выделение цитат, горячие клавиши и сохранение частичной разметки.
+Проверяются закрытая схема, source binding, enabled роли и provenance;
+сохранение защищено версией строки, блокировкой и атомарной заменой с backup.
+Время просмотра хранится отдельно в журнале. Слепой read model не передаёт
+машинные оценки, даже если в невалидном входе есть лишние поля.
+
+Регрессии покрывают store, DOM-форму и настоящий GET/PATCH через локальный HTTP,
+включая явное открытие v2 при наличии v3 и совместимость Discovery. Сценарий
+«выделить цитату → выбрать тег → заполнить решения горячими клавишами → сохранить»
+также проверен в браузере на синтетической SQLite/gold во временном каталоге.
+Найденный при проверке край HTML-списков закрыт: UI больше не добавляет `•`
+в выделяемую canonical-цитату; регрессия проводит её из DOM-формы в настоящий store
+с успешным source binding и сохранением. Legacy-оформление v2 сохранено.
+
+Добавлены **104 тестовых случая**: 22 для S-M1, 35 store, 34 DOM/quote integration
+и 13 HTTP. Итоговый полный прогон — **3161 passed** (51,90 с);
+`.venv/bin/ruff check src tests --no-cache` и `git diff --check` — pass.
+HTTP-тестам разрешён только loopback; внешние соединения, реальные `.env` и запись
+тестового Python в репозиторий блокировались.
+
+Рабочий эталон не переразмечался: проверка существующего v3 через read-only SQLite
+даёт `valid=True`, 44 заполненных решения и 7 релевантных; отчёт записан только
+во временный каталог. SHA-256 **122 файлов** (YAML, gold, рабочие/резервные SQLite,
+сохранённые eval-артефакты) совпадает с начальным снимком. P2/платные вызовы,
+pipeline, хранение машинных labels и обычная CRM-сериализация P3 не запускались.
+
+## 18. Исправления высокой и средних находок аудита P0–P1
+
+[Четвёртый аудит](audit-labels-v3-implementation-2026-10-20-4.md) остаётся
+историческим отчётом. Исправлены R-H1 и R-M1–R-M4; низкие замечания не включены
+в этот объём. Пользовательские решения, YAML, stable ID, рабочие gold/SQLite,
+сохранённые eval-отчёты и exposure journals не менялись.
+
+| ID | Исправление | Регрессионное доказательство |
+| --- | --- | --- |
+| R-H1 | Собственная human-known-role выборка в frozen-task-metrics-v2, missing/abstention не равны пустому human target; marker/hash/replay и отказ смешанным версиям | 22 новых случая в test_labels_frozen_role_recall: partial/mixed/other, независимый literal legacy metric, JSON roundtrip, unknown/mixed versions, отсутствие изменения старого run |
+| R-M1 | Default и explicit gold path одинаково resolve до pin/lock; symlink сохраняется, stale409 на общем target | Store same-target/same-row/different-row; настоящий HTTP save + stale explicit store, один target/version |
+| R-M2 | Все поддержанные canonical source-поля и две metadata-строки видны отдельными точными блоками; подписи не становятся доказательством | Четыре metadata-only DOM→insert→payload→real store.save с точным unit binding; malformed/machine whitelist; HTTP metadata→save |
+| R-M3 | SUMMARY и вложенные элементы исключены из global hotkeys | Настоящий DOM summary/span: Enter/i/0/3 не вызывают save/next, не меняют draft и не подавляют native default |
+| R-M4 | Строгие date/offset, точные UTC timestamps, явно ограниченная calendar precision для date-only; aware SP save только v3 | Offset/calendar/reverse/fraction/boundary-year/mixed tests; store и HTTP timezone rollover; first_labeled_at неизменён; legacy v2 date-only tests проходят |
+
+Добавлены **88 регрессионных случаев**: 22 frozen, 47 schema/store, 16 DOM и
+3 HTTP. Полный прогон: **3249 passed** (54,32 с), включая loopback HTTP;
+`.venv/bin/ruff check src tests --no-cache` и `git diff --check` — pass.
+Внешняя сеть, реальные `.env` и запись тестового Python в репозиторий блокировались;
+первый HTTP-запуск в sandbox остановился на запрете bind, итоговый прогон выполнен
+с разрешённым локальным портом и теми же ограничениями рабочих данных.
+
+Read-only интеграция: миграция 171 строки во временный каталог, valid=True,
+новый JSONL побайтно равен рабочему v3-снимку. Baseline остаётся N54,
+QWK=0,373134, recall≥2=12/17; blind44 — recall7/7, precision7/19. Все три
+сохранённых frozen-run проходят validate_run без изменения файлов; прежние
+16 верхних ключей saved accuracy сохранены. На десяти валидных partial строках
+gold без human role corrected role_recall даёт N0/value=null; явный legacy replay
+сохраняет историческое 10/10, не выдавая его за новое измерение.
+
+SHA-256 **7431 защищённого файла** (рабочие данные и резервные копии, восемь YAML,
+четыре исторических аудита) совпал до/после проверок. Изменения формата новых
+технических отчётов не являются изменением пользовательских критериев. P2,
+v3 freeze/gates, регистрация когорт и платный пилот остаются отдельными задачами.
+
+## 19. Исправления критической и высокой находок пятого аудита
+
+[Пятый аудит](audit-labels-v3-implementation-2026-10-20-5.md) сохранён как исторический
+отчёт. Закрыты F-C1 и F-H1; низкие замечания не включены в этот объём.
+Пользовательские критерии, YAML, stable ID, рабочие gold/SQLite, сохранённые
+eval-артефакты и exposure journals не менялись.
+
+| ID | Исправление | Регрессионное доказательство |
+| --- | --- | --- |
+| F-C1 | Общий write_new_text публикует полностью записанный, fsynced и закрытый sibling-файл через exclusive hardlink; JSON/Markdown/JSONL не заменяют final, pre-publication failure допускает повтор файла | 31 случай test_cohorts_atomic: реальные partial write/EIO, flush/fsync/close/link failures, CLI run/union-frame retry, Markdown failure, занятые file/directory/symlink/dangling paths, конкурентная публикация и cleanup только при известной собственной identity |
+| F-H1 | Coverage каждого gate использует ту же human population и нужные output-поля; partial NDCG не проходит; repeat не принимает одинаковые пропуски | 70 случаев test_labels_frozen_coverage: DEFAULT_POLICY 160+1 из аудита, partial/missing/abstention по задачам и трём run, полные и неприменимые случаи; numeric replay неизменён |
+
+Атомарность F-C1 означает видимость полного JSON по final path. Directory fsync
+и устойчивость directory entry к потере питания не обещаются. Ошибка очистки
+staging после успешной публикации сообщает об ошибке, но оставляет полный final;
+опубликованный результат не удаляется ради rollback. Чужой inode не очищается;
+при ошибке определения identity сохраняются staging и исходная ошибка.
+Markdown сравнения и JSONL union-frame также используют общий текстовый publisher.
+Пара JSON/Markdown не crash-atomic: если публикация Markdown не состоялась, ранее
+опубликованный полный JSON сохраняется; повтор всей команды требует нового пути.
+Новый marker coverage относится только к новому comparison, не к записанным run
+или predeclared policy. Поддержанный v3-gold freeze, переход со старых19 tags на
+schema-aware acceptance, реестр когорт и платный пилот остаются работой P2.
+
+Добавлен **101 регрессионный случай**: 31 atomic/caller и 70 frozen coverage.
+В существующем test_labels_metrics fixture прогонов теперь содержит известную
+human role: проверка ordinal drift выполняется при полном остальном покрытии,
+а не при одинаковом отсутствии ролей. Численные ожидания relevance не изменены.
+
+Итоговый полный pytest — **3350 passed** (55,96 с);
+`.venv/bin/ruff check src tests --no-cache` и `git diff --check` — pass.
+Предварительный sandbox-прогон остановил 25 HTTP-сценариев на запрете bind;
+итоговый прогон выполнен с разрешённым loopback. Внешняя сеть, настоящие `.env`
+и запись тестового Python в репозиторий блокировались защитным hook.
+Независимая проверка исходного DEFAULT_POLICY 160+1 теперь получает
+`insufficient_evidence`; после заполнения пропущенного prediction в памяти
+все 19 gates проходят. Исходные bundle/run этой проверки не перезаписывались.
+
+Read-only интеграция сохранила прежние результаты: миграция 171 строки в TMP,
+valid=True, JSONL побайтно равен рабочему v3; baseline N54, QWK=0,373134,
+recall≥2=12/17; blind44 — recall7/7, precision7/19. Три сохранённых frozen-run
+проходят validate_run, прежние 16 ключей saved accuracy сохранены.
+SHA-256 **7438 защищённых файлов** (данные, конфиги и пять исторических аудитов)
+совпал до/после; новых файлов в data/config нет. Полные логи и снимки хешей —
+`/private/tmp/labels-v3-fixes-22JW5q`.
+
+## 20. Исправления критической и средней находок шестого аудита
+
+[Шестой аудит](audit-labels-v3-implementation-2026-10-20-6.md) сохранён как
+исторический отчёт. Исправлены A6-C1 и A6-M1; низкие замечания не включены
+в этот объём.
+
+| ID | Исправление | Регрессионное доказательство |
+| --- | --- | --- |
+| A6-C1 | Общий guard проверяет занятость final names, включая symlink/dangling, и canonical identity входов. Accuracy saved/rules/labels и общие evaluation JSON/text writers, включая gold validate, публикуют файлы через exclusive write_new_text. Accuracy, rules-diff и classifier comparison проверяют оба выхода до первой публикации | Валидный frozen-reference, unrelated gold/report, занятый второй путь, directory/symlink/dangling, aliases входов/родителя, конкурирующий publisher, сбои публикации и прежние JSON/Markdown bytes |
+| A6-M1 | Loader прецедентов всегда проверяет role_label через fullmatch общего STREAM_ID_PATTERN. Переданные role_ids дополнительно ограничивают membership; other допустим | 53 новых случая через настоящий registered loader: empty/whitespace/newline, неверные типы и синтаксис, синтаксически неверные allowlisted IDs, допустимые новые ID с taxonomy и без неё |
+
+Имена отчётов по умолчанию сохранены, но прежний report больше не заменяется:
+для повторного запуска, включая `accuracy saved`, требуется новый `--output`.
+Запрет действует и при прямом вызове writer. Проверка обоих accuracy-путей
+в CLI выполняется до расчёта и регистрации exposure. Сериализация JSON,
+порядок ключей, Markdown, формулы метрик, пользовательские критерии и ID
+не изменены. Проверка роли без taxonomy ограничена синтаксисом и не угадывает
+актуальную membership.
+
+Гарантия publisher остаётся пофайловой: JSON/Markdown не являются одной
+транзакцией. При ошибке Markdown полный опубликованный JSON сохраняется,
+а повтор пары требует нового пути. Directory fsync и устойчивость к потере
+питания не добавлены. Кеши, обычный экспорт и сохранение Gold UI этим изменением
+не затронуты.
+
+Добавлены **118 регрессионных случаев**: 53 rubric, 35 accuracy и 30 общих
+evaluation writers/парных отчётов. Существующие тесты не ослаблялись и не менялись.
+Объединённый целевой прогон — **221 passed**; отдельный rubric-прогон —
+**95 passed**. Независимая проверка трёх paired writers подтвердила прежние
+JSON/Markdown bytes, неизменность входных объектов, отказ aliases/dangling и
+сохранность чужого файла при конкурентной публикации.
+
+Исходное воспроизведение A6-C1 повторено обычным CLI на временной копии валидного
+frozen-reference: `accuracy rules` и `gold validate` возвращают exit 2, SHA-256
+reference не меняется и последующий `validate_run` проходит. Рабочий gold читается
+через read-only SQLite, все выходы этой проверки находятся в TMP.
+
+Итоговый полный pytest — **3468 passed** (56,27 с), включая loopback HTTP;
+`.venv/bin/ruff check src tests scripts/compare_role_classifier.py --no-cache`
+и `git diff --check` — pass. Предварительный sandbox-прогон дал 3443 passed,
+а 25 HTTP-сценариев остановил системный запрет bind; итоговый прогон выполнен
+с разрешёнными локальными портами. Внешняя сеть, чтение настоящего `.env`
+и запись тестового Python в репозиторий блокировались защитным hook.
+
+Read-only интеграция сохранила прежние результаты: миграция 171 строки в TMP,
+valid=True, новый JSONL побайтно равен рабочему v3; baseline N54,
+QWK=0,373134, recall≥2=12/17; blind44 — recall7/7, precision7/19.
+Три сохранённых frozen-run проходят `validate_run`, прежние 16 верхних ключей
+saved accuracy и вложенные структуры сохранены. P1 read model по-прежнему
+открывает v3 с шестью тегами, 44 complete и 11 partial строками без machine fields.
+
+SHA-256 **7439 защищённых файлов** (данные, конфиги и шесть исторических аудитов)
+совпал до/после; новых и удалённых файлов в data/config нет. Пользовательские
+критерии, stable ID, рабочие gold/SQLite, сохранённые отчёты и exposure journals
+не менялись. P2, регистрация когорт и платные вызовы не запускались.
+Логи, синтетические артефакты и снимки хешей —
+`/private/tmp/labels-v3-audit6-fixes-Lfc9Bv`.
+
+## 21. Исправление средней A7-M1 седьмого аудита
+
+[Седьмой аудит](audit-labels-v3-implementation-2026-10-20-7.md) сохранён как
+исторический отчёт. Исправлена A7-M1, включающая прежнюю R-L6: новый ввод во время
+ожидания навигации не теряется, а старый save-next не отменяет более поздний выбор
+карточки. Семь низких находок аудита не входят в эту правку.
+
+Навигация хранит контекст действия: номер запроса, последовательность обновления
+очереди, объект редактора и canonical-снимок текущих меток. После ожидания проверяется
+актуальность этого контекста, включая view и сохранение. Сигнатура относится к
+меткам, причинам gate и тегам, а не к таймеру просмотра или disabled-состоянию UI.
+Замена редактора на новый объект распознаётся и при том же job_uid.
+
+| Сценарий | Итоговое поведение |
+| --- | --- |
+| Новые правки во время detail/page GET, в том числе после разрешённого discard | Прежний переход отменяется; форма, полный draft и dirty сохраняются. Сообщение предлагает нажать переход ещё раз. Автоматического повторного confirm нет |
+| Повторный явный переход | Обычное подтверждение относится к актуальному draft; отказ сохраняет его, согласие открывает следующую карточку. Без новых правок лишнего confirm нет |
+| Новый выбор, close/view/reset или новый редактор во время GET | Устаревшие ответы и ошибки не заменяют текущую форму и не переоткрывают закрытую |
+| Page получена, destination detail ещё ожидается | Очередь/offset и редактор публикуются вместе после последней проверки; page остаётся подготовленной до принятия detail |
+| Save начат при pending GET, затем PATCH отклонён | Начало save инвалидирует прежнюю навигацию; старый GET не заменяет draft/сообщение конфликта и не оставляет прежний loading-текст |
+| PATCH успешен, затем новый выбор/правки во время refresh или offset/detail | Сохранение остаётся успешным; прежнее продолжение save-next не меняет новый редактор, очередь, offset и сообщения |
+| Запоздавший refresh или его ошибка | Контекст проверяется до изменения queue/message и рекурсивного перехода к последней странице; loading освобождает только владелец своей sequence |
+
+Ввод при навигации не блокируется. Это отмена устаревшего действия, а не разрешение
+отбросить изменения по старому подтверждению. Успешный PATCH не откатывается, даже
+если последующая навигация больше не нужна. Форматы API/gold, source binding,
+store version/lock/backup, review_seconds и пользовательские критерии не менялись.
+
+Регрессии исполняют настоящие функции UI в существующем Node Element harness.
+Они проверяют состояние полного draft, очередь, offset, API-вызовы и сообщения;
+browser DOM/native events этой проверкой не заявляются. Ожидания в новом файле
+ограничены числом microtask turns, чтобы регрессия не зависала бесконечно.
+
+Добавлен **31 регрессионный случай** в `test_labels_gold_navigation.py`.
+Четыре основных detail/page × clean/prior-confirmed случая до исправления падали
+на потере текущего редактора и draft. Финальный целевой прогон — **98 passed**:
+31 новый случай и 67 прежних UI-тестов. Старые тесты и ожидания не менялись.
+Независимые четыре async-пробы на финальном JS также прошли: failed PATCH при
+pending GET, новый ещё ожидаемый выбор при старом refresh, close при page GET
+и staged save-next page/detail. Эти числа пересекаются и не суммируются с полным
+прогоном.
+
+Итоговый полный pytest — **3499 passed** (57,20 с), включая loopback HTTP;
+`.venv/bin/ruff check src tests --no-cache` и `git diff --check` — pass.
+Для полного прогона разрешены локальные порты; защитный hook блокировал внешнюю
+сеть, чтение настоящего `.env`, запись тестового Python в репозиторий и открытие
+рабочей SQLite без read-only режима. Все тестовые данные находятся в TMP.
+
+SHA-256 **7439 защищённых файлов** (рабочие данные/конфиги и семь исторических
+аудитов, без служебного кеша) совпал с исходным снимком. Новых и удалённых файлов
+в data/config нет; остальные существующие файлы, кроме целевых JS/design doc,
+не изменены. Diff `search_profiles.yaml`, `rules.yaml`, `settings.yaml` и
+pipeline/prefilter/scoring/storage/AI относительно `8bb3a2a` пуст.
+Пользовательские метки, stable ID, сохранённые отчёты и exposure journals
+не менялись; рабочая CRM и платные вызовы не запускались.
+Логи, исходный снимок и независимые пробы —
+`/private/tmp/labels-v3-a7-fix-r2wvEw`.

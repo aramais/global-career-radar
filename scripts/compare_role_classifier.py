@@ -25,6 +25,7 @@ from job_intake.annotation.accuracy import _parser_only_drift, evaluate_vacancie
 from job_intake.annotation.benchmark import read_jsonl
 from job_intake.annotation.eval_runner import (
     read_saved_records,
+    report_destinations,
     sqlite_path,
     write_report,
     write_text_report,
@@ -368,12 +369,12 @@ def render_markdown(report: dict) -> str:
 def save_comparison(
     report: dict, output: Path, *, protected_paths: list[Path],
 ) -> tuple[Path, Path]:
-    output = output.expanduser().resolve()
-    markdown = output.with_suffix(".md")
-    protected = {path.expanduser().resolve() for path in protected_paths}
-    if output.suffix != ".json" or output in protected or markdown in protected:
+    if output.suffix != ".json":
         raise ValueError("Output must be a JSON report and must not overwrite input files")
     # Validate both destinations before writing either of them.
+    output, markdown = report_destinations(
+        [output, output.with_suffix(".md")], protected_paths=protected_paths,
+    )
     summary = render_markdown(report)
     json_path = write_report(report, output, protected_paths=[*protected_paths, markdown])
     write_text_report(summary, markdown, protected_paths=[*protected_paths, output])

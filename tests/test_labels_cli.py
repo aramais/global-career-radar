@@ -11,6 +11,7 @@ import pytest
 from typer.testing import CliRunner
 
 from job_intake import cli
+from job_intake.annotation.accuracy import _profile_versions
 from job_intake.annotation.frozen_eval import create_run, record_from_snapshot, source_snapshot
 from job_intake.annotation.gold import _snapshot
 from job_intake.annotation.text import TEXT_VERSION, source_hash
@@ -82,6 +83,20 @@ def stored(tmp_path, monkeypatch):
         company_watchlist_path=tmp_path / "companies.yaml", export_dir=tmp_path,
         telegram=TelegramConfig(), llm=LLMConfig(),
     )
+    settings.rules_path.write_text("{}\n")
+    settings.search_profiles_path.write_text(
+        "streams:\n- id: analytics-leadership\n- id: disabled-role\n  enabled: false\n"
+        "- id: disabled_role\n  enabled: false\n"
+    )
+    versions, classifier_version = _profile_versions(settings)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE jobs SET role_classification = ?",
+            (json.dumps({"label": "analytics-leadership", "version": classifier_version,
+                         "source_hash": source_hash(record), "content_hash": "content"}),),
+        )
+        connection.execute("UPDATE job_relevance_evaluations SET profile_version = ?",
+                           (versions["analytics-leadership"],))
     current = {"settings": settings}
     monkeypatch.setattr(cli, "load_app_config", lambda _: current["settings"])
 
@@ -207,6 +222,136 @@ def test_labels_variant_scores_supplied_predictions(stored, tmp_path):
     result = invoke("eval", "accuracy", "--config", config, "--gold", gold, "--variant",
                     "labels", "--predictions", predictions, "--output", tmp_path / "y.json")
     assert result.exit_code == 2 and "relevance" in text(result)
+
+
+@pytest.mark.parametrize("role", ["audit-nonexistent-role", "audit_nonexistent_role",
+                                  "disabled-role", "disabled_role"])
+def test_labels_cli_checks_enabled_role_membership_before_writing(stored, tmp_path, role):
+    database, record, config, _ = stored
+    gold = write_jsonl(tmp_path / "gold.jsonl", [gold_row(record)])
+    row = baseline_predictions([("uid", record)], {
+        "uid": {"role_label": role, "tier": "B", "fit_score": 10},
+    })[0]
+    predictions = write_jsonl(tmp_path / "predictions.jsonl", [row])
+    protected = {p: snapshot(p) for p in (database, gold, predictions)}
+    output = tmp_path / "report.json"
+    result = invoke("eval", "accuracy", "--config", config, "--gold", gold, "--variant",
+                    "labels", "--predictions", predictions, "--output", output)
+    assert result.exit_code == 2, result.output
+    assert "row 1:" in text(result) and "$.role_label" in text(result)
+    assert role not in result.output
+    assert not output.exists() and not output.with_suffix(".md").exists()
+    assert all(snapshot(p) == before for p, before in protected.items())
+
+
+@pytest.mark.parametrize("role", ["analytics-leadership", "new-enabled-role", "new_enabled_role",
+                                  "new--role", "new-role-", "other", None])
+def test_labels_cli_accepts_current_roles_other_and_abstention(stored, tmp_path, role):
+    database, record, config, current = stored
+    current["settings"].search_profiles_path.write_text(
+        "streams:\n- id: analytics-leadership\n- id: new-enabled-role\n"
+        "- id: new_enabled_role\n- id: new--role\n- id: new-role-\n"
+    )
+    gold = write_jsonl(tmp_path / "gold.jsonl", [gold_row(record)])
+    row = baseline_predictions([("uid", record)], {
+        "uid": {"role_label": role, "tier": "B", "fit_score": 10},
+    })[0]
+    predictions = write_jsonl(tmp_path / "predictions.jsonl", [row])
+    protected = {p: snapshot(p) for p in (database, gold, predictions)}
+    output = tmp_path / "report.json"
+    result = invoke("eval", "accuracy", "--config", config, "--gold", gold, "--variant",
+                    "labels", "--predictions", predictions, "--output", output)
+    assert result.exit_code == 0, result.output
+    assert json.loads(output.read_text())["predictions"][0]["role_label"] == role
+    assert all(snapshot(p) == before for p, before in protected.items())
+
+
+@pytest.mark.parametrize("role", ["new_enabled_role", "new--role", "new-role-"])
+def test_gold_cli_accepts_loader_valid_ids_without_renaming(stored, tmp_path, role):
+    database, record, config, current = stored
+    current["settings"].search_profiles_path.write_text(
+        f"streams:\n- id: analytics-leadership\n- id: {role}\n"
+    )
+    gold = write_jsonl(tmp_path / "gold.jsonl", [gold_row(record, role_label=role)])
+    protected = {p: snapshot(p) for p in (database, gold)}
+    output = tmp_path / "validation.json"
+    result = invoke("gold", "validate", "--config", config, "--gold", gold, "--output", output)
+    assert result.exit_code == 0, result.output
+    report = json.loads(output.read_text())
+    assert report["valid"] is True
+    assert report["rows"][0]["role_label"] == role
+    assert all(snapshot(p) == before for p, before in protected.items())
+
+
+def test_labels_cli_requires_taxonomy_instead_of_skipping_role_check(stored, tmp_path):
+    database, record, config, current = stored
+    current["settings"] = replace(current["settings"], search_profiles_path=tmp_path / "absent")
+    gold = write_jsonl(tmp_path / "gold.jsonl", [gold_row(record)])
+    predictions = write_jsonl(tmp_path / "predictions.jsonl", [])
+    before = snapshot(database)
+    output = tmp_path / "report.json"
+    result = invoke("eval", "accuracy", "--config", config, "--gold", gold, "--variant",
+                    "labels", "--predictions", predictions, "--output", output)
+    assert result.exit_code == 2, result.output
+    assert "current rules and search profiles" in text(result)
+    assert not output.exists() and not output.with_suffix(".md").exists()
+    assert snapshot(database) == before
+
+
+@pytest.mark.parametrize("score", [10**400, -(10**400)])
+def test_labels_cli_evaluates_large_integer_score_after_json_roundtrip(stored, tmp_path, score):
+    database, record, config, _ = stored
+    gold = write_jsonl(tmp_path / "gold.jsonl", [gold_row(record)])
+    rows = baseline_predictions([("uid", record)], {
+        "uid": {"role_label": "analytics-leadership", "tier": "B", "fit_score": score},
+    })
+    predictions = write_jsonl(tmp_path / "predictions.jsonl", rows)
+    protected = {p: snapshot(p) for p in (database, gold, predictions)}
+    output = tmp_path / "report.json"
+    result = invoke("eval", "accuracy", "--config", config, "--gold", gold, "--variant",
+                    "labels", "--predictions", predictions, "--output", output)
+    assert result.exit_code == 0, result.output
+    report = json.loads(output.read_text())
+    assert report["predictions"][0]["fit_score"] == score
+    assert report["evaluation"]["relevance_scale"]["precision_at"]["10"]["value"] == 1
+    assert all(snapshot(p) == before for p, before in protected.items())
+
+
+@pytest.mark.parametrize("fields,missing,path", [
+    ({}, "variant", "$.variant"),
+    ({"extra": "private input value"}, None, "$"),
+    ({"tags": {"preferred_focus": {}}}, None, "$.tags.preferred_focus"),
+    ({"tags": {"function_core": {"value": "invalid", "evidence": []}}}, None,
+     "$.tags.function_core.value"),
+    ({"confidence": {}}, None, "$.confidence"),
+    ({"gate_reasons": ["personal_constraint"]}, None, "$.gate_reasons[0]"),
+    ({"gate_outcome": "eligible", "gate_reasons": ["vacancy_closed"]}, None,
+     "$.gate_reasons"),
+    ({"gate_reasons": ["vacancy_closed", "vacancy_closed"]}, None, "$.gate_reasons"),
+    ({"fit_score": float("nan")}, None, "$.fit_score"),
+    ({"relevance": True}, None, "$.relevance"),
+])
+def test_labels_cli_rejects_full_schema_errors_before_writing_reports(
+    stored, tmp_path, fields, missing, path,
+):
+    database, record, config, _ = stored
+    gold = write_jsonl(tmp_path / "gold.jsonl", [gold_row(record)])
+    row = {"schema": PREDICTION_SCHEMA, "job_uid": "uid", "source_hash": source_hash(record),
+           "labeler": "llm:test", "variant": "labels", "status": "labeled",
+           "role_label": "analytics-leadership", "relevance": 2, "gate_outcome": "unknown",
+           "gate_reasons": [], "tags": {}, **fields}
+    if missing is not None:
+        row.pop(missing)
+    predictions = write_jsonl(tmp_path / "predictions.jsonl", [row])
+    protected = {p: snapshot(p) for p in (database, gold, predictions)}
+    output = tmp_path / "report.json"
+    result = invoke("eval", "accuracy", "--config", config, "--gold", gold, "--variant",
+                    "labels", "--predictions", predictions, "--output", output)
+    assert result.exit_code == 2, result.output
+    assert "row 1:" in text(result) and path in text(result)
+    assert "private input value" not in result.output
+    assert not output.exists() and not output.with_suffix(".md").exists()
+    assert all(snapshot(p) == before for p, before in protected.items())
 
 
 @pytest.mark.parametrize("args,message", [

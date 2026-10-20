@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import copy
 import re
-from datetime import datetime
+from datetime import UTC, date, datetime
 
 from job_intake.models.job import JobRecord
+from job_intake.utils.identifiers import STREAM_ID_PATTERN
 
 LABELS_SCHEMA = "vacancy-labels-v3"
 PREDICTION_SCHEMA = "vacancy-labels-v3-prediction"
@@ -61,7 +62,9 @@ OFFICE_LOCATION_MAX = 80
 DOMAIN_MAX = 60
 EVIDENCE_MAX = 3
 REASON_MAX = 400
-_ROLE_ID = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
+# JSON Schema patterns search rather than fullmatch. The negative lookahead is a
+# strict end anchor, unlike "$", which also matches before a final newline.
+_ROLE_ID = rf"^{STREAM_ID_PATTERN}(?![\s\S])"
 _GOLD_REQUIRED = {
     "schema", "job_uid", "source_hash", "text_version", "labeler", "method", "rubric_version",
     "first_labeled_at", "labeled_at", "role_label", "relevance", "gate_outcome",
@@ -72,6 +75,11 @@ _PREDICTION_REQUIRED = (
     "schema", "job_uid", "source_hash", "labeler", "variant", "status", "role_label",
     "relevance", "gate_outcome", "gate_reasons", "tags",
 )
+_LABEL_DATE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}"
+    r"(?:[Tt](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+    r"(?:\.(?P<fraction>[0-9]+))?(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9]))?"
+)
 
 
 def _date_schema(*, nullable: bool) -> dict:
@@ -79,6 +87,22 @@ def _date_schema(*, nullable: bool) -> dict:
         {"type": "string", "format": "date"}, {"type": "string", "format": "date-time"},
         *([{"type": "null"}] if nullable else []),
     ]}
+
+
+def _nonblank_text(*, maximum: int | None = None, nullable: bool = False) -> dict:
+    schema = {"type": ["string", "null"] if nullable else "string",
+              "minLength": 1, "pattern": r"\S"}
+    if maximum is not None:
+        schema["maxLength"] = maximum
+    return schema
+
+
+def _restrictive_schema(condition: dict, *, human: bool) -> dict:
+    """A normalized restrictive label cannot have an implied basis."""
+    properties = {"basis": {"const": "explicit"}}
+    if human:
+        properties["quote"] = _nonblank_text()
+    return {"if": condition, "then": {"properties": properties}}
 
 
 def _tag_schemas(kind: str) -> dict[str, dict]:
@@ -95,10 +119,15 @@ def _tag_schemas(kind: str) -> dict[str, dict]:
     for tag, values in TAG_VALUES.items():
         properties = {"value": {"type": "string", "enum": list(values)}}
         if tag == "work_mode":
-            properties["office_location"] = {"type": "string", "maxLength": OFFICE_LOCATION_MAX}
+            properties["office_location"] = _nonblank_text(maximum=OFFICE_LOCATION_MAX)
         properties.update({evidence_name: evidence, "basis": basis})
         result[tag] = {"type": "object", "additionalProperties": False,
                        "required": ["value", evidence_name], "properties": properties}
+        if restricted := RESTRICTIVE_VALUES.get(tag):
+            result[tag]["allOf"] = [_restrictive_schema(
+                {"required": ["value"],
+                 "properties": {"value": {"enum": sorted(restricted)}}}, human=kind == "gold",
+            )]
     result["domain_fit"] = {
         "type": "object", "additionalProperties": False,
         "required": ["industry", "requirement", evidence_name],
@@ -106,7 +135,7 @@ def _tag_schemas(kind: str) -> dict[str, dict]:
             "industry": {"type": "string", "enum": list(INDUSTRIES)},
             "requirement": {"type": "string", "enum": list(DOMAIN_REQUIREMENTS)},
             "required_domain": {"enum": [*INDUSTRIES, None]},
-            "domain": {"type": "string", "minLength": 1, "maxLength": DOMAIN_MAX},
+            "domain": _nonblank_text(maximum=DOMAIN_MAX),
             evidence_name: evidence, "basis": basis,
         },
         "if": {"required": ["requirement"],
@@ -114,6 +143,16 @@ def _tag_schemas(kind: str) -> dict[str, dict]:
         "then": {"required": ["required_domain"],
                  "properties": {"required_domain": {"enum": list(INDUSTRIES)}}},
         "else": {"properties": {"required_domain": {"type": "null"}}},
+        "allOf": [
+            {"if": {"required": ["required_domain"],
+                    "properties": {"required_domain": {"const": "other"}}},
+             "then": {"required": ["domain"]}},
+            _restrictive_schema(
+                {"required": ["requirement"],
+                 "properties": {"requirement": {"const": "required"}}},
+                human=kind == "gold",
+            ),
+        ],
     }
     result["preferred_focus"] = {
         "type": "object", "additionalProperties": False,
@@ -137,13 +176,14 @@ def gold_schema() -> dict:
         "type": "object", "additionalProperties": False, "required": sorted(_GOLD_REQUIRED),
         "properties": {
             "schema": {"const": LABELS_SCHEMA},
-            "job_uid": {"type": "string", "minLength": 1},
-            "source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-            "text_version": {"type": "string", "minLength": 1},
+            "job_uid": _nonblank_text(),
+            "source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$",
+                            "minLength": 64, "maxLength": 64},
+            "text_version": _nonblank_text(),
             "source": copy.deepcopy(gold_json_schema()["properties"]["source"]),
             "labeler": {"const": "human"},
             "method": {"enum": [*METHODS, None]},
-            "rubric_version": {"type": ["string", "null"], "minLength": 1},
+            "rubric_version": _nonblank_text(nullable=True),
             "first_labeled_at": _date_schema(nullable=True),
             "labeled_at": _date_schema(nullable=True),
             "label_scope": {"enum": list(LABEL_SCOPES)},
@@ -152,7 +192,7 @@ def gold_schema() -> dict:
                 "description": "An enabled search_profiles stream ID or other; checked "
                                "against the current role taxonomy by the validator.",
             },
-            "relevance": {"enum": [*RELEVANCE_VALUES, None]},
+            "relevance": {"type": ["integer", "null"], "enum": [*RELEVANCE_VALUES, None]},
             "gate_outcome": {"enum": [*GATE_OUTCOMES, None]},
             "gate_reasons": {"type": "array", "uniqueItems": True,
                              "items": {"enum": list(GATE_REASONS)}},
@@ -160,23 +200,42 @@ def gold_schema() -> dict:
                      "properties": _tag_schemas("gold")},
             "notes": {"type": "string"},
         },
+        "allOf": [
+            {"if": {"required": ["gate_outcome"],
+                    "properties": {"gate_outcome": {"const": "eligible"}}},
+             "then": {"properties": {"gate_reasons": {"maxItems": 0}}}},
+            {"if": {"anyOf": [
+                {"required": ["tags"], "properties": {"tags": {"minProperties": 1}}},
+                {"required": ["gate_reasons"],
+                 "properties": {"gate_reasons": {"minItems": 1}}},
+                *({"required": [field],
+                   "properties": {field: {"not": {"type": "null"}}}}
+                  for field in ("role_label", "relevance", "gate_outcome")),
+            ]}, "then": {"properties": {
+                "method": {"enum": list(METHODS)},
+                "first_labeled_at": _date_schema(nullable=False),
+                "labeled_at": _date_schema(nullable=False),
+            }}},
+        ],
     }
 
 
 def prediction_schema() -> dict:
     """One machine row per vacancy, bindable by frozen_eval.create_run."""
-    nullable_int = {"enum": [*RELEVANCE_VALUES, None]}
-    nullable_text = {"type": ["string", "null"], "minLength": 1}
+    nullable_int = {"type": ["integer", "null"], "enum": [*RELEVANCE_VALUES, None]}
+    nullable_text = _nonblank_text(nullable=True)
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": f"{LABELS_SCHEMA} machine prediction",
         "type": "object", "additionalProperties": False, "required": list(_PREDICTION_REQUIRED),
         "properties": {
             "schema": {"const": PREDICTION_SCHEMA},
-            "job_uid": {"type": "string", "minLength": 1},
-            "source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-            "labeler": {"type": "string", "pattern": r"^(?:rules|llm|embedding):\S+$"},
-            "variant": {"type": "string", "minLength": 1},
+            "job_uid": _nonblank_text(),
+            "source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$",
+                            "minLength": 64, "maxLength": 64},
+            "labeler": {"type": "string",
+                        "pattern": r"^(?:rules|llm|embedding):\S+(?![\s\S])"},
+            "variant": _nonblank_text(),
             "status": {"enum": list(STATUSES)},
             "rubric_version": nullable_text,
             "rubric_status": {"enum": ["confirmed", "proposed", None]},
@@ -195,7 +254,7 @@ def prediction_schema() -> dict:
             "llm_relevance_stale": {"type": "boolean"},
             "relevance_by_policy": {
                 "type": "object", "additionalProperties": False,
-                "properties": {policy: {"enum": list(RELEVANCE_VALUES)}
+                "properties": {policy: {"type": "integer", "enum": list(RELEVANCE_VALUES)}
                                for policy in ("llm", "rules", "max", "min")},
             },
             "confidence": {"enum": [*CONFIDENCE, None]},
@@ -207,11 +266,18 @@ def prediction_schema() -> dict:
             "decision": {"enum": [*DECISIONS, None]},
             "tier": {"enum": [*TIERS, None]},
             "fit_score": {"type": ["number", "null"]},
-            "usage": {"type": "array", "items": {"type": "object",
-                                                 "required": ["stage", "model"]}},
+            "usage": {"type": "array", "items": {
+                "type": "object", "required": ["stage", "model"],
+                "properties": {"stage": _nonblank_text(), "model": _nonblank_text()},
+            }},
             "latency_ms": {"type": ["integer", "null"], "minimum": 0},
             "errors": {"type": "array", "items": {"type": "object"}},
         },
+        "allOf": [
+            {"if": {"required": ["gate_outcome"],
+                    "properties": {"gate_outcome": {"const": "eligible"}}},
+             "then": {"properties": {"gate_reasons": {"maxItems": 0}}}},
+        ],
     }
 
 
@@ -279,16 +345,44 @@ def response_schema(
             "properties": properties}
 
 
-def _valid_date(value: object) -> bool:
-    from job_intake.annotation.gold import _LABEL_DATE
-
-    if not isinstance(value, str) or not _LABEL_DATE.fullmatch(value):
-        return False
+def _parse_label_date(value: object) -> tuple[date | datetime, str] | None:
+    if not isinstance(value, str) or (match := _LABEL_DATE.fullmatch(value)) is None:
+        return None
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00").replace("z", "+00:00"))
+        parsed = date.fromisoformat(value) if len(value) == 10 else datetime.fromisoformat(
+            value.replace("Z", "+00:00").replace("z", "+00:00"),
+        )
     except ValueError:
-        return False
-    return True
+        return None
+    # datetime stores microseconds, while RFC3339 permits longer fractions. Keep
+    # their exact decimal ordering without rounding or rewriting the source text.
+    return parsed, (match["fraction"] or "").rstrip("0")
+
+
+def _valid_date(value: object) -> bool:
+    return _parse_label_date(value) is not None
+
+
+def _label_date_follows(first: tuple[date | datetime, str],
+                        last: tuple[date | datetime, str]) -> bool:
+    """Compare instants exactly; preserve legacy dates as calendar precision.
+
+    A date-only value has no time or zone. If either side is date-only, compare
+    the expressed calendar days and allow equality: order within that day is
+    unknown. This compatibility rule never invents a midnight or changes old gold.
+    Two timestamps instead compare their aware UTC instants, including all
+    fractional digits. An aware epoch subtraction also supports boundary years
+    whose UTC conversion would fall outside datetime's representable years.
+    """
+    first_value, last_value = first[0], last[0]
+    if isinstance(first_value, datetime) and isinstance(last_value, datetime):
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        return (first_value.replace(microsecond=0) - epoch, first[1]) > (
+            last_value.replace(microsecond=0) - epoch, last[1],
+        )
+    first_day = first_value.date() if isinstance(first_value, datetime) else first_value
+    last_day = last_value.date() if isinstance(last_value, datetime) else last_value
+    return first_day > last_day
 
 
 def _tag_errors(tag: str, label: object, record: JobRecord | None,
@@ -318,6 +412,9 @@ def _tag_errors(tag: str, label: object, record: JobRecord | None,
         if label["requirement"] != "none" and required_domain not in INDUSTRIES:
             errors.append(("invalid_tag_detail",
                            "A preferred/required domain needs required_domain."))
+        if required_domain == "other" and "domain" not in label:
+            errors.append(("invalid_tag_detail",
+                           "required_domain other needs a domain description."))
         restrictive = label["requirement"] == "required"
     else:
         values = label["values"]
@@ -424,9 +521,16 @@ def check_gold_row(
                     or row.get("first_labeled_at") is None):
         error("missing_label_provenance",
               "Human labels require method, first_labeled_at and labeled_at.")
-    if _valid_date(row.get("first_labeled_at")) and _valid_date(row.get("labeled_at")) \
-            and row["first_labeled_at"][:10] > row["labeled_at"][:10]:
+    first, last = (_parse_label_date(row.get(field))
+                   for field in ("first_labeled_at", "labeled_at"))
+    if first is not None and last is not None and _label_date_follows(first, last):
         error("invalid_labeled_at", "first_labeled_at cannot follow labeled_at.")
+    # Keep stable human-facing error codes above; the shared schema is the structural
+    # backstop. Source binding, dynamic roles and chronological comparisons remain runtime.
+    if not errors:
+        from job_intake.labeling.schema_validation import json_schema_errors
+
+        errors.extend(json_schema_errors(row, kind="gold"))
     return errors, bindings
 
 
