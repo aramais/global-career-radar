@@ -1,7 +1,15 @@
-version: data-interview-practice-2026-10-19-v1
-confirmed_at: '2026-10-19'
+version: data-interview-practice-2026-10-20-v2
+confirmed_at: '2026-10-20'
 source: user_confirmation_in_project_chat
 p1: role tasks and hiring supported independently
-p2: analytics/data work with similar tasks, even if level or hiring does not fit next work
+# p2 applies only with labeling.enabled=true and labeling.mode=labels (purpose.PURPOSE_RUBRIC_VERSION).
+p2: "function_core in {analytics_for_decisions, analytics_reporting} and (relevance == 1 or (relevance >= 2 and gate_outcome == ineligible))"
+p2_mode: labels
+# The legacy and shadow modes keep the earlier confirmed rule (purpose.LEGACY_PURPOSE_RUBRIC_VERSION).
+legacy_p2:
+  version: data-interview-practice-2026-10-19-v1
+  confirmed_at: '2026-10-19'
+  mode: legacy, shadow
+  rule: analytics/data work with similar tasks, even if level or hiring does not fit next work
 human_confirmation: independent_from_machine_recommendation
 unknown: preserve_missing_evidence

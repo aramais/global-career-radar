@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import copy
 import re
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import UTC, date, datetime
 
 from job_intake.models.job import JobRecord
@@ -391,7 +393,7 @@ def _tag_errors(tag: str, label: object, record: JobRecord | None,
     from job_intake.annotation.text import normalize_quote
 
     if tag not in TAG_NAMES:
-        return [("invalid_tags", f"Unknown v3 tag {tag}.")]
+        return [("invalid_tags", "Unknown v3 tag.")]
     schema = _tag_schemas("gold")[tag]
     if not isinstance(label, dict) or set(label) - set(schema["properties"]) \
             or not set(schema["required"]) <= set(label):
@@ -540,3 +542,41 @@ def validate_gold_row(
 ) -> list[dict]:
     """Errors for one human v3 row; an empty list means the row is valid."""
     return check_gold_row(row, record=record, profile_ids=profile_ids)[0]
+
+
+@dataclass(slots=True)
+class TagValue:
+    value: str = "unspecified"
+    evidence: list[str] = dataclass_field(default_factory=list)
+    basis: str = "explicit"
+
+
+@dataclass(slots=True)
+class LabelResult:
+    schema: str = LABELS_SCHEMA
+    status: str = "rules_only"
+    role_label: str | None = None
+    relevance: int | None = None
+    gate_outcome: str = "unknown"
+    gate_reasons: list[str] = dataclass_field(default_factory=list)
+    tags: dict = dataclass_field(default_factory=dict)
+    rules_relevance: int | None = None
+    llm_relevance: int | None = None
+    relevance_by_policy: dict[str, int] = dataclass_field(default_factory=dict)
+    confidence: str | None = None
+    escalated: bool = False
+    escalation_triggers: list[str] = dataclass_field(default_factory=list)
+    validation_warnings: list[str] = dataclass_field(default_factory=list)
+    route: str | None = None
+    rubric_version: str = ""
+    rubric_status: str = "proposed"
+    prompt_version: str = ""
+    aggregation_version: str = ""
+    annotation_input_hash: str = ""
+    source_hash: str = ""
+    cache_key: str | None = None
+    usage: list[dict] = dataclass_field(default_factory=list)
+    latency_ms: int = 0
+    errors: list[dict] = dataclass_field(default_factory=list)
+    llm_relevance_stale: bool = False
+    p2_candidate: bool | None = None

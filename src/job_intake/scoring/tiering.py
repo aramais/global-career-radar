@@ -7,6 +7,8 @@ def finalize_tier(
     job: EvaluatedJob,
     threshold_a: float,
     threshold_b: float,
+    *,
+    tier_source: str = "score",
 ) -> EvaluatedJob:
     """Single source of truth for tier assignment.
 
@@ -16,13 +18,22 @@ def finalize_tier(
     ``role_fit_v1`` keeps hiring decisions separate and enforces source scope caps;
     the legacy policy additionally requires PASS for A and assigns REJECT to C.
     """
+    if tier_source not in {"score", "relevance"}:
+        raise ValueError("tier_source must be score or relevance")
+    relevance = job.evaluation.relevance
+    if tier_source == "relevance" and (type(relevance) is not int or relevance not in range(4)):
+        raise ValueError("relevance tiering requires a relevance value from 0 to 3")
     role_fit = job.evaluation.fit_policy == "role_fit_v1"
-    if job.evaluation.decision == FilterDecision.REJECT and not role_fit:
+    if (tier_source == "score" and job.evaluation.decision == FilterDecision.REJECT
+            and not role_fit):
         job.evaluation.tier = JobTier.C
         job.evaluation.bucket = "Bucket C"
         return job
 
-    if (
+    if tier_source == "relevance":
+        job.evaluation.tier = {3: JobTier.A, 2: JobTier.B, 1: JobTier.C, 0: JobTier.C}[relevance]
+        job.evaluation.bucket = "Bucket " + job.evaluation.tier.value
+    elif (
         (role_fit or job.evaluation.decision == FilterDecision.PASS)
         and job.evaluation.fit_score >= threshold_a
         and job.evaluation.bridge_role

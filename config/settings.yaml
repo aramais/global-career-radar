@@ -5,6 +5,33 @@ search_profiles_path: search_profiles.yaml
 company_watchlist_path: company_watchlist.yaml
 export_dir: data
 
+# Opt-in labels-v3. Keep these rollout switches unchanged until evaluation gates pass.
+labeling:
+  enabled: false
+  mode: shadow
+  ai_enabled: false
+  tier_source: score
+  final_policy: llm
+  rubric_path: config/labeling_rubric.yaml
+  precedents_path: data/local/labeling/precedents.jsonl
+  cache_dir: data/local/labeling/cache
+  ledger_dir: data/local/labeling/ledger
+  max_source_chars: 40000
+  provider: gemini
+  tag_model: gemini-3.5-flash-lite
+  tag_reasoning_effort: minimal
+  escalate_provider: gemini
+  escalate_model: gemini-3.8-flash
+  escalate_reasoning_effort: low
+  api_key_env: GEMINI_API_KEY
+  max_output_tokens: 1200
+  request_timeout: 60
+  max_retries: 2
+  retry_backoff: 1
+  escalation:
+    enabled: true
+    max_share_warning: 0.4
+
 crm:
   team_interview_goal: 4
   weekly_time_budget_hours: 10

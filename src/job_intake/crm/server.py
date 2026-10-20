@@ -22,7 +22,7 @@ from job_intake.config.settings import AppConfig, load_yaml_mapping
 from job_intake.crm.jobs import JOB_QUERY_FIELDS, job_detail, list_job_page
 from job_intake.crm.repository import CRMRepository, serialize_application
 from job_intake.crm.schemas import CRMConflictError
-from job_intake.profiles import load_streams, with_other_stream
+from job_intake.profiles import load_streams, with_labeling_versions, with_other_stream
 from job_intake.purpose import PurposeConflictError, update_human_purpose
 from job_intake.storage.database import Database
 from job_intake.storage.models import JobORM
@@ -245,9 +245,9 @@ class CRMService:
             raise ValueError("--gold и --discovery нельзя использовать одновременно")
         self.config = config
         rules = load_yaml_mapping(config.rules_path)
-        self.streams = with_other_stream(
+        self.streams = with_labeling_versions(with_other_stream(
             load_streams(rules, load_yaml_mapping(config.search_profiles_path)), rules,
-        )
+        ), config.labeling)
         self.database = Database(config.database_url)
         self.database.create_schema()
         self.csrf_token = secrets.token_urlsafe(32)

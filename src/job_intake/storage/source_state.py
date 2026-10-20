@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import fields
 from typing import Any
 
+from job_intake.annotation.input_contract import annotation_input_hash
 from job_intake.annotation.text import source_units
 from job_intake.models.job import JobRecord, JobStatus
 
@@ -75,9 +76,53 @@ def _fact_metadata(metadata: dict) -> dict:
             if key not in OBSERVATION_FIELDS and key != "collection_observations"}
 
 
+def retained_observation_markers(markers: dict) -> dict:
+    """Accept only the typed completeness/source markers emitted by reconciliation."""
+    return {
+        key: value for key, value in markers.items()
+        if (key in {"incoming_description_complete", "incoming_description_truncated",
+                    "incoming_truncated"} and type(value) is bool)
+        or (key == "incoming_description_source" and isinstance(value, str))
+    }
+
+
+def collection_only_source_change(previous: JobRecord, incoming: JobRecord) -> bool:
+    """Prove complete source equality after removing only known observations.
+
+    A matching model-input digest alone is insufficient: status, unknown metadata,
+    completeness and source-conflict evidence also govern accepted assessments.
+    Nested observations are filtered by the same whitelist; arbitrary facts put in
+    that container are deliberately retained for this conservative comparison.
+    """
+    def facts(record, markers):
+        snapshot = source_snapshot(record)
+        metadata = snapshot["source_metadata"]
+        for key in OBSERVATION_FIELDS:
+            metadata.pop(key, None)
+        nested = metadata.get("collection_observations")
+        if isinstance(nested, dict):
+            nested = {key: value for key, value in nested.items() if key not in OBSERVATION_FIELDS}
+            for key, value in retained_observation_markers(markers).items():
+                if key in nested and nested[key] == value:
+                    nested.pop(key)
+            if nested:
+                metadata["collection_observations"] = nested
+            else:
+                metadata.pop("collection_observations")
+        return snapshot
+
+    previous_markers = previous._source_observation_markers
+    incoming_markers = {**previous_markers, **incoming._source_observation_markers}
+    return (
+        facts(previous, previous_markers) == facts(incoming, incoming_markers)
+        and annotation_input_hash(previous) == annotation_input_hash(incoming)
+    )
+
+
 def reconcile_source(incoming: JobRecord, saved: Any | None) -> JobRecord:
     """Mutate the incoming transport record before classification and scoring."""
     incoming._source_reconciled = True
+    incoming._source_observation_markers = {}
     incoming._expected_source_revision = saved.source_revision if saved is not None else None
     if saved is None:
         return incoming
@@ -104,7 +149,9 @@ def reconcile_source(incoming: JobRecord, saved: Any | None) -> JobRecord:
     observations.update(fresh_metadata.pop("collection_observations", {}) or {})
     for key in ("description_complete", "description_source", "description_truncated", "truncated"):
         if key in fresh_metadata:
-            observations["incoming_" + key] = fresh_metadata.pop(key)
+            value = fresh_metadata.pop(key)
+            observations["incoming_" + key] = value
+            incoming._source_observation_markers["incoming_" + key] = deepcopy(value)
     for key in ("working_language", "applicant_location_requirements"):
         old, fresh = metadata.get(key), fresh_metadata.get(key)
         if old and fresh and old != fresh:

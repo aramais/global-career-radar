@@ -438,19 +438,38 @@ class GoldLabelStore:
                 os.fsync(handle.fileno())
         _fsync_directory(backup_dir)
         temporary = None
+        identity = None
+        failure = None
         try:
             with tempfile.NamedTemporaryFile(dir=self.path.parent, prefix=self.path.name + ".",
                                              suffix=".tmp", delete=False) as handle:
                 temporary = Path(handle.name)
-                os.chmod(temporary, stat.S_IMODE(self.path.stat().st_mode))
+                created = os.fstat(handle.fileno())
+                identity = created.st_dev, created.st_ino
+                os.fchmod(handle.fileno(), stat.S_IMODE(self.path.stat().st_mode))
                 handle.write(after)
                 handle.flush()
                 os.fsync(handle.fileno())
+            current = temporary.lstat()
+            if (current.st_dev, current.st_ino) != identity:
+                raise OSError("Gold staging ownership changed before publication")
             os.replace(temporary, self.path)
             _fsync_directory(self.path.parent)
+        except BaseException as error:
+            failure = error
+            raise
         finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+            if temporary is not None and identity is not None:
+                try:
+                    current = temporary.lstat()
+                    if (current.st_dev, current.st_ino) == identity:
+                        temporary.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as cleanup_error:
+                    if failure is None:
+                        raise
+                    failure.add_note(f"Could not remove owned Gold staging: {cleanup_error}")
 
     def _record_review(self, content: bytes, case: dict, line: bytes, seconds: float) -> None:
         """Journal a successful unchanged review without rewriting human gold."""
@@ -467,7 +486,7 @@ class GoldLabelStore:
         path = directory / (self.path.name + ".review-" + identifier + ".audit.json")
         if path.exists():
             return  # Retrying the same unchanged review must not double-count time.
-        write_new_text(json.dumps(event, ensure_ascii=False) + "\n", path)
+        write_new_text(path, json.dumps(event, ensure_ascii=False) + "\n")
         _fsync_directory(directory)
 
     def save(self, uid: str, payload: dict) -> dict:

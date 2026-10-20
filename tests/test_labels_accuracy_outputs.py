@@ -84,7 +84,7 @@ def test_cli_refuses_valid_frozen_reference_without_replacing_its_bytes(
 
 
 @pytest.mark.parametrize("variant", ["rules", "labels", "saved"])
-def test_cli_new_reports_keep_formats_and_default_repeat_requires_a_new_path(
+def test_cli_new_reports_keep_formats_and_default_repeat_chooses_a_new_path(
     reports, tmp_path, monkeypatch, variant,
 ):
     monkeypatch.chdir(tmp_path)
@@ -101,8 +101,11 @@ def test_cli_new_reports_keep_formats_and_default_repeat_requires_a_new_path(
         assert report["evaluation"]["relevance_scale"]["N"] == 1
     before = snapshot(output), snapshot(markdown)
     repeated = invoke(*command(reports, variant))
-    assert repeated.exit_code == 2 and "already exists" in text(repeated)
+    assert repeated.exit_code == 0, repeated.output
     assert (snapshot(output), snapshot(markdown)) == before
+    generated = list(output.parent.glob(f"accuracy-{variant}-*.json"))
+    assert len(generated) == 1 and generated[0].with_suffix(".md").is_file()
+    assert json.loads(generated[0].read_text())["variant"] == variant
     fresh = tmp_path / f"new-{variant}.json"
     retry = invoke(*command(reports, variant, fresh))
     assert retry.exit_code == 0, retry.output

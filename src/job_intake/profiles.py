@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from job_intake.annotation.ai import (
@@ -188,6 +188,42 @@ def with_other_stream(
     return [*streams, other]
 
 
+def labeling_version_components(config) -> dict[str, str]:
+    """Only the active labels policy invalidates a saved relevance evaluation.
+
+    Shadow observations deliberately leave the old scoring and occupation contract
+    intact. Imports are lazy so the default path does not read a labeling rubric.
+    """
+    if not config.enabled or config.mode != "labels":
+        return {}
+    from job_intake.labeling.aggregate import AGGREGATION_VERSION
+    from job_intake.labeling.prompt import prompt_version
+    from job_intake.labeling.rubric import load_rubric
+
+    rubric = load_rubric(config.rubric_path)
+    return {
+        "labels_prompt": prompt_version(),
+        "labels_rubric": rubric.prompt_rubric_hash,
+        "labels_aggregation": AGGREGATION_VERSION + ":" + stable_hash(json.dumps({
+            "rubric": rubric.aggregation_hash,
+            "final_policy": config.final_policy,
+            "tier_source": config.tier_source,
+            "rubric_status": rubric.rubric_status,
+        }, sort_keys=True)),
+    }
+
+
+def with_labeling_versions(streams: list[SearchStream], config) -> list[SearchStream]:
+    components = labeling_version_components(config)
+    if not components:
+        return streams
+    return [replace(
+        stream,
+        version=stable_hash(json.dumps({"profile": stream.version, **components}, sort_keys=True)),
+        version_components={**stream.version_components, **components},
+    ) for stream in streams]
+
+
 def stale_version_reasons(
     previous: dict[str, str] | None, current: dict[str, str],
     *, stage: str = "evaluation",
@@ -203,7 +239,9 @@ def stale_version_reasons(
         "annotation": {"annotation", "source_units"},
         "prefilter": {"prefilter", "source_units"},
         "evaluation": {"scoring", "taxonomy", "classification_prompt", "annotation",
-                       "prefilter", "source_units"},
+                       "prefilter", "source_units", "labels_prompt", "labels_rubric",
+                       "labels_aggregation"},
+        "labels": {"labels_prompt", "labels_rubric", "labels_aggregation", "source_units"},
     }
     if stage not in stages:
         raise ValueError(f"Unknown version stage: {stage}")

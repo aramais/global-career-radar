@@ -55,6 +55,11 @@ class JobRecord:
         default=None, init=False, repr=False, compare=False,
     )
     _canonical_job_uid: str | None = field(default=None, init=False, repr=False, compare=False)
+    # Markers generated when a partial listing retains the canonical full source.
+    # Transport guards only: never source facts, model input or ORM columns.
+    _source_observation_markers: dict[str, Any] = field(
+        default_factory=dict, init=False, repr=False, compare=False,
+    )
 
 
 @dataclass(slots=True)
@@ -81,6 +86,9 @@ class JobEvaluation:
     # Hiring evidence is independent of occupation, role fit and overall routing.
     eligibility_status: str = "unknown"
     eligibility_evidence_status: str = "unconfirmed"
+    relevance: int | None = None
+    labels_status: str | None = None
+    labels_version: str | None = None
 
 
 @dataclass(slots=True)

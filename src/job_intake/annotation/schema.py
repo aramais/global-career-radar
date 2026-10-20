@@ -14,6 +14,25 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from typing import Any
 
+from job_intake.annotation.scope import (
+    CANDIDATE_HISTORY as _CANDIDATE_HISTORY,
+)
+from job_intake.annotation.scope import (
+    CONDITIONAL_SCOPE as _CONDITIONAL_SCOPE,
+)
+from job_intake.annotation.scope import (
+    NEGATED_LANGUAGE as _NEGATED_LANGUAGE,
+)
+from job_intake.annotation.scope import (
+    OPTIONAL as _OPTIONAL,
+)
+from job_intake.annotation.scope import (
+    ROLE_SCOPE as _ROLE_SCOPE,
+)
+from job_intake.annotation.scope import (
+    UNCONFIRMED as _UNCONFIRMED,
+)
+
 FOCUS_KINDS = (
     "project_management",
     "people_interaction",
@@ -69,11 +88,6 @@ COVERAGE_KINDS = (
 _COMPANY_SECTIONS = frozenset(
     {"company", "company_context", "about_company", "company_overview", "about_us"}
 )
-_OPTIONAL = re.compile(
-    r"\b(?:not|no)\b(?!\W+only\b)(?:\W+\w+){0,4}\W+(?:required|necessary|needed)\b"
-    r"|\b(?:optional|preferred)\b|\bnice[ -]to[ -]have\b",
-    re.IGNORECASE,
-)
 _LANGUAGE_NAMES = {
     "english": ("English", "inglês", "inglés", "anglais", "английский"),
     "portuguese": ("Portuguese", "português", "portugués", "portugais", "португальский"),
@@ -97,36 +111,6 @@ _EXCLUSIVE_LANGUAGE = re.compile(
     rf"|\bthe\s+only\s+working\s+language\s+is\s+{_LANGUAGE_PATTERN}\b"
     rf"|\b(?:work|communicate|communication)\w*\s+exclusively\s+in\s+"
     rf"{_LANGUAGE_PATTERN}\b",
-    re.IGNORECASE,
-)
-_NEGATED_LANGUAGE = re.compile(
-    rf"\b(?:not|no)\s+{_LANGUAGE_PATTERN}\b"
-    rf"|\b{_LANGUAGE_PATTERN}\s+(?:(?:is|will\s+be|are)\s+)?"
-    rf"not\b(?!\s+only\b)",
-    re.IGNORECASE,
-)
-_UNCONFIRMED = re.compile(
-    r"\bnot\s+(?:yet\s+)?confirmed\b"
-    r"|\b(?:unconfirmed|unclear|undetermined|unknown|might|possibly)\b"
-    r"|\bmay\s+(?:be|change|vary|require|hire)\b",
-    re.IGNORECASE,
-)
-_CANDIDATE_HISTORY = re.compile(
-    r"\b(?:experience (?:in|with|of|leading|managing)|track record|previous(?:ly)?|"
-    r"prior experience|background in|(?:ability|able) to|proven ability|"
-    r"skills?|skillset|competenc(?:e|ies)|experienced (?:in|with|at)|skilled at)\b",
-    re.IGNORECASE,
-)
-_ROLE_SCOPE = re.compile(
-    r"\b(?:you (?:will|must)(?!\s+(?:have|bring|possess|demonstrate|be\s+able))|"
-    r"you['’]ll(?!\s+(?:have|bring|possess|demonstrate|be\s+able))|your responsibilities|"
-    r"(?:this|the|your) (?:role|position) (?:will|involves|owns|includes|leads|manages)|"
-    r"responsible for|responsibilities include)\b",
-    re.IGNORECASE,
-)
-_CONDITIONAL_SCOPE = re.compile(
-    r"\b(?:may|might|could)\s+(?:be\s+)?(?:lead|manage|own|coordinate|collaborate|"
-    r"partner|work|apply|analy[sz]e|perform|influence|participate|conduct|do|spend)\b",
     re.IGNORECASE,
 )
 _WORLDWIDE = re.compile(

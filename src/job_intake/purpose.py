@@ -10,7 +10,8 @@ from job_intake.models.job import EvaluatedJob, JobStatus
 from job_intake.scoring.evidence import description_evidence
 from job_intake.storage.models import JobEventORM, JobPurposeAssessmentORM
 
-PURPOSE_RUBRIC_VERSION = "data-interview-practice-2026-10-19-v1"
+LEGACY_PURPOSE_RUBRIC_VERSION = "data-interview-practice-2026-10-19-v1"
+PURPOSE_RUBRIC_VERSION = "data-interview-practice-2026-10-20-v2"
 SUITABILITY_VALUES = {"suitable", "unsuitable", "unknown"}
 
 
@@ -61,6 +62,14 @@ def predict_purpose(item: EvaluatedJob) -> dict:
     p2_reasons = ["similar_analytics_data_tasks" if similar else "task_similarity_unconfirmed"]
     if item.record.status == JobStatus.CLOSED:
         p2, p2_reasons = "unsuitable", ["vacancy_closed"]
+    labels = item.record.annotation.get("labels_v3", {})
+    labels_active = "labels_prompt" in item.version_components and isinstance(labels, dict)
+    if labels_active and item.record.status != JobStatus.CLOSED:
+        candidate = labels.get("p2_candidate")
+        if candidate is True:
+            p2, p2_reasons = "suitable", ["labels_v3_analytics_practice"]
+        elif candidate is False and labels.get("status") == "labeled":
+            p2, p2_reasons = "unsuitable", ["labels_v3_not_practice_candidate"]
     p1 = "unknown"
     reasons = []
     if item.record.status == JobStatus.CLOSED:
@@ -84,7 +93,9 @@ def predict_purpose(item: EvaluatedJob) -> dict:
         "predicted_p1": p1,
         "predicted_p2": p2,
         "practice_suitability": p2,
-        "rubric_version": PURPOSE_RUBRIC_VERSION,
+        "rubric_version": (
+            PURPOSE_RUBRIC_VERSION if labels_active else LEGACY_PURPOSE_RUBRIC_VERSION
+        ),
         "prediction_source_hash": purpose_source_hash(item.record),
         "prediction_reason": {
             "p1": reasons,
@@ -138,7 +149,7 @@ def serialize_purpose(row: JobPurposeAssessmentORM | None) -> dict:
                 (getattr(row, name + "_source_hash") or row.human_source_hash)
                 != row.prediction_source_hash
                 or (getattr(row, name + "_rubric_version") or row.human_rubric_version)
-                != PURPOSE_RUBRIC_VERSION
+                != (row.rubric_version or PURPOSE_RUBRIC_VERSION)
             )
         )
         for name in ("human_p1", "human_p2")
@@ -178,10 +189,10 @@ def update_human_purpose(session, job_uid: str, payload: dict) -> dict:
     }
     for name in changes:
         values[name + "_source_hash"] = row.prediction_source_hash
-        values[name + "_rubric_version"] = PURPOSE_RUBRIC_VERSION
+        values[name + "_rubric_version"] = row.rubric_version or PURPOSE_RUBRIC_VERSION
     if {"human_p1", "human_p2"} <= changes.keys():
         values["human_source_hash"] = row.prediction_source_hash
-        values["human_rubric_version"] = PURPOSE_RUBRIC_VERSION
+        values["human_rubric_version"] = row.rubric_version or PURPOSE_RUBRIC_VERSION
     result = session.execute(
         update(JobPurposeAssessmentORM)
         .where(

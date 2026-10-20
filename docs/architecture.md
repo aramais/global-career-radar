@@ -555,9 +555,15 @@ hardlink из соседнего staging; занятый final не заменя
 directory entry к потере питания. После публикации cleanup error может оставить
 полный final и staging, но не удаляет результат.
 Пара JSON/Markdown не является одной транзакцией: ошибка второго файла может
-оставить полный JSON без Markdown; для повтора пары нужен новый путь.
+оставить полный JSON без Markdown. Для явно заданного output нужен новый путь;
+неявные default-пути eval/gold validate/accuracy/rules-diff автоматически выбирают
+свободное имя с UTC-датой и уникальным суффиксом. Предварительная проверка frozen
+compare/experiment-report защищает оба final-пути и exposure journal до анализа.
+Публичный `run_accuracy(output=...)` применяет такой же preflight до чтения gold
+и SQLite во всех вариантах, включая DB sidecars, цены, predictions и объявленный
+cohort journal; перед публикацией проверка повторяется.
 
-Единая шкала `vacancy-labels-v3` (фазы P0–P1 [design doc](vacancy-labeling-architecture.md))
+Единая шкала `vacancy-labels-v3` (фазы P0–P3 [design doc](vacancy-labeling-architecture.md))
 живёт в `job_intake.labeling`. `schema` задаёт enum, JSON Schema gold и предсказаний
 (снимки — `docs/schemas/vacancy-labels-v3-*.schema.json`) и `validate_gold_row`.
 `rubric` читает `config/labeling_rubric.yaml`: раздел со `status: proposed` не
@@ -592,8 +598,68 @@ Draft 2020-12 (`jsonschema`); binding цитат/источника и такс�
 Миграция читает один снимок bytes для строк и SHA; staging обоих выходов предшествует
 публикации без перезаписи, обычная ошибка откатывает собственные опубликованные файлы.
 Географически неоднозначные v2-теги фиксируются как dropped, а не превращаются в факты.
-UI разметки v3 реализован в P1; теггер, pipeline, хранение предсказаний и обычная
-CRM-сериализация машинных labels относятся к P2–P3. Синтаксис `role_label` общий
+UI разметки v3 реализован в P1. P2–P3 добавляют `labeling.{gates,prompt,validate,
+aggregate,tagger,budget,ledger,runner,cli}`: бесплатные маршруты, закрытый ответ
+с ID доказательств, проверку секций/отрицаний и значения hiring/work-mode/language
+по конкретной цитате, агрегацию, перепроверку и кеш. Нераспознанные формулировки
+дают `unspecified`. Корневой `proposed` отключает все применяемые секции;
+неподтверждённая секция P2 даёт `p2_candidate=None` для v3.
+`annotation.scope` содержит общие определения обязанностей и недоказательных
+контекстов; legacy annotation/prefilter используют те же выражения после переноса.
+Gemini/Anthropic получают отдельную схему labels, OpenAI — строгую JSON Schema;
+совместимые адаптеры сохраняют `json_object`, после которого выполняется S3.
+Jev сохраняет ограничения существующего review-only адаптера.
+
+`label --export` не создаёт pipeline/Database, читает SQLite через `mode=ro` и
+`query_only` либо использует источники frozen/gold. Человеческие метки не входят
+в промпт. Выходы и ledger проверяются до модели; имена SQLite `-wal`, `-shm`,
+`-journal` защищены наравне с базой. JSONL публикуется эксклюзивно.
+Экспорт допускает 1–8 потоков с общими thread-safe бюджетом и ledger. До каждой
+попытки резервируется стоимость по `eval_prices.yaml`, неизвестное потребление
+учитывается консервативно. Остановка по бюджету сохраняет завершённые строки.
+При graceful close незавершённые запросы попадают в ledger с неизвестным расходом;
+сохранение при SIGKILL не гарантируется.
+Terminal attempt остаётся pending до полной записи строки и flush/fsync. При
+восстановимой ошибке append возвращается к прежнему byte offset; повтор сохраняет
+исходный terminal и известный usage с тем же call_id без второго списания.
+Неудачный rollback блокирует последующие запросы и завершение как успешного run.
+Повторный graceful close может восстановить pending запись через тот же descriptor.
+
+`label` без экспорта требует `labeling.enabled` и пишет по вакансии. В `shadow`
+repository.update_labels проверяет source hash/revision и изменяет только v3-поля,
+сохраняя legacy tier/score/decision, purpose и уведомления. В `labels` pipeline
+пересобирает stream при смене роли и пропускает старые платные annotation/prefilter.
+Общий `labeling.application` применяет confirmed/current-source hiring gate к
+eligibility/decision до категории, purpose и уведомлений, включая экспорт.
+Правила и source conflicts не снимаются положительным ответом модели.
+Обычные pipeline-команды пересчитывают v3 без новых API; платный путь — только
+`label --ai --max-cost`. `enabled: false` и `mode: legacy` сохраняют прежнее поведение.
+Категория по relevance требует `mode: labels`, подтверждённую рубрику, успешную
+метку и отдельный `tier_source: relevance`; существующие потолки категории остаются.
+Версии labels включают effective final_policy/tier_source и инвалидируют оценки
+только в `mode: labels`; shadow не влияет на purpose. При сохранении принятой
+оценки после неудачной попытки свежий observed источник всё равно обновляет
+last_seen и complete-snapshot lifecycle, сохраняя архивный статус.
+Обычная shadow-переоценка при `error`/`rules_only` также сохраняет accepted v3 и
+отдельный `labels_v3_attempt`, если роль и source совместимы. Совместимость source
+включает доказанный collection-only rebind с provenance; изменение фактов или роли
+не переносит прежнюю оценку. При этом legacy score/tier/profile/purpose/alerts
+проходят полный обычный upsert. Принятая labels_version не повышается до версии
+неудачной попытки; source_revision и updated_at защищают конкурентную запись.
+
+Полный `LabelResult` хранится в `annotation.labels_v3`. Миграции добавляют nullable
+`relevance`, `labels_status`, `labels_version` в jobs и job_relevance_evaluations.
+CRM сохраняет прежний объект `relevance` (оценку профиля), добавляя ordinal
+`labels_relevance`, статус и отдельную сортировку. Детали выдают whitelist фактов,
+причин gate и флага эскалации, без usage/errors. Факты другого source hash скрываются
+как устаревшие. Машинная разметка не попадает в blind Gold UI.
+
+Frozen build/load и saved baseline поддерживают v3, проверяют структуру и привязку
+источника; полный набор тегов v3 — шесть, legacy — девятнадцать. Сохранённые run и
+численные пороги гейтов не переписываются. Платный пилот и гейты качества внедрения
+не подтверждены одной реализацией или тестами на фейковых клиентах.
+
+Синтаксис `role_label` общий
 с loader stream ID (`[a-z0-9][a-z0-9_-]*`); принадлежность enabled streams
 проверяется отдельно, без изменения самих ID.
 

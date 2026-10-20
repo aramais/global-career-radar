@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -10,6 +11,7 @@ from sqlalchemy import and_, case, delete, or_, select, update
 from sqlalchemy.orm import aliased, selectinload
 
 from job_intake.alerts.digest import DigestJob
+from job_intake.annotation.input_contract import annotation_input_hash
 from job_intake.annotation.text import source_hash
 from job_intake.filtering import refresh_eligibility_status
 from job_intake.models.job import EvaluatedJob, FilterDecision, JobRecord, JobTier
@@ -25,7 +27,9 @@ from job_intake.storage.models import (
 )
 from job_intake.storage.queries import classification_is_current, ranked_profile_evaluations
 from job_intake.storage.source_state import (
+    collection_only_source_change,
     record_from_saved,
+    retained_observation_markers,
     source_snapshot,
     would_discard_source,
 )
@@ -63,6 +67,22 @@ def validate_job_uids(job_uids: list[str] | None) -> list[str] | None:
     return list(job_uids)
 
 
+def _validate_labels(labels: dict) -> None:
+    if not isinstance(labels, dict) or labels.get("schema") != "vacancy-labels-v3":
+        raise ValueError("Invalid machine labels schema")
+    relevance = labels.get("relevance")
+    if relevance is not None and (type(relevance) is not int or relevance not in range(4)):
+        raise ValueError("Invalid machine labels relevance")
+    if not isinstance(labels.get("status"), str) or labels["status"] not in {
+        "labeled", "rules_only", "gated", "error",
+    }:
+        raise ValueError("Invalid machine labels status")
+    try:
+        json.dumps(labels, allow_nan=False)
+    except (ValueError, TypeError, OverflowError):
+        raise ValueError("Machine labels must contain finite JSON values") from None
+
+
 class JobRepository:
     def __init__(
         self,
@@ -74,7 +94,10 @@ class JobRepository:
         self.deduplicator = deduplicator or JobDeduplicator()
         self.alert_dedup_hours = alert_dedup_hours
 
-    def upsert_evaluated_job(self, item: EvaluatedJob, *, observed: bool = True) -> UpsertResult:
+    def upsert_evaluated_job(
+        self, item: EvaluatedJob, *, observed: bool = True,
+        retain_labels_on_fallback: bool = False,
+    ) -> UpsertResult:
         refresh_eligibility_status(item.evaluation)
         self.find_by_record(item.record)
         identity = self.deduplicator.build_identity(item.record)
@@ -168,12 +191,17 @@ class JobRepository:
 
         if would_discard_source(item.record, existing):
             raise JobSourceConflictError("Reconcile the incomplete source before evaluating it")
+        retained = (self._retain_accepted_labels(item, existing)
+                    if retain_labels_on_fallback else None)
         previous_revision = existing.source_revision
+        conditions = [JobORM.job_uid == identity.job_uid,
+                      JobORM.source_revision == previous_revision]
+        if retained is not None:
+            # Label-only updates keep source_revision but change updated_at.
+            # Retention must not overwrite a newer accepted same-source result.
+            conditions.append(JobORM.updated_at == existing.updated_at)
         claimed = self.session.execute(
-            update(JobORM).where(
-                JobORM.job_uid == identity.job_uid,
-                JobORM.source_revision == previous_revision,
-            ).values(source_revision=previous_revision + 1),
+            update(JobORM).where(*conditions).values(source_revision=previous_revision + 1),
             execution_options={"synchronize_session": False},
         )
         if claimed.rowcount != 1:
@@ -203,6 +231,16 @@ class JobRepository:
                     "source_revision": previous_revision,
                     "source_hash": source_hash(previous_source),
                     "source_snapshot": source_snapshot(previous_source),
+                },
+            ))
+        if retained is not None and retained[0] != retained[1]:
+            self.session.add(JobEventORM(
+                job_uid=identity.job_uid, event_type="labels_source_rebound",
+                payload={
+                    "source_revision": previous_revision,
+                    "previous_source_hash": retained[0], "source_hash": retained[1],
+                    "annotation_input_hash": annotation_input_hash(item.record),
+                    "reason": "collection_observations_changed",
                 },
             ))
         previous_tier = existing.tier
@@ -282,11 +320,262 @@ class JobRepository:
         )
 
     @staticmethod
+    def _retain_accepted_labels(item: EvaluatedJob, saved: JobORM) -> tuple[str, str] | None:
+        """Retain only compatible accepted v3 fields while legacy reevaluation proceeds.
+
+        This opt-in is for regular shadow saves. It deliberately changes neither
+        the new score/tier/purpose nor their current profile versions. A failed
+        attempt remains separate, and an observation-only source pin can move
+        only under the same complete-source proof used by labels-mode retention.
+        """
+        attempt = item.record.annotation.get("labels_v3")
+        accepted = (saved.annotation or {}).get("labels_v3")
+        if (not isinstance(attempt, dict) or attempt.get("status") not in {"error", "rules_only"}
+                or not isinstance(accepted, dict) or accepted.get("status") != "labeled"):
+            return None
+        _validate_labels(attempt)
+        _validate_labels(accepted)
+        previous = record_from_saved(saved)
+        old_hash, new_hash = source_hash(previous), source_hash(item.record)
+        model_input = annotation_input_hash(previous)
+        classification = saved.role_classification or {}
+        if (attempt.get("source_hash") != new_hash or accepted.get("source_hash") != old_hash
+                or accepted.get("annotation_input_hash") != model_input
+                or item.profile_id != saved.role_label
+                or accepted.get("role_label") != saved.role_label
+                or classification.get("label") != saved.role_label
+                or classification.get("source_hash") != old_hash):
+            return None
+        binding = (saved.annotation or {}).get("labels_v3_source_binding")
+        if (isinstance(binding, dict) and binding.get("source_hash") == old_hash
+                and binding.get("annotation_input_hash") == model_input
+                and isinstance(binding.get("observation_markers"), dict)):
+            previous._source_observation_markers = retained_observation_markers(
+                binding["observation_markers"],
+            )
+        if old_hash != new_hash and not collection_only_source_change(previous, item.record):
+            return None
+        item.record.annotation["labels_v3"] = {**deepcopy(accepted), "source_hash": new_hash}
+        item.record.annotation["labels_v3_attempt"] = deepcopy(attempt)
+        if old_hash != new_hash:
+            markers = {**previous._source_observation_markers,
+                       **item.record._source_observation_markers}
+            nested = item.record.source_metadata.get("collection_observations", {})
+            markers = {key: value for key, value in retained_observation_markers(markers).items()
+                       if isinstance(nested, dict) and key in nested and nested[key] == value}
+            item.record.annotation["labels_v3_source_binding"] = {
+                "source_hash": new_hash, "annotation_input_hash": model_input,
+                "observation_markers": markers,
+            }
+        elif previous._source_observation_markers:
+            item.record.annotation["labels_v3_source_binding"] = deepcopy(binding)
+        for name in ("relevance", "labels_status", "labels_version"):
+            setattr(item.evaluation, name, deepcopy(getattr(saved, name)))
+        return old_hash, new_hash
+
+    @staticmethod
     def _assessment_fields(row, item: EvaluatedJob) -> None:
         for name in ("raw_fit_score", "score_cap_reasons", "eligibility_status",
-                     "eligibility_evidence_status"):
+                     "eligibility_evidence_status", "relevance", "labels_status",
+                     "labels_version"):
             setattr(row, name, deepcopy(getattr(item.evaluation, name)))
+        labels = item.record.annotation.get("labels_v3")
+        if isinstance(labels, dict) and row.labels_version is None:
+            row.labels_version = JobRepository._labels_version(labels)
         row.version_components = dict(item.version_components)
+
+    @staticmethod
+    def _labels_version(labels: dict) -> str | None:
+        prompt, aggregation = labels.get("prompt_version"), labels.get("aggregation_version")
+        return f"{prompt}:{aggregation}" if prompt and aggregation else None
+
+    def update_labels(
+        self, job_uid: str, labels: dict, *, expected_source_hash: str | None = None,
+        expected_source_revision: int | None = None, include_archived: bool = False,
+    ) -> bool:
+        """Save machine labels without changing source, ranking, purpose or alerts.
+
+        The caller commits one vacancy at a time. A source change during model work
+        is rejected instead of attaching predictions to a newer advertisement.
+        """
+        return self._write_labels(
+            job_uid, labels, expected_source_hash=expected_source_hash,
+            expected_source_revision=expected_source_revision,
+            include_archived=include_archived, attempt=False,
+        )
+
+    def record_label_attempt(
+        self, job_uid: str, labels: dict, *, expected_source_hash: str | None = None,
+        expected_source_revision: int | None = None, include_archived: bool = False,
+        observed: bool = False,
+    ) -> bool:
+        """Retain the accepted assessment; advance freshness only for observed intake."""
+        return self._write_labels(
+            job_uid, labels, expected_source_hash=expected_source_hash,
+            expected_source_revision=expected_source_revision,
+            include_archived=include_archived, attempt=True, observed=observed,
+        )
+
+    def record_collection_label_attempt(
+        self, job_uid: str, record: JobRecord, labels: dict, *, expected_source_revision: int,
+        include_archived: bool = False, observed: bool = False,
+    ) -> bool:
+        """Retain an accepted assessment across a proved observation-only change.
+
+        The source pin, failed attempt and provenance move in one transaction.
+        Matching model input alone cannot ignore changed status or unknown facts.
+        """
+        _validate_labels(labels)
+        if labels["status"] not in {"error", "rules_only"}:
+            raise ValueError("Collection preservation requires an unsuccessful label attempt")
+        if type(include_archived) is not bool or type(observed) is not bool:
+            raise ValueError("Observation and archive flags must be Boolean")
+        if type(expected_source_revision) is not int or expected_source_revision < 1:
+            raise ValueError("expected_source_revision must be a positive integer")
+        job = self.session.scalar(select(JobORM).where(JobORM.job_uid == job_uid)
+                                  .execution_options(populate_existing=True))
+        if job is None or job.archived_at is not None and not include_archived:
+            return False
+        if job.source_revision != expected_source_revision:
+            raise JobSourceConflictError("Source changed before labels save; label it again")
+        previous = record_from_saved(job)
+        old_hash, new_hash = source_hash(previous), source_hash(record)
+        if labels.get("source_hash") != new_hash:
+            raise JobSourceConflictError("Source changed before labels save; label it again")
+        accepted = (job.annotation or {}).get("labels_v3")
+        classification = job.role_classification or {}
+        model_input = annotation_input_hash(previous)
+        binding = (job.annotation or {}).get("labels_v3_source_binding")
+        if (isinstance(binding, dict) and binding.get("source_hash") == old_hash
+                and binding.get("annotation_input_hash") == model_input
+                and isinstance(binding.get("observation_markers"), dict)):
+            previous._source_observation_markers = retained_observation_markers(
+                binding["observation_markers"],
+            )
+        if (
+            old_hash == new_hash or not collection_only_source_change(previous, record)
+            or not isinstance(accepted, dict) or accepted.get("status") != "labeled"
+            or accepted.get("source_hash") != old_hash
+            or accepted.get("annotation_input_hash") != model_input
+            or classification.get("source_hash") != old_hash
+            or classification.get("label") != job.role_label
+        ):
+            return False
+        identity = self.deduplicator.build_identity(record)
+        if identity.fingerprint != job.fingerprint:
+            return False
+        annotation = deepcopy(job.annotation)
+        annotation["labels_v3"] = {**deepcopy(accepted), "source_hash": new_hash}
+        annotation["labels_v3_attempt"] = deepcopy(labels)
+        markers = {**previous._source_observation_markers, **record._source_observation_markers}
+        nested = record.source_metadata.get("collection_observations", {})
+        markers = {key: value for key, value in retained_observation_markers(markers).items()
+                   if isinstance(nested, dict) and key in nested and nested[key] == value}
+        annotation["labels_v3_source_binding"] = {
+            "source_hash": new_hash, "annotation_input_hash": model_input,
+            "observation_markers": markers,
+        }
+        now = datetime.now(UTC)
+        values = {
+            "source_metadata": deepcopy(record.source_metadata),
+            "source_revision": expected_source_revision + 1,
+            "content_hash": identity.content_hash,
+            "role_classification": {**deepcopy(classification), "source_hash": new_hash,
+                                    "content_hash": identity.content_hash},
+            "annotation": annotation, "updated_at": now,
+        }
+        if observed:
+            values["last_seen_at"] = now
+        # Label-only writes keep source_revision but advance updated_at. Claim
+        # both snapshots so a newer accepted result is never replaced by our copy.
+        conditions = [JobORM.job_uid == job_uid,
+                      JobORM.source_revision == expected_source_revision,
+                      JobORM.updated_at == job.updated_at]
+        if not include_archived:
+            conditions.append(JobORM.archived_at.is_(None))
+        updated = self.session.execute(update(JobORM).where(*conditions).values(**values)
+                                      .execution_options(synchronize_session=False))
+        if updated.rowcount != 1:
+            raise JobSourceConflictError("Source changed before labels save; label it again")
+        self.session.execute(update(JobProfileEvaluationORM).where(
+            JobProfileEvaluationORM.job_uid == job_uid,
+            JobProfileEvaluationORM.profile_id == job.role_label,
+            JobProfileEvaluationORM.content_hash == job.content_hash,
+            JobProfileEvaluationORM.classification_source_hash == old_hash,
+        ).values(classification_source_hash=new_hash, content_hash=identity.content_hash,
+                 updated_at=JobProfileEvaluationORM.updated_at)
+         .execution_options(synchronize_session=False))
+        self.session.add(JobEventORM(job_uid=job_uid, event_type="source_superseded", payload={
+            "source_revision": expected_source_revision, "source_hash": old_hash,
+            "source_snapshot": source_snapshot(previous),
+        }))
+        self.session.add(JobEventORM(job_uid=job_uid, event_type="labels_source_rebound", payload={
+            "source_revision": expected_source_revision,
+            "previous_source_hash": old_hash, "source_hash": new_hash,
+            "annotation_input_hash": model_input, "reason": "collection_observations_changed",
+        }))
+        register_aliases(self.session, record, job_uid)
+        self.session.expire(job)
+        self.session.flush()
+        return True
+
+    def _write_labels(
+        self, job_uid: str, labels: dict, *, expected_source_hash: str | None,
+        expected_source_revision: int | None, include_archived: bool, attempt: bool,
+        observed: bool = False,
+    ) -> bool:
+        _validate_labels(labels)
+        relevance = labels.get("relevance")
+        if type(include_archived) is not bool:
+            raise ValueError("include_archived must be Boolean")
+        if type(observed) is not bool:
+            raise ValueError("observed must be Boolean")
+        if expected_source_revision is not None and (
+            type(expected_source_revision) is not int or expected_source_revision < 1
+        ):
+            raise ValueError("expected_source_revision must be a positive integer")
+        if expected_source_hash is not None and (
+            not isinstance(expected_source_hash, str) or not expected_source_hash
+        ):
+            raise ValueError("expected_source_hash must be nonempty text")
+        job = self.session.scalar(select(JobORM).where(JobORM.job_uid == job_uid)
+                                  .execution_options(populate_existing=True))
+        if job is None or (job.archived_at is not None and not include_archived):
+            return False
+        current_hash = source_hash(record_from_saved(job))
+        if (
+            labels.get("source_hash") != current_hash
+            or (expected_source_hash is not None and expected_source_hash != current_hash)
+            or (expected_source_revision is not None
+                and expected_source_revision != job.source_revision)
+        ):
+            raise JobSourceConflictError("Source changed before labels save; label it again")
+        annotation = deepcopy(job.annotation or {})
+        annotation["labels_v3_attempt" if attempt else "labels_v3"] = deepcopy(labels)
+        values = {} if attempt else {
+            "relevance": relevance, "labels_status": labels["status"],
+            "labels_version": self._labels_version(labels),
+        }
+        if observed:
+            values["last_seen_at"] = datetime.now(UTC)
+        conditions = [JobORM.job_uid == job_uid, JobORM.source_revision == job.source_revision]
+        if not include_archived:
+            conditions.append(JobORM.archived_at.is_(None))
+        saved = self.session.execute(update(JobORM).where(*conditions).values(
+            annotation=annotation, updated_at=datetime.now(UTC), **values,
+        ).execution_options(synchronize_session=False))
+        if saved.rowcount != 1:
+            raise JobSourceConflictError("Source changed before labels save; label it again")
+        if not attempt:
+            self.session.execute(update(JobProfileEvaluationORM).where(
+                JobProfileEvaluationORM.job_uid == job_uid,
+                JobProfileEvaluationORM.content_hash == job.content_hash,
+                JobProfileEvaluationORM.profile_id == job.role_label,
+                JobProfileEvaluationORM.classification_source_hash == current_hash,
+            ).values(**values).execution_options(synchronize_session="fetch"))
+        self.session.expire(job)
+        self.session.flush()
+        return True
 
     def upsert_evaluations(
         self,
@@ -295,12 +584,15 @@ class JobRepository:
         *,
         observed: bool = True,
         queue_alert: bool = False,
+        retain_labels_on_fallback: bool = False,
     ) -> UpsertResult:
         """Atomically save one assigned role and its single relevance evaluation."""
         if len(items) != 1:
             raise ValueError("Exactly one role relevance evaluation is required")
         best = items[0]
-        result = self.upsert_evaluated_job(best, observed=observed)
+        result = self.upsert_evaluated_job(
+            best, observed=observed, retain_labels_on_fallback=retain_labels_on_fallback,
+        )
         self.session.flush()
         identity = self.deduplicator.build_identity(best.record)
         for item in items:

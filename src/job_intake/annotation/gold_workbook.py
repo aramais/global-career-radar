@@ -9,13 +9,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
 import re
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
 from job_intake.annotation.benchmark import read_jsonl
+from job_intake.annotation.cohorts import write_new_text as publish_new_text
 from job_intake.annotation.eval_runner import read_saved_records
 from job_intake.annotation.gold import DEFAULT_PROFILE_IDS, GOLD_SCHEMA, _snapshot, validate_gold
 from job_intake.annotation.text import source_hash
@@ -42,36 +41,20 @@ _GATES = {
 
 def ensure_new_outputs(outputs: list[Path]) -> None:
     """Check every destination before work starts; the writer also refuses races."""
-    resolved = [path.expanduser().resolve() for path in outputs]
-    if len(set(resolved)) != len(resolved):
+    paths = [path.expanduser().parent.resolve() / path.expanduser().name for path in outputs]
+    if len({path.resolve() for path in paths}) != len(paths):
         raise ValueError("Gold destinations must be distinct")
-    for path in resolved:
-        if path.exists():
+    for path in paths:
+        if path.exists() or path.is_symlink():
             raise ValueError(f"Gold output already exists; choose a new path: {path}")
 
 
-def write_new_text(content: str, output: Path) -> Path:
-    """Atomically create a complete file, refusing to replace any existing output."""
-    path = output.expanduser().resolve()
+def write_new_text(output: Path, content: str) -> Path:
+    """Gold preflight with the common path-first, identity-owned publisher."""
+    output = output.expanduser()
+    path = output.parent.resolve() / output.name
     ensure_new_outputs([path])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".",
-            suffix=".tmp", delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        # A hard link publishes a complete file atomically and fails if a second
-        # process created the destination after the preflight check.
-        os.link(temporary, path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-    return path
+    return publish_new_text(path, content)
 
 
 def jsonl_content(cases: list[dict]) -> str:

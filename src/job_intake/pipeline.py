@@ -26,17 +26,28 @@ from job_intake.config.settings import (
     load_yaml_mapping,
 )
 from job_intake.filtering import refresh_eligibility_status
+from job_intake.labeling.application import apply_labels_hiring
 from job_intake.models.job import EvaluatedJob, FilterDecision, JobRecord, JobStatus, JobTier
-from job_intake.profiles import SearchStream, load_streams, profile_query_order, with_other_stream
+from job_intake.profiles import (
+    SearchStream,
+    load_streams,
+    profile_query_order,
+    with_labeling_versions,
+    with_other_stream,
+)
 from job_intake.scoring.llm import BatchReranker, build_reranker, should_skip_llm
 from job_intake.scoring.tiering import finalize_tier
 from job_intake.storage.database import Database
 from job_intake.storage.dedup import JobDeduplicator
 from job_intake.storage.models import AlertOutboxORM
 from job_intake.storage.queries import classification_is_current
-from job_intake.storage.repository import JobRepository, validate_job_uids
+from job_intake.storage.repository import (
+    JobRepository,
+    JobSourceConflictError,
+    validate_job_uids,
+)
 from job_intake.storage.source_lifecycle import record_source_snapshot
-from job_intake.storage.source_state import reconcile_source
+from job_intake.storage.source_state import reconcile_source, record_from_saved
 from job_intake.utils.logging import configure_logging
 from job_intake.utils.text import stable_hash
 
@@ -51,6 +62,7 @@ class JobIntakePipeline:
             load_streams(common_rules, load_yaml_mapping(config.search_profiles_path)),
             common_rules,
         )
+        self.streams = with_labeling_versions(self.streams, config.labeling)
         self.classifier = RoleClassifier(self.streams, config.annotation)
         self.database = Database(config.database_url)
         self.database.create_schema()
@@ -62,6 +74,11 @@ class JobIntakePipeline:
         self.deduplicator = JobDeduplicator()
         self.annotator = VacancyAnnotator(config.annotation)
         self.prefilter = VacancyPrefilter(config.prefilter)
+        from job_intake.labeling.tagger import VacancyTagger
+
+        self.tagger = VacancyTagger(config.labeling, self.streams)
+        self._label_ai_authorized = False
+        self._label_include_archived = False
 
     @property
     def profile_versions(self) -> dict[str, str]:
@@ -109,6 +126,12 @@ class JobIntakePipeline:
             "prefilter_suppressed": 0,
             "prefilter_full_review": 0,
             "prefilter_local_skipped": 0,
+            "labels_calls": 0,
+            "labels_cache_hits": 0,
+            "labels_facts_reuse": 0,
+            "labels_escalations": 0,
+            "labels_errors": 0,
+            "labels_gated": 0,
             "errors": [],
         }
 
@@ -156,6 +179,10 @@ class JobIntakePipeline:
                     else:
                         pending_groups.pop(job_uid, None)
                 except Exception as exc:
+                    from job_intake.labeling.budget import BudgetExceeded
+
+                    if isinstance(exc, BudgetExceeded):
+                        raise
                     self._error(stats, "record_errors", record.original_url or record.title, exc)
             self._record_source_health(adapter, source, stats)
         self._finish_batches(pending_groups, stats, queue_alert=True)
@@ -258,6 +285,7 @@ class JobIntakePipeline:
             local_item = engine.apply(record)
             requested_ai = (
                 use_llm and self.config.annotation.enabled and self.config.annotation.ai_enabled
+                and not self._labels_mode()
             )
             if (
                 stream.id == "other" and requested_ai
@@ -269,6 +297,29 @@ class JobIntakePipeline:
                 local_item = engine.apply(record)
             for name, value in self.classifier.stats.items():
                 stats["classification_" + name] += value - before_classification[name]
+            labels = None
+            if self.config.labeling.enabled and self.config.labeling.mode != "legacy":
+                before_labels = dict(self.tagger.stats)
+                if (use_llm and self.config.labeling.ai_enabled
+                        and self._label_ai_authorized):
+                    labels = self.tagger.label(
+                        record, local_item.evaluation, classification, use_ai=True,
+                    )
+                else:
+                    labels = self.tagger.relabel_offline(
+                        record, local_item.evaluation, classification,
+                    )
+                for name, value in self.tagger.stats.items():
+                    stats["labels_" + name] += value - before_labels[name]
+                if self._labels_mode() and labels.role_label and labels.role_label != stream.id:
+                    stream = self._stream_by_id(labels.role_label)
+                    engine = stream.engine
+                    local_item = engine.apply(record)
+                    classification = {
+                        **classification, "label": stream.id, "method": "labels_v3",
+                        "labels_cache_key": labels.cache_key,
+                    }
+            skip_two_pass = labels is not None and self._labels_mode()
             route = None
             if requested_ai and local_item.evaluation.decision == FilterDecision.REJECT:
                 blockers = sorted(set(local_item.evaluation.blocker_signals))
@@ -283,7 +334,7 @@ class JobIntakePipeline:
                     self.annotator.progress, "prefilter_local_skip", routing="local_reject",
                     reason_code="hard_blocker", blockers=len(blockers),
                 )
-            elif self.config.prefilter.enabled:
+            elif self.config.prefilter.enabled and not skip_two_pass:
                 if requested_ai:
                     before = dict(self.prefilter.stats)
                     route = self.prefilter.route(record)
@@ -301,11 +352,14 @@ class JobIntakePipeline:
             suppressed = route is not None and route["routing"] == "suppressed"
             before = dict(self.annotator.stats)
             self.annotator.annotate(
-                record, use_ai=use_llm and not suppressed
+                record, use_ai=use_llm and not skip_two_pass and not suppressed
                 and not (route is not None and route["routing"] == "local_reject"),
             )
             # Routing is deliberately outside source claims and their independent review.
             record.annotation.pop("prefilter", None)
+            if labels is not None:
+                # The legacy annotator replaces its object; preserve the independent result.
+                record.annotation["labels_v3"] = asdict(labels)
             if route is not None:
                 record.annotation["prefilter"] = route
             for name, value in self.annotator.stats.items():
@@ -316,6 +370,12 @@ class JobIntakePipeline:
             item.profile_version, item.profile_context = stream.version, stream.context
             item.version_components = dict(stream.version_components)
             item.role_classification = classification
+            if labels is not None:
+                item.evaluation.relevance = labels.relevance
+                item.evaluation.labels_status = labels.status
+                item.evaluation.labels_version = (
+                    labels.prompt_version + ":" + labels.aggregation_version
+                )
             if stream.id == "other":
                 # No relevance estimate against an unrelated occupation.
                 item.evaluation.fit_score = item.evaluation.deterministic_score = 0.0
@@ -353,6 +413,7 @@ class JobIntakePipeline:
                 )
             if (
                 use_llm
+                and not skip_two_pass
                 and self.config.llm.enabled
                 and not suppressed
                 and not (self.config.annotation.enabled and self.config.annotation.ai_enabled)
@@ -410,7 +471,35 @@ class JobIntakePipeline:
                     )
             scoring = by_id[item.profile_id].scoring
             refresh_eligibility_status(item.evaluation)
-            finalize_tier(item, scoring.threshold_a, scoring.threshold_b)
+            if self._labels_mode():
+                apply_labels_hiring(
+                    item.record, item.evaluation, item.record.annotation.get("labels_v3"),
+                )
+            finalize_tier(
+                item, scoring.threshold_a, scoring.threshold_b,
+                tier_source=self._effective_tier_source(item.record.annotation.get("labels_v3")),
+            )
+
+    def _labels_mode(self) -> bool:
+        return self.config.labeling.enabled and self.config.labeling.mode == "labels"
+
+    def _stream_by_id(self, role_id: str) -> SearchStream:
+        for stream in self.streams:
+            if stream.id == role_id:
+                return stream
+        raise ValueError("Labels returned an unknown or disabled role")
+
+    def _effective_tier_source(self, labels) -> str:
+        if not isinstance(labels, dict) and labels is not None:
+            labels = asdict(labels)
+        if (
+            self._labels_mode() and self.config.labeling.tier_source == "relevance"
+            and isinstance(labels, dict) and labels.get("rubric_status") == "confirmed"
+            and labels.get("status") in {"labeled", "gated"}
+            and type(labels.get("relevance")) is int and labels["relevance"] in range(4)
+        ):
+            return "relevance"
+        return "score"
 
     def _save(
         self, items: list[EvaluatedJob], keys: dict[str, str], *, observed: bool, queue_alert: bool
@@ -419,10 +508,50 @@ class JobIntakePipeline:
             repository = JobRepository(
                 session, alert_dedup_hours=self.config.telegram.alert_dedup_hours
             )
+            record = items[0].record
+            labels = record.annotation.get("labels_v3")
+            if (self._labels_mode() and isinstance(labels, dict)
+                    and labels.get("status") in {"error", "rules_only"}):
+                saved = repository.find_by_record(record)
+                if saved is not None:
+                    if (record._source_reconciled
+                            and record._expected_source_revision != saved.source_revision):
+                        raise JobSourceConflictError(
+                            "Source changed after reconciliation; evaluate it again"
+                        )
+                    current_hash = source_hash(record_from_saved(saved))
+                    if current_hash == labels.get("source_hash") == source_hash(record):
+                        revision = saved.source_revision
+                        if not repository.record_label_attempt(
+                            saved.job_uid, labels, expected_source_hash=current_hash,
+                            expected_source_revision=revision,
+                            include_archived=self._label_include_archived or observed,
+                            observed=observed,
+                        ):
+                            raise ValueError("Selected vacancy disappeared or was archived")
+                        if observed:
+                            from job_intake.storage.aliases import register_aliases
+
+                            register_aliases(session, record, saved.job_uid)
+                        session.commit()
+                        record._expected_source_revision = revision
+                        return
+                    if repository.record_collection_label_attempt(
+                        saved.job_uid, record, labels,
+                        expected_source_revision=saved.source_revision,
+                        include_archived=self._label_include_archived or observed,
+                        observed=observed,
+                    ):
+                        session.commit()
+                        record._expected_source_revision = saved.source_revision
+                        return
             repository.upsert_evaluations(
                 items,
                 keys,
                 observed=observed,
+                retain_labels_on_fallback=(
+                    self.config.labeling.enabled and self.config.labeling.mode == "shadow"
+                ),
                 queue_alert=(
                     queue_alert
                     and self.config.telegram.enabled
@@ -501,9 +630,13 @@ class JobIntakePipeline:
         previous_progress = self.annotator.progress
         previous_prefilter_progress = self.prefilter.progress
         previous_classifier_progress = self.classifier.client.progress
+        previous_tagger_progress = self.tagger.progress
+        previous_include_archived = self._label_include_archived
         self.annotator.set_progress(progress)
         self.prefilter.set_progress(progress)
         self.classifier.client.progress = progress
+        self.tagger.set_progress(progress)
+        self._label_include_archived = include_archived
         started = time.monotonic()
         emit_progress(progress, "run_start")
         try:
@@ -516,13 +649,16 @@ class JobIntakePipeline:
             emit_progress(
                 progress, "run_complete", total=result["persisted"] + result["record_errors"],
                 persisted=result["persisted"], elapsed=time.monotonic() - started,
-                **{key: value for key, value in result.items() if key.startswith("prefilter_")},
+                **{key: value for key, value in result.items()
+                   if key.startswith(("prefilter_", "labels_"))},
             )
             return result
         finally:
             self.annotator.set_progress(previous_progress)
             self.prefilter.set_progress(previous_prefilter_progress)
             self.classifier.client.progress = previous_classifier_progress
+            self.tagger.set_progress(previous_tagger_progress)
+            self._label_include_archived = previous_include_archived
 
     def _reevaluate_saved(
         self, *, use_ai: bool, limit: int | None, progress: ProgressCallback | None,
@@ -572,6 +708,7 @@ class JobIntakePipeline:
             started = time.monotonic()
             annotation_errors_before = stats["annotation_errors"]
             prefilter_errors_before = stats["prefilter_errors"]
+            labels_errors_before = stats["labels_errors"]
             emit_progress(
                 progress, "job_start", index=index, total=len(records),
                 company=record.company, title=record.title,
@@ -585,18 +722,57 @@ class JobIntakePipeline:
                     progress, "job_complete", evaluations=len(items),
                     elapsed=time.monotonic() - started,
                     errors=(stats["annotation_errors"] - annotation_errors_before
-                            + stats["prefilter_errors"] - prefilter_errors_before),
+                            + stats["prefilter_errors"] - prefilter_errors_before
+                            + stats["labels_errors"] - labels_errors_before),
                     annotation_errors=stats["annotation_errors"] - annotation_errors_before,
                     prefilter_errors=stats["prefilter_errors"] - prefilter_errors_before,
+                    labels_errors=stats["labels_errors"] - labels_errors_before,
                 )
                 if pending:
                     job_uid = self.deduplicator.build_identity(record).job_uid
                     pending_groups[job_uid] = (items, keys, pending)
             except Exception as exc:
+                from job_intake.labeling.budget import BudgetExceeded
+
+                if isinstance(exc, BudgetExceeded):
+                    raise
                 emit_progress(progress, "job_error", error_type=type(exc).__name__)
                 self._error(stats, "record_errors", record.title, exc)
         self._finish_batches(pending_groups, stats, queue_alert=False)
         return stats
+
+    def label_saved(
+        self, *, use_ai: bool = False, limit: int | None = None,
+        job_uids: list[str] | None = None, offline: bool = False,
+        include_archived: bool = False, budget=None, ledger=None,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
+        """Run the labels-mode path once, committing each completed vacancy.
+
+        Shadow writes have a dedicated repository operation and should not call
+        this method: their legacy evaluation must remain exactly as saved.
+        """
+        if not self._labels_mode():
+            raise ValueError("label_saved requires labeling.enabled and mode=labels")
+        if offline and use_ai:
+            raise ValueError("offline labeling cannot use AI")
+        if use_ai and budget is None:
+            raise ValueError("AI labels require an explicit budget")
+        previous_budget, previous_ledger = self.tagger.budget, self.tagger.ledger
+        previous_config = self.config.labeling.ai_enabled
+        previous_authorized = self._label_ai_authorized
+        self.tagger.budget, self.tagger.ledger = budget, ledger
+        self.config.labeling.ai_enabled = use_ai and not offline
+        self._label_ai_authorized = use_ai and budget is not None
+        try:
+            return self.reevaluate_saved(
+                use_ai=use_ai and not offline, limit=limit, job_uids=job_uids,
+                include_archived=include_archived, progress=progress,
+            )
+        finally:
+            self.tagger.budget, self.tagger.ledger = previous_budget, previous_ledger
+            self.config.labeling.ai_enabled = previous_config
+            self._label_ai_authorized = previous_authorized
 
     def send_daily_digest(self, hours: int = 24) -> str:
         with self.database.session() as session:

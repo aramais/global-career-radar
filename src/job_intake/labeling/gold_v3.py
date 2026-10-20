@@ -26,7 +26,7 @@ from job_intake.labeling.schema import (
 from job_intake.models.job import JobRecord
 
 MIGRATION_SCHEMA = "vacancy-labels-v3-migration-v1"
-TAG_MAP_VERSION = "v2-to-v3-tags-v3"
+TAG_MAP_VERSION = "v2-to-v3-tags-v4"
 METHOD_MAP = {"blind": "blind", "assisted": "curated"}
 _HIRING_GEOGRAPHY = {
     "brazil_explicit": "open_to_brazil", "includes_brazil_region": "open_to_brazil",
@@ -103,6 +103,7 @@ def gold_file_schema(cases: list[dict]) -> str:
 
 def _hiring(tags: dict) -> tuple[dict | None, list[tuple[str, str, str]]]:
     candidates, dropped = [], []
+    unresolved_required_authorization = False
     geography = tags.get("hiring_geography")
     if isinstance(geography, dict) and geography.get("value") in _HIRING_GEOGRAPHY:
         candidates.append((_HIRING_GEOGRAPHY[geography["value"]], geography["quote"]))
@@ -118,12 +119,18 @@ def _hiring(tags: dict) -> tuple[dict | None, list[tuple[str, str, str]]]:
             elif alias in _FOREIGN_AUTHORIZATION_ALIASES:
                 candidates.append(("restricted_elsewhere", authorization["quote"]))
             else:
+                unresolved_required_authorization = True
                 dropped.append(("work_authorization", value,
                                 "authorization country is missing or unsupported"))
         elif value == "unspecified":
             candidates.append(("unspecified", authorization["quote"]))
         else:
             dropped.append(("work_authorization", str(value), "no v3 analogue"))
+    if unresolved_required_authorization:
+        if isinstance(geography, dict) and geography.get("value") in _HIRING_GEOGRAPHY:
+            dropped.append(("hiring_geography", geography["value"],
+                            "combined hiring fact has an unresolved authorization requirement"))
+        return None, dropped
     for value in _HIRING_PRIORITY:
         for candidate, quote in candidates:
             if candidate == value:
@@ -237,9 +244,11 @@ def _write_migration_outputs(outputs: list[tuple[Path, str]]) -> None:
     ensure_new_outputs([path for path, _ in outputs])
     staged: list[tuple[Path, Path, tuple[int, int]]] = []
     published: list[tuple[Path, tuple[int, int]]] = []
+    failure = None
     try:
         for output, content in outputs:
-            path = output.expanduser().resolve()
+            expanded = output.expanduser()
+            path = expanded.parent.resolve() / expanded.name
             path.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
                 mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".",
@@ -257,6 +266,7 @@ def _write_migration_outputs(outputs: list[tuple[Path, str]]) -> None:
             published.append((path, identity))
             os.link(temporary, path)
     except BaseException as exc:
+        failure = exc
         for path, identity in reversed(published):
             try:
                 current = path.lstat()
@@ -268,8 +278,21 @@ def _write_migration_outputs(outputs: list[tuple[Path, str]]) -> None:
                 exc.add_note(f"Could not roll back migration output {path}: {cleanup_error}")
         raise
     finally:
-        for temporary, _, _ in staged:
-            temporary.unlink(missing_ok=True)
+        for temporary, _, identity in staged:
+            try:
+                current = temporary.lstat()
+            except OSError:
+                # Unknown ownership leaves an orphan rather than deleting a peer.
+                continue
+            if (current.st_dev, current.st_ino) == identity:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as cleanup_error:
+                    if failure is None:
+                        raise
+                    failure.add_note(f"Could not remove owned migration staging: {cleanup_error}")
 
 
 def migrate_gold_v2(source: Path, out: Path, *, rubric_version: str) -> dict:

@@ -2,9 +2,9 @@
 
 Values come from ``config/labeling_rubric.yaml``; the user owns them. A section whose
 ``status`` is ``proposed`` is loaded for transparency but never applied: it reaches
-neither the prompt nor the aggregation and does not change their hashes. The anchors
-and notes are the root section: they always describe the prompt, and the root status
-only reports whether the user has confirmed them.
+neither the prompt nor the aggregation and does not change their hashes. The root
+confirmation controls the whole rubric, including its independently confirmed
+child sections. Hashes describe effective, applied parts only.
 """
 
 from __future__ import annotations
@@ -192,13 +192,16 @@ def parse_rubric(data: dict) -> Rubric:
                                           for name in names):
         raise RubricError("invalid_rubric", "strong_companies.names must be nonempty text")
     p2_rule = _text(sections["p2"]["rule"], "p2.rule")
-    applied = {name: status[name] == "confirmed" for name in status}
+    root_confirmed = data["status"] == "confirmed"
+    applied = {name: root_confirmed and status[name] == "confirmed" for name in status}
     effective_preferences = preferences if applied["domain_preferences"] else None
     effective_names = tuple(names) if applied["strong_companies"] else ()
     prompt_part = {
         "anchors": anchors, **notes, "domain_preferences": effective_preferences,
         "strong_companies": list(effective_names),
     }
+    if not root_confirmed:
+        prompt_part = {}
     aggregation_part = {
         "aggregation": aggregation if applied["aggregation"] else None,
         "domain_preferences": effective_preferences,

@@ -35,6 +35,7 @@ from job_intake.annotation.experiments import (
 from job_intake.annotation.frozen_eval import (
     build_bundle,
     compare_runs,
+    comparison_destinations,
     create_run,
     load_bundle,
     save_bundle,
@@ -175,6 +176,11 @@ def compare(
         )
         if manifest and manifest["dataset_role"] == "holdout" and log is None:
             raise ValueError("Holdout comparison requires an exposure journal")
+        comparison_destinations(output, protected_paths=[
+            bundle, baseline, candidate,
+            *([repeat] if repeat else []), *([cohort] if cohort else []),
+            *([log] if log else []),
+        ])
         result = compare_runs(
             frozen,
             read_object(baseline),
@@ -183,8 +189,6 @@ def compare(
             exposure_log=log,
         )
         # Exclusive destination is checked before consuming the holdout; no gold writes.
-        if output.suffix != ".json" or output.exists() or output.with_suffix(".md").exists():
-            raise ValueError("Output exists; immutable reports cannot be replaced")
         if manifest and log:
             event = record_exposure(
                 log,
@@ -339,14 +343,15 @@ def experiment_report(
         manifest = frozen.get("cohort")
         if manifest and manifest["dataset_role"] == "holdout" and exposure_log is None:
             raise ValueError("Holdout experiment analysis requires --exposure-log")
+        comparison_destinations(output, protected_paths=[
+            bundle, declaration, *runs, *([exposure_log] if exposure_log else []),
+        ])
         result = measure_experiment(
             frozen,
             read_object(declaration),
             runs=[read_object(path) for path in runs],
             exposure_log=exposure_log,
         )
-        if output.suffix != ".json" or output.exists() or output.with_suffix(".md").exists():
-            raise ValueError("Output exists; immutable reports cannot be replaced")
         if manifest and exposure_log:
             result["exposure_event"] = record_exposure(
                 exposure_log,

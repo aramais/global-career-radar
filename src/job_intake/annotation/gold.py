@@ -213,6 +213,16 @@ def validate_gold(
     Source drift is visible and quotes must still rebind uniquely to the current source.
     Rebound IDs are returned in the report only; the human JSONL remains quote-based.
     """
+    from job_intake.labeling.schema import LABELS_SCHEMA
+
+    if isinstance(cases, list) and any(
+        isinstance(case, dict) and case.get("schema") == LABELS_SCHEMA for case in cases
+    ):
+        from job_intake.labeling.gold_v3 import validate_gold_v3
+
+        return validate_gold_v3(
+            rows, cases, profile_ids=profile_ids, source_history=source_history,
+        )
     records = dict(rows)
     expected_profiles = set(profile_ids or DEFAULT_PROFILE_IDS)
     errors, warnings, rebound, compatibility = [], [], [], []

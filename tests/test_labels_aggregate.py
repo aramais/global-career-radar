@@ -149,6 +149,8 @@ def test_unconfirmed_aggregation_is_refused():
     ("Mercado-Libre LLC", "mercado libre"), ("ARGENX", "argenx"), ("  Foo   Ltd  ", "foo"),
     ("Mosa", "mosa"), (None, ""), ("Natura Cosméticos S/A", "natura cosmeticos"),
     ("Acme, Inc.,", "acme"), ("Foo Ltd., Inc.", "foo"), ("Visa", "visa"),
+    ("Acme (LLC)", "acme"), ("Acme-LLC", "acme"), ("Acme(LLC)", "acme"),
+    ("Acme (S.A.)", "acme"), ("Acme / S.A.", "acme"),
 ])
 def test_normalize_company(name, expected):
     assert normalize_company(name) == expected
@@ -170,4 +172,4 @@ def test_p2_candidate(function_core, relevance, gate, expected):
 
 
 def test_aggregation_version_is_stable():
-    assert AGGREGATION_VERSION == "labels-aggregation-v1"
+    assert AGGREGATION_VERSION == "labels-aggregation-v4"

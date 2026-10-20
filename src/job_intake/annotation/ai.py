@@ -487,6 +487,9 @@ def _openai_reasoning_model(model: str) -> bool:
 
 def _anthropic_schema(prompt: str) -> dict[str, Any]:
     """Use a fixed application schema; source strings never control its shape."""
+    if prompt.startswith("labels_v3_format=closed_schema_v1\n"):
+        from job_intake.labeling.prompt import response_schema_from_prompt
+        return response_schema_from_prompt(prompt)
     if prompt.startswith(ROLE_CLASSIFICATION_PROMPT):
         return _classification_schema()
     if prompt.startswith(REVIEW_PROMPT):
@@ -532,6 +535,9 @@ def _gemini_schema(prompt: str) -> dict[str, Any] | None:
     The provider schema complements local evidence validation. It does not
     establish whether a claim or a proposed exclusion is true.
     """
+    if prompt.startswith("labels_v3_format=closed_schema_v1\n"):
+        from job_intake.labeling.prompt import response_schema_from_prompt
+        return response_schema_from_prompt(prompt)
     if prompt.startswith(ROLE_CLASSIFICATION_PROMPT):
         return _classification_schema()
     if prompt.startswith(REVIEW_PROMPT):
@@ -911,6 +917,12 @@ class AnnotationModelClient:
         self, model: str, prompt: str, api_key: str
     ) -> tuple[dict[str, Any], dict[str, int]]:
         # Native Messages structured outputs; see Claude's official JSON outputs contract.
+        # Haiku 5.5 defaults to adaptive thinking. Restrict the new explicit
+        # control to labels requests so existing annotation stages stay identical.
+        labels_haiku = (prompt.startswith("labels_v3_format=closed_schema_v1\n")
+                        and model.startswith("claude-haiku-5-5"))
+        labels_effort = ("low" if self.config.reasoning_effort in {"none", "minimal"}
+                         else self.config.reasoning_effort)
         body = self._post(
             f"{_base_url(self.config)}/messages",
             {"x-api-key": api_key, "anthropic-version": "2023-06-01",
@@ -921,7 +933,9 @@ class AnnotationModelClient:
                 "max_tokens": self.config.max_output_tokens,
                 "output_config": {"format": {
                     "type": "json_schema", "schema": _anthropic_schema(prompt),
-                }},
+                }, **({"effort": labels_effort} if labels_haiku else {})},
+                **({"thinking": {"type": "disabled" if self.config.reasoning_effort == "none"
+                                  else "adaptive"}} if labels_haiku else {}),
             },
         )
         raw_usage = body.get("usage")
@@ -987,6 +1001,10 @@ class AnnotationModelClient:
                     "text": {"format": {"type": "json_object"}},
                     "store": False,
                 }
+                if prompt.startswith("labels_v3_format=closed_schema_v1\n"):
+                    from job_intake.labeling.prompt import response_schema_from_prompt
+                    arguments["text"] = {"format": {"type": "json_schema", "name": "labels_v3",
+                        "schema": response_schema_from_prompt(prompt), "strict": True}}
                 if _openai_reasoning_model(model):
                     arguments["reasoning"] = {"effort": self.config.reasoning_effort}
                 response = client.responses.create(**arguments)

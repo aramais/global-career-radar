@@ -91,7 +91,7 @@ def test_manifest_records_input_and_output_sha256(tmp_path):
     manifest = migrate_gold_v2(source, out, rubric_version=RUBRIC_VERSION)
     saved = json.loads(out.with_suffix(".manifest.json").read_text(encoding="utf-8"))
     assert saved == manifest
-    assert manifest["tag_map_version"] == TAG_MAP_VERSION == "v2-to-v3-tags-v3"
+    assert manifest["tag_map_version"] == TAG_MAP_VERSION == "v2-to-v3-tags-v4"
     assert manifest["source"]["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
     assert manifest["output"]["sha256"] == hashlib.sha256(out.read_bytes()).hexdigest()
     assert manifest["api_calls"] == 0 and manifest["database_access"] == "none"
@@ -276,8 +276,8 @@ def test_authorization_without_an_established_country_never_invents_a_gate(count
         "hiring_geography": {"value": "brazil_explicit", "quote": "Hiring in Brazil."},
         "work_authorization": authorization,
     })
-    assert result["hiring_eligibility"]["value"] == "open_to_brazil"
-    assert len(dropped) == 1
+    assert "hiring_eligibility" not in result
+    assert len(dropped) == 2 and dropped[1][0] == "hiring_geography"
 
 
 def test_unknown_authorization_country_is_reported_as_dropped_in_manifest(tmp_path):

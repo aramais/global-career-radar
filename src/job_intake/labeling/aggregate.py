@@ -1,7 +1,7 @@
 """S4 deterministic aggregation of v3 tags; free to recompute, never calls a model.
 
-P0 implements only the pure functions: ``rules_relevance``, ``normalize_company``
-and ``p2_candidate``. Gate, escalation and final-policy logic arrive with the tagger.
+Pure rules, final policy and escalation decisions do not perform I/O. Hiring
+conditions are independent from relevance; model-only blockers need confirmation.
 """
 
 from __future__ import annotations
@@ -11,7 +11,8 @@ import unicodedata
 
 from job_intake.labeling.rubric import Rubric
 
-AGGREGATION_VERSION = "labels-aggregation-v1"
+# v4: S3 recognizes more explicit hiring/office wording (audit 14); facts keys unchanged.
+AGGREGATION_VERSION = "labels-aggregation-v4"
 _LEGAL_FORM = re.compile(
     r"(?:[\s,]+(?:inc|incorporated|llc|ltd|limited|ltda|gmbh|s\s?[./]?\s?a)\.?)+$"
 )
@@ -24,9 +25,11 @@ def normalize_company(name: str | None) -> str:
         return ""
     text = unicodedata.normalize("NFKD", name)
     text = "".join(character for character in text if not unicodedata.combining(character))
-    text = " ".join(text.casefold().split()).rstrip(" ,.;:")
+    # Punctuation can surround or separate the legal form: (LLC), -LLC, S.A.
+    # Normalize it first so every supported suffix has the same boundary.
+    text = " ".join(re.sub(r"[\W_]+", " ", text.casefold()).split())
     text = _LEGAL_FORM.sub("", text)
-    return " ".join(re.sub(r"[\W_]+", " ", text).split())
+    return text.strip()
 
 
 def _value(tags: dict, tag: str, field: str = "value") -> object:
@@ -84,3 +87,55 @@ def p2_candidate(function_core: str | None, relevance: int | None, gate_outcome:
     if function_core not in _P2_FUNCTIONS or type(relevance) is not int:
         return False
     return relevance == 1 or (relevance >= 2 and gate_outcome == "ineligible")
+
+
+def gate_outcome(tags, evaluation, gates):
+    """Return the source-grounded hiring outcome, reasons and model-only block flag."""
+    if evaluation.eligibility_status == "ineligible" or gates.gate_outcome == "ineligible":
+        return "ineligible", list(gates.gate_reasons), False
+    reasons = []
+    for name, value, reason in (
+        ("hiring_eligibility", "restricted_elsewhere", "hiring_region_restricted"),
+        ("work_mode", "office_elsewhere", "office_outside_sp"),
+        ("working_language", "portuguese_only", "other_language_required"),
+        ("working_language", "other_language_required", "other_language_required"),
+    ):
+        if (_value(tags, name) == value and _value(tags, name, "basis") == "explicit"
+                and reason not in reasons):
+            reasons.append(reason)
+    if reasons:
+        return "ineligible", reasons, True
+    if (_value(tags, "hiring_eligibility") == "open_to_brazil"
+            and _value(tags, "hiring_eligibility", "basis") == "explicit"
+            and _value(tags, "work_mode") in {"remote", "office_sao_paulo"}
+            and _value(tags, "working_language") in {"english", "portuguese_with_english"}):
+        return "eligible", [], False
+    return "unknown", [], False
+
+
+def escalation_triggers(first, rules_rel, classification, warnings, llm_only_block):
+    triggers = []
+    if abs(first["relevance"] - rules_rel) >= 1:
+        triggers.append("relevance_disagreement")
+    if first["confidence"] == "low":
+        triggers.append("low_confidence")
+    if first["relevance"] == 3 or rules_rel == 3:
+        triggers.append("top_candidate")
+    if llm_only_block:
+        triggers.append("llm_only_block")
+    if any(warning.startswith(("tag:function_core:", "tag:hiring_eligibility:"))
+           for warning in warnings):
+        triggers.append("decisive_tag_downgraded")
+    if classification.get("label") not in {None, "other", first["role_label"]}:
+        triggers.append("role_disagreement")
+    return triggers
+
+
+def final_relevance(llm_rel, rules_rel, policy):
+    if policy not in {"llm", "rules", "max", "min"}:
+        raise ValueError("Unknown relevance policy")
+    if llm_rel is None or policy == "rules":
+        return rules_rel
+    if policy == "llm":
+        return llm_rel
+    return max(llm_rel, rules_rel) if policy == "max" else min(llm_rel, rules_rel)

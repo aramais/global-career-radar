@@ -12,6 +12,8 @@ import pytest
 from test_gold_web_ui import _browser
 from test_labels_gold_web_ui import _V3_SETUP
 
+from job_intake.crm.ui import render_crm_page
+
 _DRAFT = {
     "role_label": "", "relevance": "0", "gate_outcome": "ineligible",
     "notes": "New human draft", "gate_reasons": ["personal_constraint"],
@@ -370,3 +372,154 @@ def test_plain_refresh_does_not_replace_queue_after_user_opens_another_card():
     assert result["offset"] == 0 and result["cases"] == ["one", "two"]
     assert result["message"] == "Current context message"
     assert result["refreshed"] is False and result["loading"] is False
+
+
+def _main_pager_handler(button):
+    """Register the production callback in the Element harness, then click it."""
+    prefix = f"$('{button}').addEventListener('click',"
+    statements = [line for line in render_crm_page().splitlines() if line.startswith(prefix)]
+    assert len(statements) == 1
+    return (f"$('{button}').addEventListener=(event,handler)=>{{"
+            "if(event!=='click')throw Error('Unexpected pager event');"
+            "globalThis.mainPagerClick=handler;};\n" + statements[0])
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_main_pager_then_old_card_keeps_committed_offset_and_visits_adjacent_page(direction):
+    button = "nextGold" if direction > 0 else "previousGold"
+    setup = _NAV_SETUP + _main_pager_handler(button) + f"const direction={direction};"
+    result = _browser(setup + r"""
+(async()=>{
+  const initial=direction>0?0:100,target=initial+direction*100;
+  goldOffset=initial;
+  goldPage={...goldPage,offset:initial,total:301,has_more:true,
+    cases:Array.from({length:100},(_,i)=>({job_uid:
+      i===(direction>0?99:0)?'one':'row-'+i}))};
+  renderGoldList();
+  let release;const queries=[];
+  api=async(path)=>{
+    if(!path.includes('?'))return detailFor(decodeURIComponent(path.split('/').pop()));
+    const offset=Number(new URL('http://local'+path).searchParams.get('offset'));
+    queries.push(offset);
+    const page={...goldPage,offset,cases:[{job_uid:'destination-'+offset}]};
+    if(queries.length===1)return await new Promise(resolve=>release=()=>resolve(page));
+    return page;
+  };
+  mainPagerClick();await waitUntil(()=>release);
+  const pendingOffset=goldOffset;
+  await openGold('one');release();await waitUntil(()=>!goldLoading);
+  const beforeMove={...editorState(),pageOffset:goldPage.offset,
+    editorPageOffset:goldEditor.pageOffset,anchor:goldEditor.anchorIndex};
+  await moveGold(direction);
+  return {pendingOffset,beforeMove,queries,target,initial,...editorState()};
+})()
+""")
+    assert result["pendingOffset"] == result["initial"]
+    before = result["beforeMove"]
+    assert before["offset"] == before["pageOffset"] == result["initial"]
+    assert before["editorPageOffset"] == result["initial"]
+    assert before["anchor"] == (99 if direction > 0 else 0)
+    assert result["queries"] == [result["target"], result["target"]]
+    assert result["uid"] == f"destination-{result['target']}"
+    assert result["offset"] == result["target"] and not result["dirty"]
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_rejected_main_pager_request_keeps_the_committed_page(direction):
+    button = "nextGold" if direction > 0 else "previousGold"
+    setup = _NAV_SETUP + _main_pager_handler(button)
+    result = _browser(setup + r"""
+(async()=>{
+  goldOffset=100;goldPage={...goldPage,offset:100,total:301,has_more:true};
+  renderGoldList();const before=JSON.stringify(goldPage);
+  api=async()=>{throw Error('Synthetic page failure');};
+  mainPagerClick();await waitUntil(()=>!goldLoading);
+  return {offset:goldOffset,pageUnchanged:before===JSON.stringify(goldPage),
+    message:$('goldMessage').textContent,messageHidden:$('goldMessage').hidden};
+})()
+""")
+    assert result["offset"] == 100 and result["pageUnchanged"]
+    assert result["message"] and not result["messageHidden"]
+
+
+@pytest.mark.parametrize("response", ["success", "error"])
+def test_close_after_successful_patch_clears_the_finished_refresh_loading_message(response):
+    result = _browser(_NAV_SETUP + f"const response={json.dumps(response)};" + r"""
+(async()=>{
+  renderGoldEditor(detail);let release;
+  api=async(path,method)=>method==='PATCH'?{...detail,version:'saved'}:
+    await new Promise((resolve,reject)=>release=()=>response==='success'?
+      resolve({...goldPage}):reject(Error('Synthetic page failure')));
+  const saving=saveGold(false);await waitUntil(()=>release);
+  const closed=closeModal();release();const saved=await saving;
+  return {closed,saved,editorNull:goldEditor===null,modalHidden:$('modalShade').hidden,
+    loading:goldLoading,message:$('goldMessage').textContent,messageHidden:$('goldMessage').hidden};
+})()
+""")
+    assert result["closed"] and result["saved"] and result["editorNull"] and result["modalHidden"]
+    assert result["loading"] is False and result["messageHidden"] and result["message"] == ""
+
+
+@pytest.mark.parametrize("message", ["Later context message", "Загрузка выборки…"])
+def test_finishing_stale_refresh_preserves_a_message_set_by_a_later_action(message):
+    result = _browser(_NAV_SETUP + f"const laterMessage={json.dumps(message)};" + r"""
+(async()=>{
+  renderGoldEditor(detail);let release;
+  api=async()=>await new Promise(resolve=>release=()=>resolve({...goldPage}));
+  const refreshing=refreshGold(false);await waitUntil(()=>release);
+  closeModal();goldMessage(laterMessage,'error');release();await refreshing;
+  return {loading:goldLoading,message:$('goldMessage').textContent,
+    messageHidden:$('goldMessage').hidden,messageClass:$('goldMessage').className};
+})()
+""")
+    assert result["loading"] is False
+    assert result["message"] == message and not result["messageHidden"]
+    assert result["messageClass"] == "gold-message error"
+
+
+@pytest.mark.parametrize("response", ["success", "error"])
+def test_close_while_detail_is_pending_clears_only_its_finished_loading_message(response):
+    result = _browser(_NAV_SETUP + f"const response={json.dumps(response)};" + r"""
+(async()=>{
+  renderGoldEditor(detail);let release;
+  api=async()=>await new Promise((resolve,reject)=>release=()=>response==='success'?
+    resolve(detailFor('two')):reject(Error('Synthetic detail failure')));
+  const opening=openGold('two');await waitUntil(()=>release);
+  const closed=closeModal();release();const opened=await opening;
+  return {closed,opened,editorNull:goldEditor===null,modalHidden:$('modalShade').hidden,
+    message:$('goldMessage').textContent,messageHidden:$('goldMessage').hidden};
+})()
+""")
+    assert result["closed"] and result["opened"] is False
+    assert result["editorNull"] and result["modalHidden"]
+    assert result["messageHidden"] and result["message"] == ""
+
+
+def test_filter_reset_then_old_card_preserves_the_committed_page_context():
+    result = _browser(_NAV_SETUP + r"""
+(async()=>{
+  goldOffset=100;
+  goldPage={...goldPage,offset:100,total:301,has_more:true,
+    cases:Array.from({length:100},(_,i)=>({job_uid:i===99?'one':'row-'+i}))};
+  renderGoldList();let release;const queries=[];
+  api=async(path)=>{
+    if(!path.includes('?'))return detailFor(decodeURIComponent(path.split('/').pop()));
+    const offset=Number(new URL('http://local'+path).searchParams.get('offset'));
+    queries.push(offset);
+    const page={...goldPage,offset,cases:[{job_uid:'destination-'+offset}]};
+    if(queries.length===1)return await new Promise(resolve=>release=()=>resolve(page));
+    return page;
+  };
+  const resetting=refreshGold();await waitUntil(()=>release);
+  const pendingOffset=goldOffset;
+  await openGold('one');release();await resetting;
+  const beforeMove={offset:goldOffset,pageOffset:goldPage.offset,
+    editorOffset:goldEditor.pageOffset};
+  await moveGold(1);
+  return {pendingOffset,beforeMove,queries,uid:goldEditor.detail.job_uid,offset:goldOffset};
+})()
+""")
+    assert result["pendingOffset"] == 100
+    assert result["beforeMove"] == {"offset": 100, "pageOffset": 100, "editorOffset": 100}
+    assert result["queries"] == [0, 200]
+    assert result["uid"] == "destination-200" and result["offset"] == 200

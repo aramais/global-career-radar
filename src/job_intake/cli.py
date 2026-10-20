@@ -11,8 +11,10 @@ from typing import Annotated
 import typer
 
 from job_intake.annotation.eval_runner import (
+    default_report_path,
     read_saved_records,
     run_evaluation,
+    sqlite_input_paths,
     sqlite_path,
     write_report,
 )
@@ -27,6 +29,7 @@ from job_intake.config.settings import (
 )
 from job_intake.crm.cli import app as crm_app
 from job_intake.discovery.cli import app as discovery_app
+from job_intake.labeling.cli import label as label_command
 from job_intake.pipeline import JobIntakePipeline, build_pipeline
 from job_intake.profiles import load_streams
 from job_intake.sources_cli import app as sources_app
@@ -40,6 +43,7 @@ app.add_typer(crm_app, name="crm")
 app.add_typer(discovery_app, name="discovery")
 app.add_typer(repair_app, name="repair")
 app.add_typer(sources_app, name="sources")
+app.command("label")(label_command)
 eval_app = typer.Typer(no_args_is_help=False, help="Read-only integrity and accuracy evaluation")
 gold_app = typer.Typer(help="Prepare and validate human vacancy labels without API calls")
 app.add_typer(eval_app, name="eval")
@@ -395,8 +399,8 @@ def eval_annotations(
         list[str] | None, typer.Option("--job-uid", help="Select specific job; repeatable")
     ] = None,
     output: Annotated[
-        Path, typer.Option(help="JSON report path")
-    ] = Path("data/local/eval/latest.json"),
+        Path | None, typer.Option(help="New JSON report; default latest.json or a fresh dated name")
+    ] = None,
     log: Annotated[
         Path | None, typer.Option(help="Also diagnose the latest annotation run in this log")
     ] = None,
@@ -408,6 +412,9 @@ def eval_annotations(
     """Check saved evidence/reviews without API calls, migrations, rescoring or notifications."""
     if ctx.invoked_subcommand is not None:
         return
+    output = output if output is not None else default_report_path(
+        Path("data/local/eval/latest.json")
+    )
     try:
         settings = load_app_config(config)
         protected = [sqlite_path(settings.database_url), Path(config), settings.rules_path,
@@ -487,9 +494,8 @@ def eval_annotations(
 
 
 def _eval_inputs(settings: AppConfig, config: str, *inputs: Path | None) -> list[Path]:
-    database = sqlite_path(settings.database_url)
     return [
-        database, *(Path(str(database) + suffix) for suffix in ("-wal", "-shm", "-journal")),
+        *sqlite_input_paths(settings.database_url),
         Path(config), Path(config).resolve().parent.parent / ".env", settings.rules_path,
         settings.search_profiles_path, settings.company_watchlist_path,
         *(path for path in inputs if path is not None),
@@ -534,8 +540,8 @@ def gold_sample(
         )
         content = "".join(json.dumps(case, ensure_ascii=False, allow_nan=False) + "\n"
                           for case in cases)
-        write_new_text(content, out)
-        write_new_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", manifest_path)
+        write_new_text(out, content)
+        write_new_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(f"Sample: {len(cases)} unlabeled vacancies. API calls=0; database=read-only.")
@@ -548,7 +554,9 @@ def gold_validate(
     gold: Annotated[Path, typer.Option(help="Gold JSONL")] = Path(
         "data/local/gold/vacancy-tags-v2.jsonl"
     ),
-    output: Annotated[Path, typer.Option()] = Path("data/local/eval/gold-validation.json"),
+    output: Annotated[
+        Path | None, typer.Option(help="New JSON report; default name is made unique when occupied")
+    ] = None,
 ) -> None:
     """Validate v2 or v3 vacancy labels (by their schema field) and rebind quotes."""
     from job_intake.annotation.benchmark import read_jsonl
@@ -556,6 +564,9 @@ def gold_validate(
     from job_intake.labeling.gold_v3 import gold_file_schema, validate_gold_v3
     from job_intake.labeling.schema import LABELS_SCHEMA
 
+    output = output if output is not None else default_report_path(
+        Path("data/local/eval/gold-validation.json")
+    )
     try:
         settings = load_app_config(config)
         protected = _eval_inputs(settings, config, gold)
@@ -615,9 +626,9 @@ def gold_migrate(
         cases = migrate_unlabeled_v1(read_jsonl(source))
         validate_current_cases(settings, cases, configured_roles(settings))
         companions = migration_companions(source, out, cases)
-        write_new_text(jsonl_content(cases), out)
+        write_new_text(out, jsonl_content(cases))
         for path, content in companions.items():
-            write_new_text(content, path)
+            write_new_text(path, content)
     except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(f"Migrated {len(cases)} unanswered cases; source preserved. "
@@ -685,7 +696,7 @@ def gold_workbook_data(
         roles = configured_roles(settings)
         validate_current_cases(settings, cases, roles)
         payload = workbook_data(cases, roles, selection_xlsx=selection_xlsx)
-        write_new_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", out)
+        write_new_text(out, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(f"Workbook data: {len(payload['cases'])} cases; {out.resolve()}. "
@@ -726,7 +737,7 @@ def gold_import_xlsx(
         result, changed = import_workbook(cases, workbook, roles,
                                           method=method, labeled_at=labeled_at)
         validate_current_cases(settings, result, roles)
-        write_new_text(jsonl_content(result), out)
+        write_new_text(out, jsonl_content(result))
     except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(f"Imported answers for {changed} cases; preserved cohort={len(result)}. "
@@ -762,7 +773,9 @@ def eval_accuracy(
         write_accuracy_report,
     )
 
-    output = output or Path(f"data/local/eval/accuracy-{variant}.json")
+    output = output if output is not None else default_report_path(
+        Path(f"data/local/eval/accuracy-{variant}.json"), markdown=True,
+    )
     try:
         settings = load_app_config(config)
         protected = _eval_inputs(
@@ -808,12 +821,17 @@ def eval_accuracy(
 def eval_rules_diff(
     baseline: Annotated[str, typer.Option(help="Git revision or rules snapshot JSON")],
     config: str = typer.Option("config/settings.yaml", help="App config YAML"),
-    output: Annotated[Path, typer.Option()] = Path("data/local/eval/rules-diff.json"),
+    output: Annotated[
+        Path | None, typer.Option(help="New JSON/Markdown pair; occupied defaults use dated names")
+    ] = None,
     limit: Annotated[int | None, typer.Option(min=1, help="Active vacancies to compare")] = None,
 ) -> None:
     """Compare deterministic decisions on the same source snapshot, without API calls."""
     from job_intake.annotation.rules_diff import run_rules_diff, write_rules_diff_report
 
+    output = output if output is not None else default_report_path(
+        Path("data/local/eval/rules-diff.json"), markdown=True,
+    )
     try:
         settings = load_app_config(config)
         baseline_path = Path(baseline)

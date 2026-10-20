@@ -353,6 +353,96 @@ class PrefilterConfig:
 
 
 @dataclass(slots=True)
+class LabelingEscalationConfig:
+    enabled: bool = True
+    max_share_warning: float = 0.4
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ValueError("labeling.escalation.enabled must be Boolean")
+        if (type(self.max_share_warning) not in (int, float)
+                or not math.isfinite(self.max_share_warning)
+                or not 0 <= self.max_share_warning <= 1):
+            raise ValueError("labeling.escalation.max_share_warning must be between 0 and 1")
+
+
+@dataclass(slots=True)
+class LabelingConfig:
+    """Opt-in v3 facts and decisions; defaults preserve the legacy pipeline."""
+
+    enabled: bool = False
+    mode: str = "shadow"
+    ai_enabled: bool = False
+    tier_source: str = "score"
+    final_policy: str = "llm"
+    rubric_path: str = "config/labeling_rubric.yaml"
+    precedents_path: str = "data/local/labeling/precedents.jsonl"
+    cache_dir: str = "data/local/labeling/cache"
+    ledger_dir: str = "data/local/labeling/ledger"
+    max_source_chars: int = 40000
+    provider: str = "gemini"
+    tag_model: str = "gemini-3.5-flash-lite"
+    tag_reasoning_effort: str = "minimal"
+    escalate_provider: str = "gemini"
+    escalate_model: str = "gemini-3.8-flash"
+    escalate_reasoning_effort: str = "low"
+    api_key_env: str = "GEMINI_API_KEY"
+    escalate_api_key_env: str | None = None
+    base_url: str | None = None
+    escalate_base_url: str | None = None
+    max_output_tokens: int = 1200
+    request_timeout: float = 60.0
+    max_retries: int = 2
+    retry_backoff: float = 1.0
+    refresh_stale: bool = False
+    escalation: LabelingEscalationConfig = field(default_factory=LabelingEscalationConfig)
+
+    def __post_init__(self) -> None:
+        for name in ("enabled", "ai_enabled", "refresh_stale"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"labeling.{name} must be Boolean")
+        for name, allowed in (("mode", {"legacy", "shadow", "labels"}),
+                              ("tier_source", {"score", "relevance"}),
+                              ("final_policy", {"llm", "rules", "min", "max"})):
+            if not isinstance(getattr(self, name), str) or getattr(self, name) not in allowed:
+                raise ValueError(f"labeling.{name} has an unsupported value")
+        if type(self.max_source_chars) is not int or self.max_source_chars < 256:
+            raise ValueError("labeling.max_source_chars must be an integer >= 256")
+        for name in ("rubric_path", "precedents_path", "cache_dir", "ledger_dir"):
+            if (not isinstance(getattr(self, name), (str, Path))
+                    or not str(getattr(self, name)).strip()):
+                raise ValueError(f"labeling.{name} must be a nonempty path")
+        if isinstance(self.escalation, dict):
+            self.escalation = LabelingEscalationConfig(**self.escalation)
+        if not isinstance(self.escalation, LabelingEscalationConfig):
+            raise ValueError("labeling.escalation must be a mapping")
+        if self.tag_model == self.escalate_model:
+            raise ValueError("labeling tag and escalation models must differ")
+        self._model_config()
+
+    def _model_config(self) -> AnnotationConfig:
+        try:
+            return AnnotationConfig(
+                enabled=self.enabled, ai_enabled=self.ai_enabled, provider=self.provider,
+                extract_model=self.tag_model, review_model=self.escalate_model,
+                review_provider=self.escalate_provider, api_key_env=self.api_key_env,
+                review_api_key_env=self.escalate_api_key_env,
+                extract_base_url=self.base_url, review_base_url=self.escalate_base_url,
+                extract_reasoning_effort=self.tag_reasoning_effort,
+                review_reasoning_effort=self.escalate_reasoning_effort,
+                max_output_tokens=self.max_output_tokens, request_timeout=self.request_timeout,
+                max_retries=self.max_retries, retry_backoff=self.retry_backoff,
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc).replace("annotation.", "labeling.")) from None
+
+    def resolved_stage(self, stage: str) -> AnnotationStageSpec:
+        if stage not in {"tag", "escalate"}:
+            raise ValueError("labeling stage must be tag or escalate")
+        return self._model_config().resolved_stage("extract" if stage == "tag" else "review")
+
+
+@dataclass(slots=True)
 class AppConfig:
     database_url: str
     log_level: str
@@ -366,6 +456,7 @@ class AppConfig:
     crm: CRMConfig = field(default_factory=CRMConfig)
     annotation: AnnotationConfig = field(default_factory=AnnotationConfig)
     prefilter: PrefilterConfig = field(default_factory=PrefilterConfig)
+    labeling: LabelingConfig = field(default_factory=LabelingConfig)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -474,6 +565,20 @@ def load_app_config(path: str | Path) -> AppConfig:
             ),
         }
     )
+    labeling_raw = raw.get("labeling", {})
+    if not isinstance(labeling_raw, dict):
+        raise ValueError("labeling must be a mapping")
+    labeling_paths = {
+        "rubric_path": "config/labeling_rubric.yaml",
+        "precedents_path": "data/local/labeling/precedents.jsonl",
+        "cache_dir": "data/local/labeling/cache",
+        "ledger_dir": "data/local/labeling/ledger",
+    }
+    labeling = LabelingConfig(**{
+        **labeling_raw,
+        **{name: str((config_path.parent.parent / labeling_raw.get(name, default)).resolve())
+           for name, default in labeling_paths.items()},
+    })
     return AppConfig(
         database_url=raw.get("database_url", "sqlite:///data/local/job_intake.db"),
         log_level=raw.get("log_level", "INFO"),
@@ -491,6 +596,7 @@ def load_app_config(path: str | Path) -> AppConfig:
         crm=CRMConfig(**raw.get("crm", {})),
         annotation=annotation,
         prefilter=prefilter,
+        labeling=labeling,
     )
 
 

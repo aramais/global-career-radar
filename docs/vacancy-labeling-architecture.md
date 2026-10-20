@@ -1,8 +1,10 @@
 # Design doc: этап разметки вакансий `labels-v3`
 
-_Статус: P0 и P1 реализованы; критические, высокие и средние находки семи аудитов
-20.10.2026 закрыты (§15–§21). P2–P4 не начаты. Исходный проект: ревизия `8bb3a2a`, ветка
-`feature/vacancy-tags`. Ниже разделены реализованные P0–P1 и будущие фазы._
+_Статус: P0–P3 реализованы. P2–P3 проверены на временных данных с фейковыми
+клиентами (§22); платный пилот, массовая разметка рабочих вакансий и переключение
+категорий не выполнены. P4 не начата. Исторические исправления семи аудитов —
+§15–§21; открытые замечания аудитов №8–9 этим статусом не закрываются.
+Исходный проект: ревизия `8bb3a2a`, ветка `feature/vacancy-tags`._
 _Решения пользователя от 20.10.2026 внесены (§13). Канон критериев — career-orientation:
 [вектор поиска](</Users/admin/Documents/aramais-vault/codex/projects/career-orientation/codex/areas/job-search-vector.md#оценка-релевантности-вакансий--2026-10-20>)
 и [ответы пользователя](</Users/admin/Documents/aramais-vault/codex/projects/career-orientation/codex/external/intake/2026-10-20_vacancy-labeling-criteria.md>)._
@@ -66,7 +68,11 @@ _Решения пользователя от 20.10.2026 внесены (§13). 
    Ручное сохранение в Gold UI (§10) изменяет выбранную строку
    существующего gold по явному действию человека, с проверкой версии и backup.
 5. **Eval и экспорт предсказаний читают SQLite только через `mode=ro` и
-   `PRAGMA query_only=ON`.** Записывать в рабочую базу могут только `label` без
+   `PRAGMA query_only=ON`.** CLI и public `run_accuracy(output=...)` защищают саму
+   базу и имена `-wal`, `-shm`, `-journal`, даже когда sidecar отсутствует;
+   проверяются оба выходных пути до анализа и перед публикацией. API также
+   защищает gold/config inputs, predictions, цены, log, cohort и объявленный
+   exposure journal. Записывать в рабочую базу могут только `label` без
    `--export` и `annotate` / `reevaluate`, через существующий repository.
 6. **Миграции SQLite — только аддитивные**, через
    `Database._apply_lightweight_migrations`.
@@ -166,7 +172,7 @@ JobRecord
 | Модуль | Статус | Ответственность |
 | --- | --- | --- |
 | `src/job_intake/labeling/__init__.py` | новый | пустой пакет |
-| `labeling/schema.py`, `labeling/schema_validation.py` | P0 | enum, JSON Schema gold и предсказаний v3, структурная валидация Draft 2020-12 и семантический валидатор gold; `LabelResult` / `TagValue` добавляются с P2 |
+| `labeling/schema.py`, `labeling/schema_validation.py` | P0/P2 | enum, JSON Schema gold и предсказаний v3, структурная валидация Draft 2020-12, семантический валидатор gold, `LabelResult` / `TagValue` |
 | `utils/identifiers.py` | S-M1 | общий синтаксис stream ID для loader и схем v3, без изменения ID или enabled membership |
 | `labeling/rubric.py` | новый | загрузка `config/labeling_rubric.yaml`, хеши частей рубрики, прецеденты |
 | `labeling/gates.py` | новый | S1: бесплатные решения без LLM |
@@ -185,7 +191,7 @@ JobRecord
 | `pipeline.py` | изменение | вызов S1–S4 в `_evaluate_record`, ветки `mode` |
 | `scoring/tiering.py` | изменение | параметр `tier_source` |
 | `storage/database.py`, `storage/models.py`, repository | изменение | аддитивные колонки `relevance`, `labels_status`, `labels_version` |
-| `cli.py` | изменение | команда `label`, `gold migrate-v3`, `eval accuracy --variant labels` |
+| `cli.py`, `labeling/cli.py`, `labeling/runner.py` | P2–P3 | команда `label`, чтение источников/экспорт, отдельная запись shadow, `gold migrate-v3`, `eval accuracy --variant labels` |
 | `annotation/accuracy.py`, `annotation/frozen_eval.py` | изменение | блок `relevance_scale` в метриках, когда в предсказаниях есть `relevance` |
 | `annotation/gold_ui.py`, `crm/index.html` | P1 | шесть тегов, `gate_reasons`, v2/v3 store, слепая форма, цитаты, горячие клавиши и журнал времени |
 | `crm/` (сериализация вакансии) | изменение | `relevance`, `labels_status`, сортировка |
@@ -333,8 +339,8 @@ JSON Schema не сужает его до kebab-case; членство в enable
 
 Семантические проверки остаются в runtime: текущая таксономия ролей, соответствие
 source/hash, уникальное дословное связывание цитаты и хронология provenance. Для
-машины доказательность, разрешённые секции и нормализация фактов — будущий S3 (P2),
-а не замена структурной проверки P0. Ошибки gold сохраняют существующие коды;
+машины доказательность, разрешённые секции и нормализация фактов реализованы в S3
+(P2), отдельно от структурной проверки P0. Ошибки gold сохраняют существующие коды;
 структурный backstop дополняет ручной валидатор.
 
 Даты provenance сохраняют исходную точность. Date-time требует явного offset
@@ -431,7 +437,8 @@ labeling:
   escalate. Это переиспользует проверки модели, URL, ключа и лимитов;
 - `resolved_stage("tag" | "escalate") -> AnnotationStageSpec`;
 - в отличие от `PrefilterConfig` провайдер не ограничен Gemini: допустимы все ключи
-  `ANNOTATION_PROVIDER_DEFAULTS`;
+  `ANNOTATION_PROVIDER_DEFAULTS` с сохранением ограничений существующего адаптера
+  (например, Jev — только стадия review/escalate с версией Jev);
 - `__post_init__` проверяет enum `mode`, `tier_source`, `final_policy` и что
   `tag_model != escalate_model`;
 - `load_app_config` читает блок `labeling` (по умолчанию пустой → `enabled: false`)
@@ -684,7 +691,7 @@ def validate_tags(raw: dict, units: list[dict], role_ids: list[str]
 ### 6.5 S4 `labeling/aggregate.py`
 
 ```python
-AGGREGATION_VERSION = "labels-aggregation-v1"
+AGGREGATION_VERSION = "labels-aggregation-v3"
 
 def rules_relevance(role_label: str | None, tags: dict, rubric: Rubric,
                     *, company: str | None = None) -> int: ...
@@ -836,6 +843,14 @@ error_diagnostic(error, stage="tag"))`, `relevance = rules_relevance` по те�
 `request_failed` из `AnnotationModelClient.generate`. LedgerWriter подписывается на
 них через progress callback, не меняя клиент.
 
+Pending attempt удаляется только после полной записи terminal JSONL и flush/fsync.
+Первый terminal сохраняет status/известный usage: последующий request_failed после
+ошибки complete callback не заменяет его неизвестным расходом. Восстановимый сбой
+append откатывает byte offset перед повтором; committed call_id идемпотентен.
+Если rollback не удался, writer блокирует новые запросы и отказывает в успешном
+close; незаписанная попытка не считается нулевой стоимостью. Graceful close можно
+повторить для pending terminal, не открывая заново уже занятый ledger path.
+
 **Бюджет.** `BudgetGuard(max_cost_usd, prices)`:
 
 - цены — из `config/eval_prices.yaml` через `accuracy.load_prices`;
@@ -967,10 +982,10 @@ relevance его не требует.
 явная схема, а также варианты labels/rules требуют полной проверки, поэтому отсутствие
 или опечатка schema не обходят её. `validate_run` также проверяет v3-структуру перед
 пересчётом новых метрик; исторический replay v1 сохраняет прежний контракт.
-Но `build_bundle` всё ещё использует v2 gold validator. `load_bundle` проверяет
-digest/policy/source binding и сам по себе не доказывает корректность схемы labels.
-Поддержанный schema-aware build/save/load для v3 gold — предпосылка P2; принятие
-вручную подготовленного бандла не закрывает эту предпосылку.
+В P2 `build_bundle`/save/load выбирают validator по схеме gold и поддерживают
+v2 и v3. Для v3 проверяются структура, цитаты, source binding и таксономия;
+digest/policy не заменяют эту проверку. Исторические v2 replay сохраняют прежний
+контракт, принятие вручную подготовленного бандла не обходит валидацию.
 
 ### 6.8 `labeling/predictions.py`
 
@@ -1000,13 +1015,15 @@ def migrate_gold_v2(source: Path, out: Path, *, rubric_version: str) -> dict:
 
 Сейчас человеческих тегов v2 нет, но маппинг нужен для полноты и покрыт тестом.
 
-Версия таблицы переноса — `v2-to-v3-tags-v3`. `country_required` превращается в
+Версия таблицы переноса — `v2-to-v3-tags-v4`. `country_required` превращается в
 open_to_brazil/restricted_elsewhere только при точном совпадении нормализованного
 названия/кода с поддерживаемой таблицей страны или однозначного региона без Brazil.
 Неподдержанный текст, placeholders и смешанные/неопределённые регионы не доказывают
 ограничение и отражаются в dropped tags с причиной. Таблица алиасов задаёт возможности
 парсера, а не новые предпочтения пользователя; неподдержанную страну нельзя считать чужой
 только потому, что это непустая строка.
+Если country_required не разрешён парсером, объединённый hiring_eligibility
+не выводится даже при brazil_explicit: manifest сохраняет обе причины dropped.
 `office_sao_paulo` назначается только явной форме названия города São Paulo:
 упоминание штата/агломерации или одного Brazil без города не считается городом.
 `office_elsewhere` требует распознанного города и допустимых административных
@@ -1022,7 +1039,9 @@ open_to_brazil/restricted_elsewhere только при точном совпа�
 Оба выхода полностью подготавливаются и fsync-ятся до публикации. Каждый публикуется
 атомарным hardlink без перезаписи. При обрабатываемой ошибке публикации выполняется
 rollback собственных выходов с проверкой inode/dev; чужой файл, обнаруженный вместо
-своего, не удаляется. Два пути не становятся видимыми одной атомарной операцией:
+своего, не удаляется. Это относится и к staging; при недоступной inode-идентичности
+файл остаётся для разбора, исходная ошибка сохраняется. Проверка занятости учитывает
+лексический final, включая dangling symlink. Два пути не становятся видимыми одной атомарной операцией:
 при аварийном завершении процесса/ОС возможен неполный комплект. Это не crash-atomic
 транзакция и не изоляция от сторонних изменений путей между проверкой и удалением.
 После такой аварии исходник сохраняется, существующие выходы не перезаписываются;
@@ -1148,10 +1167,12 @@ skip_two_pass = labels is not None and self.config.labeling.mode == "labels"
 
 ## 10. CRM и UI эталона
 
-**Сериализация вакансии — будущая P3** (место, где отдаются `eligibility_status` и `tier`):
+**Сериализация вакансии — реализована P3** (место, где отдаются `eligibility_status` и `tier`):
 
-- добавить `relevance`, `labels_status`, `labels_v3.tags`, `gate_reasons`,
-  `escalated`;
+- `labels_relevance` (ordinal 0–3), `labels_status`, `labels_version`; прежний
+  `relevance` остаётся объектом оценки профиля для обратной совместимости;
+- в деталях `labels_v3` содержит whitelist `tags`, `gate_outcome`, `gate_reasons`,
+  `escalated`, `relevance`, `status`; usage/errors и иной служебный JSON не выдаются;
 - сортировка списка по умолчанию не меняется. Новая сортировка «по релевантности» —
   отдельная опция UI.
 
@@ -1255,8 +1276,8 @@ loader с восемью сбалансированными примерами, 
 | --- | --- | --- |
 | **P0. Схема, метрики, базовый уровень** (без API) | schema + Draft 2020-12 validation; rubric + подтверждённые разделы §5.2 (strong_companies proposed); metrics v2 с read-only пересчётом исторического v1; baseline; миграция; CLI migrate/validate/accuracy rules\|labels; hooks accuracy/frozen. Dataclasses LabelResult/TagValue и label_predictions — P2 | тесты зелёные; v3 создан по новому пути с manifest, исходник сохранён; baseline с QWK, recall/precision, P@k; регрессии высокого/среднего уровня аудита закрыты без изменения критериев и рабочих данных |
 | **P1. UI разметки v3 — реализована** (без вызовов моделей) | `gold_ui` v3, 6 тегов, причины gate, цитаты, горячие клавиши, слепота, журнал времени | карточка v3 сохраняется через CRM с полной валидацией; v2-файлы открываются как раньше; проверено на временных данных, рабочий эталон не переразмечен |
-| **P2. Теггер, только экспорт** | `scope.py` (перенос), `gates.py`, `prompt.py`, регистрация схем в `ai.py`, `validate.py`, `aggregate.py`, `tagger.py`, ledger, бюджет, `LabelingConfig`, CLI `label --export` | тесты зелёные; `label --export --bundle … --max-cost` с фейковым клиентом в тесте. **Реальный пилот — только по команде пользователя:** Gemini 3.5 Flash-Lite, 3.8 Flash и каскад Flash-Lite → 3.8 Flash, по 3 прогона на калибровке; победитель — один прогон на holdout; **общий лимит $3** (U6, U7) |
-| **P3. Pipeline и хранение** | `pipeline.py`, `tiering.py`, колонки, repository, `label` без `--export`, `--offline`, `reevaluate`, сериализация CRM, P2 из labels и новая версия `purpose_rubric.yaml` (§8) | `enabled: false` → прежний вывод бит в бит; `shadow` пишет `labels_v3` без изменения tier; документация обновлена |
+| **P2. Теггер, только экспорт — реализована** | `scope.py` (перенос), `gates.py`, `prompt.py`, регистрация схем в `ai.py`, `validate.py`, `aggregate.py`, `tagger.py`, ledger, бюджет, `LabelingConfig`, CLI `label --export` | экспорт с фейковым клиентом, бюджет/ретраи/параллелизм/кеш и frozen roundtrip проверены (§22). **Реальный пилот не выполнен:** по отдельной команде Gemini 3.5 Flash-Lite, 3.8 Flash и каскад, 3 прогона на калибровке и победитель на holdout, **общий лимит $3** (U6, U7) |
+| **P3. Pipeline и хранение — реализована** | `pipeline.py`, `tiering.py`, колонки, repository, `label` без `--export`, `--offline`, `reevaluate`, сериализация CRM, P2 из labels и purpose v2 (§8) | выключенный флаг/legacy и shadow сохраняют прежнее поведение; labels-mode tiering/роль/offline/fallback/versioning проверены на временной SQLite; рабочая база не мигрировалась |
 | **P4. Задел** (по отдельному поручению) | эмбеддинги + голова для `role_label`; дистилляция при 1–2 тыс. меток | не начинать без поручения |
 
 Переключение `mode: labels` и `tier_source: relevance` в рабочем конфиге — **не
@@ -1431,7 +1452,7 @@ pipeline, хранение машинных labels и обычная CRM-сер�
 | R-H1 | Собственная human-known-role выборка в frozen-task-metrics-v2, missing/abstention не равны пустому human target; marker/hash/replay и отказ смешанным версиям | 22 новых случая в test_labels_frozen_role_recall: partial/mixed/other, независимый literal legacy metric, JSON roundtrip, unknown/mixed versions, отсутствие изменения старого run |
 | R-M1 | Default и explicit gold path одинаково resolve до pin/lock; symlink сохраняется, stale409 на общем target | Store same-target/same-row/different-row; настоящий HTTP save + stale explicit store, один target/version |
 | R-M2 | Все поддержанные canonical source-поля и две metadata-строки видны отдельными точными блоками; подписи не становятся доказательством | Четыре metadata-only DOM→insert→payload→real store.save с точным unit binding; malformed/machine whitelist; HTTP metadata→save |
-| R-M3 | SUMMARY и вложенные элементы исключены из global hotkeys | Настоящий DOM summary/span: Enter/i/0/3 не вызывают save/next, не меняют draft и не подавляют native default |
+| R-M3 | SUMMARY и вложенные элементы исключены из global hotkeys | Реальный обработчик в Node Element harness, summary/span: Enter/i/0/3 не вызывают save/next, не меняют draft; native DOM/default behavior этим harness не проверяются |
 | R-M4 | Строгие date/offset, точные UTC timestamps, явно ограниченная calendar precision для date-only; aware SP save только v3 | Offset/calendar/reverse/fraction/boundary-year/mixed tests; store и HTTP timezone rollover; first_labeled_at неизменён; legacy v2 date-only tests проходят |
 
 Добавлены **88 регрессионных случаев**: 22 frozen, 47 schema/store, 16 DOM и
@@ -1615,3 +1636,367 @@ pipeline/prefilter/scoring/storage/AI относительно `8bb3a2a` пус�
 не менялись; рабочая CRM и платные вызовы не запускались.
 Логи, исходный снимок и независимые пробы —
 `/private/tmp/labels-v3-a7-fix-r2wvEw`.
+
+## 22. Реализация P2–P3 — 20.10.2026
+
+Реализованы автоматический теггер и его интеграция. Рабочий rollout остаётся
+выключенным: `labeling.enabled: false`, `mode: shadow`, `ai_enabled: false`,
+`tier_source: score`. Пилот, массовая разметка и переключение категорий не выполнялись.
+
+### Контракт P2
+
+- `annotation.scope` содержит перенесённые duty/context helpers; legacy-контракт
+  подтверждён прежними тестами annotation и prefilter.
+- S1 бесплатно останавливает closed, incomplete/truncated, слишком длинный источник
+  и доказанный title-out-of-family. Блокер найма правил не останавливает оценку роли.
+- Промпт содержит компактные source units, duty/title ID, таксономию и только
+  подтверждённые части рубрики. Источник явно недоверенный; gold notes/решения
+  не передаются модели. Ответы проходят закрытую схему и S3: чужие ID, неподходящие
+  секции, история кандидата, отрицания, вопросы и условные формулировки понижают
+  соответствующий факт. Reason провайдера не сохраняется в кеш, ledger или отчёт.
+- Схемы регистрируются отдельно для Gemini, Anthropic и OpenAI. OpenAI использует
+  strict JSON Schema, compatible endpoints — прежний JSON object с последующей S3.
+  Для labels + Haiku 5.5 + reasoning none thinking явно выключается;
+  legacy-запросы сохраняют прежние параметры. Валидация конфигурации наследует
+  ограничения адаптеров, включая review-only Jev.
+- S4 реализует четыре политики и шесть триггеров эскалации. LLM-only блокер
+  становится окончательным только при совпадении tag/value двух стадий;
+  второй ответ не добавляет самостоятельную неподтверждённую причину блокировки.
+- Кеш хранит только валидированные факты и безопасные метаданные. Полный hit,
+  reuse по facts key, смена одной aggregation, stale-rubric fallback и явный
+  `--refresh-stale` проверены. Warning-коды кеша ограничены известными tag/code.
+- Бюджет общий для потоков, резервируется перед каждой попыткой POST, включая
+  ретраи. Модель без цены отказывает до вызова; неизвестная/непредставимая стоимость
+  учитывается консервативно. Это ограничитель на основе входной таблицы цен и
+  оценки токенов, а не гарантия точной суммы счёта провайдера.
+  Ledger содержит одну строку на попытку и ссылки на cache reuse, без текста
+  источника/промпта/ответа. Доля эскалаций выше `max_share_warning` даёт событие
+  `label_escalation_share_warning`; общий счётчик экспортного запуска потокобезопасен.
+
+`label --export` не создаёт pipeline/Database. Источники — проверенные снимки
+`--bundle`, снимки v3 `--gold` либо SQLite read-only. Неполный снимок `--gold`
+разрешается через SQLite read-only по тем же доказательствам, что frozen-бандл (§26).
+Источники, конфиги, база, gold и цены защищены
+от совпадения с output/ledger; занятый путь, включая dangling symlink, отказывает
+до модели. Новый JSONL публикуется эксклюзивно. При остановке по бюджету завершённые
+строки сохраняются, команда возвращает 1. Экспорт 1–8 потоков сохраняет порядок.
+`--job-uid` / `--limit` несовместимы; выбор bundle/gold не ограничивается частично.
+Архивные записи включаются только явным `--include-archived`.
+
+Frozen build/load/roundtrip теперь schema-aware для v3: структура, цитаты,
+source binding и enabled taxonomy проверяются до метрик. Полный набор тегов —
+шесть в v3 и девятнадцать в legacy. Saved baseline для v3 явно использует
+`rules:tier-map-v1`, не выдавая старый tier за результат нового теггера.
+Численные пороги policy и исторические сохранённые run не изменяются.
+
+### Контракт P3 и сохранность принятых решений
+
+Добавлены nullable `relevance`, `labels_status`, `labels_version` в обе таблицы.
+`annotation.labels_v3` хранит полный `LabelResult`. `update_labels` и
+`record_label_attempt` проверяют schema/status/ordinal, конечность JSON, source hash
+и ожидаемую ревизию. Архивные записи требуют отдельного разрешения и не разархивируются.
+
+Shadow CLI записывает только v3-поля, не пересчитывая legacy score/tier/decision,
+purpose, уведомления и ручные решения. В labels-mode pipeline пересобирает stream
+при смене роли, пропускает старые платные annotation/prefilter, поддерживает новые
+версии, статистику и условную категорию по relevance. Версии labels влияют на stale
+оценок только в labels-mode. Обычные `run`/`annotate`/`reevaluate` используют labels
+offline; платный доступ разрешает только бюджетный контекст `label_saved` команды
+`label --ai --max-cost`, который восстанавливается в `finally`.
+
+Дополнительная интеграционная проба нашла понижение сохранённой A→C и изменение
+purpose при ошибке модели/пустом offline-кеше. Это исправлено: для прежнего источника
+labels-mode сохраняет только `annotation.labels_v3_attempt`, оставляя принятую
+оценку, метки, классификацию и purpose. Shadow также сохраняет последнюю принятую
+метку при неудачной попытке. Для нового источника/вакансии остаётся результат правил;
+конкурентное изменение ревизии отклоняется. Диагностика попытки не превращается
+в принятое предсказание. Сценарии проверены на реальной временной SQLite, включая
+архивные записи и ручные purpose-решения.
+
+CRM сохраняет прежний объект `relevance` и добавляет `labels_relevance`, статус,
+версию, отдельную сортировку и whitelist фактов/gate/escalation в деталях.
+Список не подгружает полный annotation. Метки другого source hash скрыты как stale;
+машинные поля не добавлены в blind Gold UI.
+
+Изменения `config/purpose_rubric.yaml` следуют существующему U5 (§13), без нового
+решения о предпочтениях:
+
+| Поле | Было | Стало | Основание |
+| --- | --- | --- | --- |
+| `version` | `data-interview-practice-2026-10-19-v1` | `data-interview-practice-2026-10-20-v2` | реализован labels-mode контракт U5 |
+| `confirmed_at` | `2026-10-19` | `2026-10-20` | дата принятого U5 |
+| `p2` | `analytics/data work with similar tasks, even if level or hiring does not fit next work` | `function_core in {analytics_for_decisions, analytics_reporting} and (relevance == 1 or (relevance >= 2 and gate_outcome == ineligible))` | буквальное правило из labeling rubric и решения пользователя 20.10 |
+
+В legacy/shadow purpose остаётся v1, ручные подтверждения сверяются с версией
+сохранённой рекомендации. Поисковые профили, rules, labeling rubric, значения
+критериев, stable ID и рабочие данные не менялись. Реальные источники/CRM,
+платные API, сообщения и deployment при реализации не запускались.
+
+### Проверки
+
+Новые тесты охватывают P2 core, provider schemas, доказательность, кеш,
+бюджет/ретраи/параллелизм/ledger, CLI, frozen roundtrip, миграции/CRM,
+режимы pipeline/tiering/purpose/versioning и сохранность принятых решений.
+Тестовые БД и выходы находятся во временных каталогах; клиенты моделей фейковые.
+Первый полный прогон до дополнительных защит сохранности — 3708 passed (60,30 с).
+Итоговый полный прогон — **3739 passed** (60,66 с), включая loopback HTTP:
+**240 новых случаев** сверх прежних 3499. `.venv/bin/ruff check src tests` и
+`git diff --check` проходят. После итоговых тестов SHA-256 **7423 защищённых файлов**
+совпали с начальным снимком: рабочая SQLite, gold, frozen/cohort/exposure-артефакты,
+`search_profiles.yaml`, `rules.yaml`, `labeling_rubric.yaml` не изменены, новых
+файлов в `data/local` нет. Из прежнего settings YAML ни одно поле не изменено:
+добавлен только выключенный блок `labeling`. Рабочая схема SQLite не мигрировалась.
+Снимок и сверка — `/private/tmp/labels-v3-p23-ey6e9iae`.
+
+Официальные контракты адаптеров сверены по документации
+[OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs),
+[Anthropic thinking](https://platform.claude.com/docs/en/build-with-claude/thinking) и
+[effort](https://platform.claude.com/docs/en/build-with-claude/effort).
+Это проверка формата интеграции, не подтверждение платного пилота или качества
+разметки рабочих вакансий.
+
+## 23. Повторный аудит P0–P3 и исправления (20.10.2026)
+
+[Аудит №10](audit-labels-v3-implementation-2026-10-20-10.md) фиксирует отдельно
+состояние до правок и итоговую приёмку. Исправления не меняют YAML, карьерные
+решения, stable ID, рабочую SQLite, gold, когорты и журналы exposure.
+
+### Доказательства, подтверждения и применение результата
+
+S3 проверяет не только существование ID и секцию: для hiring_eligibility,
+work_mode и working_language значение должно следовать из выбранной цитаты.
+Географическое ограничение требует явной hiring/residency/authorization формулировки;
+упоминание офиса компании не подтверждает возможность найма. Явное исключение
+Brazil распознаётся как отрицательный факт. Офисный формат требует обязанности
+работать в офисе и однозначного города; штат/агломерация São Paulo и Barueri
+не становятся городом São Paulo. Требование языка относится к самому языку,
+а не к стране или клиентам. Поддержанные алиасы — возможности парсера;
+нераспознанные/неоднозначные формулировки дают `unspecified` и закрытый warning.
+Согласие двух моделей не заменяет доказательство источника. Кеш повторно проходит
+текущую S3 без нового платного вызова.
+
+Корневой `status: proposed` отключает все применяемые секции, модельные решения
+и использование кеша решений; prompt hash соответствует effective содержимому.
+Неподтверждённая секция P2 даёт `p2_candidate=None`. Текущая confirmed-рубрика
+сохраняет прежние prompt_rubric_hash и aggregation_hash. Неподтверждённые сильные
+компании и другие proposed-секции не превращаются в пользовательские критерии.
+
+`labeling.application.apply_labels_hiring` — общий мост для labels pipeline и
+экспорта: только accepted confirmed-решение с текущим source hash влияет на
+eligibility/decision. Ineligible блокирует P1 и уведомления, сохраняя релевантность
+роли и отдельное правило P2. Unknown требует review; eligible снимает только
+мягкую неопределённость найма. Rule blockers и source conflicts сохраняют силу.
+Shadow не применяет этот мост. Нераспознанные legacy blockers сохраняют запрет,
+но не получают выдуманную причину hiring_region_restricted.
+
+Техническая `labels-aggregation-v2` инвалидирует старые принятые оценки после
+исправления proof/gate/нормализации компании. Дополнительно версии оценок учитывают
+effective final_policy/tier_source/rubric status. Facts key и численные критерии
+не меняются, исторические frozen run остаются доступными для replay.
+Нормализация компании сначала удаляет пунктуацию, затем юридический суффикс.
+
+### Учёт попыток, файловые границы и интерфейс
+
+Graceful interruption после request_start завершается строкой ledger с неизвестным
+расходом; close также сохраняет pending attempts. Неизвестный расход не равен нулю.
+Этот контракт не обещает сохранение при SIGKILL/потере питания. Неудачная попытка
+по прежнему источнику сохраняет принятую оценку; реальное наблюдение вакансии
+обновляет last_seen/алиасы/complete-snapshot lifecycle, не снимая архивный статус.
+
+SQLite DB и имена `-wal`, `-shm`, `-journal` защищены от output/ledger до чтения
+и модели, в том числе через aliases и при отсутствии sidecar. Занятые лексические
+пути и dangling symlink отклоняются до публикации. Gold text writer использует
+общий path-first publisher; миграция удаляет только собственные staging/final
+по inode/dev. Техническая таблица переноса теперь v2-to-v3-tags-v4; неразрешённое
+country_required не позволяет вывести open_to_brazil из другой части v2-тегов.
+
+Первый неявный путь отчёта сохраняет привычное имя. Если JSON либо его Markdown
+уже занят, eval/gold validate/accuracy/rules-diff выбирают свободное имя с UTC-датой
+и уникальным суффиксом. Явный output неизменяем. Frozen compare/experiment-report
+проверяют оба пути и защищённые входы до анализа и записи exposure; отказ из-за
+занятого или dangling пути не расходует независимость holdout.
+
+Gold UI фиксирует offset только после принятого ответа; открытие старой карточки
+во время загрузки страницы не сдвигает следующую страницу. Сообщения loading
+принадлежат конкретному поколению запроса и снимаются при завершении/закрытии,
+не скрывая поздние ошибки. Неизвестный ключ тега не выводится в blind диагностике.
+Node Element harness исполняет реальные обработчики, но не проверяет native DOM.
+
+Portable JSON Schema Draft 2020-12 считает 2.0 целым числом по значению; строгий
+Python runtime дополнительно требует type(value) is int и отказывает float/bool.
+Это явная граница числового представления, а не изменение шкалы 0–3.
+Регрессия проверяет оба контракта отдельно; привязка к источнику остаётся runtime
+проверкой сверх структурной схемы.
+
+### Приёмка исправлений
+
+Добавлены **130 регрессионных случаев**; итоговый полный набор — **3869 passed**
+за 64,38 с, включая loopback HTTP. Ruff и `git diff --check` проходят.
+Финальный snapshot 242 Python/HTML исходников и тестов совпал до/после прогона;
+SHA-256 7441 защищённого файла (все config/data и аудиты №1–№9) не изменился,
+новых non-cache файлов в data/config нет. Выходы тестов и четырёх обязательных CLI
+находятся в `/private/tmp/labels-v3-audit10-cfh9abur`.
+
+Read-only миграция 171 строки по v4 вновь побайтно совпала с рабочим v3; human
+решения/provenance 1:1. Baseline N54, QWK0.373134, recall12/17, precision12/24,
+P@10=0.8, blind N44/recall7/7/precision7/19 и три исторических frozen run прежние.
+Текущие confirmed rubric hashes и точный YAML §5.2 сохранены. Проверка исправлений
+разрешала только loopback и запрещала внешнюю сеть/.env/запись рабочих данных;
+строгий исходный аудит запрещал также loopback. Все 22 подтверждённые находки
+аудита №10 закрыты в проверенном объёме. Это не live pilot/holdout acceptance;
+рабочий rollout остаётся выключенным, P4 не реализовывалась.
+
+## 24. Исправления критической и высоких находок аудита №11
+
+[Аудит №11](audit-labels-v3-implementation-2026-10-20-11.md) остаётся историческим.
+Объём исправления — A11-C1 и A11-H1–H3. Средние и низкие A11-M1–M3/L1–L2 не
+включаются в эту задачу автоматически; их состояние фиксируется новым аудитом.
+Пользовательские YAML, веса, пороги, stable ID и рабочие данные не меняются.
+
+Public `run_accuracy(output=...)` проверяет оба output до чтения gold/SQLite для
+saved/rules/labels. Shared sqlite_input_paths защищает DB и отсутствующие sidecars,
+canonical aliases и lexical occupied names. В protected inputs входят rules,
+profiles, company watchlist, gold, predictions, цены/log/cohort и объявленный
+exposure journal. Writer повторно проверяет эти же inputs. Без optional output
+сохраняется прежний read-only расчёт и формат отчёта.
+
+Hiring proof связывает ограничение с кандидатом и местом/правом найма. Клиенты,
+команда и часы пересечения не задают ограничение страны; полный список допустимых
+регионов должен исключать Brazil. Неизвестные или неоднозначные связи не становятся
+hard facts. Мягкое English inference по U5a не перевешивает явное требование
+другого языка; international относится к компании, а не к её клиентам. Это проверка
+доказательства существующего критерия, не изменение пользовательских предпочтений.
+Required language lists сохраняют AND/OR: French AND English не доказывает
+English-only, English OR French сохраняет допустимый английский вариант.
+Нераспознанная связь упомянутого другого естественного языка отменяет положительное
+подтверждение до unknown, не создавая hard blocker. Доказанные optional/negated
+требования, язык клиентов, национальность компании и SQL/Python/C++ не становятся
+обязательным рабочим языком. Typed declaration с неизвестным языком также требует
+abstention; Portuguese-with-English допускает только свой набор рабочих языков.
+Техническая labels-aggregation-v3 отражает пересчёт решений после S3; facts keys,
+рубрика и её confirmed hashes не меняются, кеш повторно проходит текущую S3.
+
+Для labels-mode fallback при collection-only изменении проверяется полный meaningful
+source snapshot, точные source units/model input, canonical completeness и status. Удаляются
+лишь известные observation-поля; произвольные факты, включая неизвестные nested
+collection fields, не игнорируются. При доказанной совместимости сохраняются
+accepted оценка/метки/purpose, обновляются observation/lifecycle и source pin с
+provenance и optimistic revision. Неполная listing-карточка может сохранить уже
+полученный полный canonical source: только созданные reconciler маркеры
+incoming completeness/source исключаются из сравнения и сохраняются в binding,
+привязанном к source/input hash. Произвольный incoming_* не получает такого доверия.
+Изменённые факты, status или canonical completeness не получают совместимость.
+Shadow retention A11-M2 остаётся отдельной находкой.
+
+Приёмка этого исправления: **238 новых регрессионных случаев**, итоговый полный
+набор **4107 passed за 61,19 с**, включая loopback HTTP. Ruff и diff check проходят.
+Независимый replay 80 adversarial/positive-control сценариев не выявил ошибок;
+3000 численных проверок метрик также без расхождений. Строгий read-only аудит
+с запретом всех socket/bind: 4082 passed, 3 failed и 22 errors за 53,46 с;
+все 25 остановленных проверок относятся к HTTP/bind. Это отдельно от полного
+зелёного прогона исправления, где разрешён только loopback.
+
+245 Python/HTML исходников и тестов не менялись между итоговыми прогонами;
+SHA-256 7443 защищённых файлов config/data/аудитов №1–№11 прежний, новых non-cache
+файлов data/config нет. Миграция 171 строки, baseline и три исторических frozen run
+сохранены; критерии, рабочая разметка и rollout не менялись. Материалы проверки —
+`/private/tmp/labels-v3-a12-fixes-EfzeSr`; [новый аудит №12](audit-labels-v3-implementation-2026-10-20-12.md)
+закрывает C1/H1–H3 в проверенном объёме и оставляет три средние и две низкие находки.
+
+## 25. Исправления средних находок аудита №12
+
+Объём — A12-M1/M2/M3 из [аудита №12](audit-labels-v3-implementation-2026-10-20-12.md).
+Пользовательские критерии, config, stable ID, рабочие данные и старые отчёты не
+меняются. Низкие A12-L1/L2 не закрываются этим описанием автоматически.
+
+### Terminal ledger
+
+Writer хранит pending ownership и первый terminal до полной записи JSONL и
+flush/fsync. Повторный request_failed после сбоя complete callback не теряет
+известный usage. Append использует byte offset и rollback при частичной записи
+или I/O-сбое; committed call_id не публикуется повторно. Если rollback не удался,
+writer отказывает в новых запросах и успешном close. Повторный graceful close
+сохраняет pending через тот же descriptor, не открывая занятое имя заново.
+Это graceful recovery, без гарантии SIGKILL/потери питания.
+
+### Regular shadow retention
+
+Regular shadow upsert при `error`/`rules_only` сохраняет accepted v3 отдельно от
+`labels_v3_attempt`. Требуются прежняя роль, корректные source/input pins и exact
+source либо доказанная collection-only совместимость (§24). Rebind хранит trusted
+observation binding и provenance. Значимые факты или новая роль не получают старую
+оценку; старые prompt/aggregation/labels_version не повышаются неудачной попыткой.
+Полный legacy upsert score/tier/profile/purpose/alerts продолжается; это отличается
+от раннего возврата labels-mode. Source_revision и updated_at защищают более новую
+конкурентную разметку.
+
+### Manual Gold staging
+
+Manual Gold writer фиксирует dev/inode через открытый descriptor, применяет права
+к descriptor и проверяет identity перед replace. Cleanup удаляет лишь совпадающую
+identity. Чужая подмена или неизвестная ownership сохраняются. Secondary cleanup
+ошибка добавляется к primary как note; primary исключение не заменяется. Backup,
+write-ahead audit и атомарная публикация выбранной human строки сохраняются.
+Shared immutable publisher остаётся отдельным путём A12-L1.
+
+### Приёмка
+
+Добавлены **75 регрессионных случаев**: ledger37, regular shadow16, manual Gold22.
+Итоговый полный набор — **4182 passed за 66,10 с**, включая loopback HTTP;
+Ruff и `git diff --check` проходят. Независимые native probes подтверждают один
+счёт ledger после восстановления, fail-closed при неустранимом rollback, сохранение
+accepted v3 одновременно с настоящим legacy upsert и сохранность foreign staging.
+248 Python/HTML исходников и тестов совпали до/после итоговых прогонов.
+
+Строгий аудит без всех socket/bind: 4157 passed, 3 failed, 22 errors за 54,24 с;
+все 25 остановленных проверок — HTTP, пройденные в полном loopback наборе.
+SHA-256 7446 защищённых config/data/старых audit entries прежний, новых файлов
+data/config нет. Миграция171, baseline, frozen replay и rubric hashes сохранены.
+[Аудит №13](audit-labels-v3-implementation-2026-10-20-13.md) закрывает M1–M3
+в проверенном объёме и оставляет две низкие находки. Материалы —
+`/private/tmp/labels-v3-a13-fixes-BpODOM`; live pilot/rollout не выполнялись.
+
+## 26. Исправления находок аудита №14
+
+[Аудит №14](audit-labels-v3-implementation-2026-10-20-14.md) нашёл две средние и одну
+низкую находку. Критерии, веса, пороги, stable ID и рабочие данные не менялись.
+
+**A14-M1 — `label --export --gold` на реальном gold.** Снимок `source` в строках
+`gold sample` и `gold migrate-v3` — whitelist `gold._snapshot`, а `source_hash` покрывает
+полную запись, поэтому снимок не воспроизводил хеш ни у одной из 171 строки. Теперь
+`runner.export_records` использует снимок, только если он воспроизводит хеш; иначе
+источник читается из SQLite read-only и принимается при совпадении хеша или
+доказанном collection-only изменении (`check_source_compatibility`), как в
+`build_bundle`. Запись пересобирается из полного снимка источника, сохранённая
+annotation модели не передаётся. Изменённые факты, отсутствующая или повреждённая
+вакансия дают отказ с указанием причины и пути через бандл. На рабочем gold экспорт
+`--gold` совпал с экспортом через бандл по всем 171 строке; SQLite не изменилась.
+
+**A14-M2 — полнота S3 для явных формулировок.** Распознаются дополнительно:
+- исключения Brazil: «… is not open to candidates in Brazil», «Candidates in Brazil are
+  not eligible for this role», «Open to candidates worldwide except Brazil»;
+- включения: «hire remote employees across LATAM, including Brazil», «Open to candidates
+  worldwide», «… fully remote and open to candidates worldwide», «You can work from
+  anywhere in Latin America, including Brazil»;
+- закрытые списки вакансии: «open/available to <места>» трактуется как «restricted/limited
+  to <места>»; «we can/will only hire in <места>».
+
+Офис: город извлекается из фразы без артикля, слова office и частоты («in our São Paulo
+office», «… in São Paulo three days a week»); метка «Hybrid: …» с собственным in/at не
+блокирует проверку. Метрополия/штат, списки городов, Barueri/Campinas и условные
+формулировки по-прежнему дают `unspecified`. Общая проверка противоречий по всему
+объявлению не менялась. Структурное `location_text` по-прежнему не доказывает найм —
+это решение пользователя. Технический `AGGREGATION_VERSION` — `labels-aggregation-v4`:
+принятые оценки labels-mode устаревают, facts keys кеша не меняются.
+
+**A14-L1 — `config/purpose_rubric.yaml`.** Документирующая правка, значения правил взяты
+из уже принятых решений:
+
+| Файл / поле | Было | Стало | Основание |
+| --- | --- | --- | --- |
+| `purpose_rubric.yaml` / `p2_mode` | — | `labels` | `p2` v2 применяется только в `labeling.mode=labels` (`purpose.PURPOSE_RUBRIC_VERSION`) |
+| `purpose_rubric.yaml` / `legacy_p2` | — | `version: data-interview-practice-2026-10-19-v1`, `confirmed_at: '2026-10-19'`, `mode: legacy, shadow`, прежний текст правила | действующее по умолчанию правило (`purpose.LEGACY_PURPOSE_RUBRIC_VERSION`), удалённое из файла в §22 |
+
+Регрессии — `tests/test_labels_a14_fixes.py` (40 случаев): экспорт по урезанному снимку,
+отказ при изменённых фактах и без источника, соответствие YAML константам purpose,
+сохранение явных фактов и отказ для 15 контрольных формулировок без доказательства.

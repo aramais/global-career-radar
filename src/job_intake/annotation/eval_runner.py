@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import uuid
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,6 +60,29 @@ def sqlite_path(database_url: str) -> Path:
     if url.query:
         raise ValueError("eval does not accept SQLite URL query options")
     return Path(url.database).expanduser().resolve()
+
+
+def sqlite_input_paths(database_url: str) -> list[Path]:
+    """The database and SQLite-owned companion names are all protected inputs."""
+    database = sqlite_path(database_url)
+    return [database, *(Path(str(database) + suffix)
+                        for suffix in ("-wal", "-shm", "-journal"))]
+
+
+def default_report_path(base: Path, *, markdown: bool = False) -> Path:
+    """Keep the familiar first default; subsequent reports use fresh immutable names.
+
+    This is selection, not a filesystem reservation. The exclusive publisher still
+    rejects a competitor that occupies the selected name before publication.
+    Explicit --output destinations do not call this helper.
+    """
+    candidate = base
+    while any(path.exists() or path.is_symlink() for path in (
+        (candidate, candidate.with_suffix(".md")) if markdown else (candidate,)
+    )):
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        candidate = base.with_name(f"{base.stem}-{stamp}-{uuid.uuid4().hex[:8]}{base.suffix}")
+    return candidate
 
 
 def _object_json(value: object, field: str) -> dict:

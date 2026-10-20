@@ -8,10 +8,12 @@ from datetime import UTC
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session, load_only, selectinload
 
+from job_intake.annotation.text import source_hash
 from job_intake.profiles import stale_version_reasons
 from job_intake.purpose import PURPOSE_RUBRIC_VERSION, serialize_purpose
 from job_intake.storage.models import JobORM, JobProfileEvaluationORM, JobPurposeAssessmentORM
 from job_intake.storage.queries import classification_is_current, ranked_profile_evaluations
+from job_intake.storage.source_state import record_from_saved
 
 JOB_QUERY_FIELDS = {"profile_id", "job_archive", "query", "tier", "score_min", "score_max",
                     "sort", "offset", "limit", "purpose"}
@@ -25,6 +27,7 @@ LIST_COLUMNS = (
     JobORM.location_text, JobORM.remote_text,
     JobORM.role_label, JobORM.role_classification,
     JobORM.version_components,
+    JobORM.relevance, JobORM.labels_status, JobORM.labels_version,
 )
 EVALUATION_COLUMNS = (
     JobProfileEvaluationORM.job_uid, JobProfileEvaluationORM.profile_id,
@@ -36,6 +39,8 @@ EVALUATION_COLUMNS = (
     JobProfileEvaluationORM.raw_fit_score, JobProfileEvaluationORM.score_cap_reasons,
     JobProfileEvaluationORM.eligibility_status, JobProfileEvaluationORM.eligibility_evidence_status,
     JobProfileEvaluationORM.version_components,
+    JobProfileEvaluationORM.relevance, JobProfileEvaluationORM.labels_status,
+    JobProfileEvaluationORM.labels_version,
 )
 
 
@@ -97,6 +102,40 @@ def _public_prefilter(value: object) -> dict | None:
     blockers = value.get("blockers", [])
     if isinstance(blockers, list):
         result["blockers"] = [item for item in blockers if isinstance(item, str)]
+    return result
+
+
+def _public_labels(value: object) -> dict | None:
+    """Public fact fields only; never publish model errors, prompts or cache internals."""
+    if not isinstance(value, dict):
+        return None
+    ordinal = value.get("relevance")
+    status, outcome = value.get("status"), value.get("gate_outcome")
+    result = {
+        "relevance": ordinal if type(ordinal) is int and ordinal in range(4) else None,
+        "status": status if isinstance(status, str) and status in {
+            "labeled", "rules_only", "gated", "error"} else "error",
+        "gate_outcome": outcome if isinstance(outcome, str) and outcome in {
+            "eligible", "ineligible", "unknown"} else "unknown",
+        "escalated": value.get("escalated") is True,
+    }
+    reasons = {"hiring_region_restricted", "work_authorization_required", "office_outside_sp",
+               "other_language_required", "vacancy_closed"}
+    result["gate_reasons"] = [item for item in value.get("gate_reasons", [])
+                              if isinstance(item, str) and item in reasons] if isinstance(
+                                  value.get("gate_reasons"), list) else []
+    scalar_fields = {"value", "industry", "requirement", "required_domain",
+                     "domain", "office_location", "basis"}
+    tags = value.get("tags")
+    result["tags"] = {
+        name: {key: item if key in scalar_fields else [v for v in item if isinstance(v, str)]
+               for key, item in tag.items()
+               if (key in scalar_fields and isinstance(item, str))
+               or (key in {"values", "evidence"} and isinstance(item, list))}
+        for name, tag in tags.items()
+        if name in {"hiring_eligibility", "work_mode", "working_language", "function_core",
+                    "domain_fit", "preferred_focus"} and isinstance(tag, dict)
+    } if isinstance(tags, dict) else {}
     return result
 
 
@@ -170,7 +209,18 @@ def serialize_job(job: JobORM, versions: dict[str, str], *, profile: str | None 
                           "blocker_signals": p.blocker_signals} if detailed else {})}
                      for p in evaluations if job.role_label != "other"],
     }
+    # Preserve compact legacy list payloads when no labels have been produced.
+    # `relevance` above remains the legacy profile-assessment object.
+    if job.labels_status is not None or job.relevance is not None:
+        result.update(labels_relevance=job.relevance, labels_status=job.labels_status,
+                      labels_version=job.labels_version)
     if detailed:
+        raw_labels = (job.annotation or {}).get("labels_v3")
+        labels_current = (isinstance(raw_labels, dict)
+                          and raw_labels.get("source_hash") == source_hash(record_from_saved(job)))
+        result["labels_v3"] = _public_labels(raw_labels) if labels_current else None
+        if isinstance(raw_labels, dict) and not labels_current:
+            result.update(labels_relevance=None, labels_status="stale", labels_stale=True)
         result["description"] = job.description_clean or job.description_raw
         result["annotation"] = {key: value for key, value in (job.annotation or {}).items()
                                 if key in PUBLIC_ANNOTATION_FIELDS}
@@ -194,7 +244,8 @@ def list_job_page(session: Session, versions: dict[str, str], query: dict[str, s
     if tier not in {None, "A", "B", "C", "unrated"}:
         raise ValueError("Unknown vacancy tier")
     sort = query.get("sort") or "tier-asc"
-    if sort not in {"tier-asc", "tier-desc", "score-asc", "score-desc", "review-evidence"}:
+    if sort not in {"tier-asc", "tier-desc", "score-asc", "score-desc", "review-evidence",
+                    "relevance-asc", "relevance-desc"}:
         raise ValueError("Unknown vacancy sort")
     purpose = query.get("purpose") or "all"
     if purpose not in {"all", "p1", "p2", "review"}:
@@ -231,7 +282,8 @@ def list_job_page(session: Session, versions: dict[str, str], query: dict[str, s
             )
             stale_axes[axis] = and_(human != "unknown", or_(
                 pin != row.prediction_source_hash,
-                rubric != PURPOSE_RUBRIC_VERSION,
+                rubric != func.coalesce(func.nullif(row.rubric_version, ""),
+                                        PURPOSE_RUBRIC_VERSION),
             ))
         if purpose == "review":
             statement = statement.where(or_(
@@ -285,7 +337,13 @@ def list_job_page(session: Session, versions: dict[str, str], query: dict[str, s
             (ranked.c.eligibility_evidence_status == "confirmed", 0),
             (ranked.c.eligibility_evidence_status == "unconfirmed", 1), else_=2,
         ), score_order, tier_order)
-    statement = statement.order_by(unrated, *order, JobORM.job_uid).offset(offset).limit(limit)
+    if sort.startswith("relevance-"):
+        relevance_order = (JobORM.relevance.asc() if sort == "relevance-asc"
+                           else JobORM.relevance.desc())
+        ordering = (case((JobORM.relevance.is_(None), 1), else_=0), relevance_order, *order)
+    else:
+        ordering = (unrated, *order)
+    statement = statement.order_by(*ordering, JobORM.job_uid).offset(offset).limit(limit)
     statement = statement.options(
         load_only(*LIST_COLUMNS, raiseload=True),
         selectinload(JobORM.profile_evaluations).load_only(*EVALUATION_COLUMNS, raiseload=True),

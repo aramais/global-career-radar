@@ -19,7 +19,7 @@ from job_intake.annotation.cohorts import (
     write_new,
     write_new_text,
 )
-from job_intake.annotation.eval_runner import read_saved_records
+from job_intake.annotation.eval_runner import read_saved_records, report_destinations
 from job_intake.annotation.gold import validate_gold
 from job_intake.annotation.text import source_hash
 from job_intake.config.settings import AppConfig
@@ -116,7 +116,12 @@ def build_bundle(
     wanted = {case["job_uid"] for case in cases}
     saved = [(uid, record) for uid, record in saved if uid in wanted]
     from job_intake.config.settings import load_yaml_mapping
-    from job_intake.profiles import load_streams, taxonomy_version, with_other_stream
+    from job_intake.profiles import (
+        load_streams,
+        taxonomy_version,
+        with_labeling_versions,
+        with_other_stream,
+    )
 
     profiles, classifier_version = None, None
     if config.rules_path.is_file() and config.search_profiles_path.is_file():
@@ -125,6 +130,7 @@ def build_bundle(
             load_streams(rules, load_yaml_mapping(config.search_profiles_path)),
             rules,
         )
+        streams = with_labeling_versions(streams, config.labeling)
         profiles = {stream.id: stream.version for stream in streams}
         classifier_version = taxonomy_version(streams)
     predictions = read_saved_predictions(
@@ -145,7 +151,10 @@ def build_bundle(
     from job_intake.annotation.source_compat import check_source_compatibility, read_source_history
 
     history = read_source_history(config.database_url, cases)
-    validated = validate_gold(list(records.items()), cases, source_history=history)
+    validated = validate_gold(
+        list(records.items()), cases, source_history=history,
+        profile_ids=list(profiles) if profiles is not None else None,
+    )
     if not validated["valid"]:
         raise ValueError("Invalid gold: " + "; ".join(row["code"] for row in validated["errors"]))
     proofs = {
@@ -158,6 +167,14 @@ def build_bundle(
     }
     if any(not proof["compatible"] for proof in proofs.values()):
         raise ValueError("Source drift: create reviewed labels/cohort before freezing")
+    if cases[0].get("schema") == LABELS_SCHEMA:
+        # An immutable v3 bundle needs normalized v3 baseline rows as well. This
+        # explicit tier-map is an evaluation baseline, never a pipeline policy.
+        from job_intake.labeling.predictions import baseline_predictions
+
+        predictions = {row["job_uid"]: row for row in baseline_predictions(
+            [(uid, record) for uid, record in saved if uid in predictions], predictions,
+        )}
     gate_policy = copy.deepcopy(policy or DEFAULT_POLICY)
     validate_policy(gate_policy)
     rows = [
@@ -224,6 +241,15 @@ def load_bundle(path: Path) -> dict:
     ):
         raise ValueError("Frozen bundle changed or has unsupported schema")
     validate_policy(result["gate_policy"])
+    if any(row.get("label", {}).get("schema") == LABELS_SCHEMA for row in result["rows"]):
+        validated = validate_gold(
+            [(row["job_uid"], record_from_snapshot(row["source"])) for row in result["rows"]],
+            [row["label"] for row in result["rows"]],
+        )
+        if not validated["valid"]:
+            raise ValueError("Invalid v3 frozen labels: " + "; ".join(
+                row["code"] for row in validated["errors"]
+            ))
     for row in result["rows"]:
         from job_intake.annotation.source_compat import check_source_compatibility
 
@@ -350,6 +376,14 @@ def _bundle_uses_v3_labels(bundle: dict) -> bool:
     return any(row["label"].get("schema") == LABELS_SCHEMA for row in bundle["rows"])
 
 
+def _has_full_human_tags(row: dict) -> bool:
+    if row.get("schema") == LABELS_SCHEMA:
+        from job_intake.labeling.schema import TAG_NAMES
+
+        return set(row.get("tags", {})) == set(TAG_NAMES)
+    return len(row.get("tags", {})) == 19
+
+
 def _is_v3_prediction(row: dict) -> bool:
     # These discriminators belong to v3 rows, regardless of the experiment name.
     # Legacy frozen predictions may already carry relevance, so it is not enough.
@@ -421,7 +455,12 @@ def saved_predictions_for_bundle(config: AppConfig, bundle: dict) -> list[dict]:
     from job_intake.annotation.gold import _snapshot
     from job_intake.annotation.source_compat import check_source_compatibility
     from job_intake.config.settings import load_yaml_mapping
-    from job_intake.profiles import load_streams, taxonomy_version, with_other_stream
+    from job_intake.profiles import (
+        load_streams,
+        taxonomy_version,
+        with_labeling_versions,
+        with_other_stream,
+    )
 
     _, saved, _ = read_saved_records(config.database_url, limit=None, include_archived=True)
     selected = {row["job_uid"]: row for row in bundle["rows"]}
@@ -433,6 +472,7 @@ def saved_predictions_for_bundle(config: AppConfig, bundle: dict) -> list[dict]:
             load_streams(rules, load_yaml_mapping(config.search_profiles_path)),
             rules,
         )
+        streams = with_labeling_versions(streams, config.labeling)
         versions = {stream.id: stream.version for stream in streams}
         classification_version = taxonomy_version(streams)
     predictions = read_saved_predictions(
@@ -441,6 +481,13 @@ def saved_predictions_for_bundle(config: AppConfig, bundle: dict) -> list[dict]:
         profile_versions=versions,
         classification_version=classification_version,
     )
+    v3 = _bundle_uses_v3_labels(bundle)
+    if v3:
+        from job_intake.labeling.predictions import baseline_predictions
+
+        predictions = {row["job_uid"]: row for row in baseline_predictions(
+            [(uid, record) for uid, record in saved if uid in predictions], predictions,
+        )}
     output = []
     for uid, record in saved:
         frozen = selected[uid]
@@ -454,15 +501,12 @@ def saved_predictions_for_bundle(config: AppConfig, bundle: dict) -> list[dict]:
         )
         if not proof["compatible"]:
             raise ValueError("Current source facts changed since bundle: " + uid)
-        output.append(
-            {
-                **predictions[uid],
-                "source_hash": frozen["source_hash"],
-                "source_binding": {
-                    key: value for key, value in proof.items() if key != "source_snapshot"
-                },
+        row = {**predictions[uid], "source_hash": frozen["source_hash"]}
+        if not v3:
+            row["source_binding"] = {
+                key: value for key, value in proof.items() if key != "source_snapshot"
             }
-        )
+        output.append(row)
     return output
 
 
@@ -735,7 +779,7 @@ def compare_runs(
         ("human_relevant", after["counts"]["relevant"], policy.get("minimum_relevant", 0)),
         (
             "human_full_tags",
-            sum(len(row.get("tags", {})) == 19 for row in cases),
+            sum(_has_full_human_tags(row) for row in cases),
             policy.get("minimum_full_tag_cases", 0),
         ),
         (
@@ -1011,12 +1055,20 @@ def comparison_markdown(report: dict) -> str:
     return "\n".join(lines)
 
 
-def write_comparison_report(report: dict, path: Path) -> tuple[Path, Path]:
-    markdown = path.with_suffix(".md")
-    if path.suffix != ".json" or any(
-        target.exists() or target.is_symlink() for target in (path, markdown)
-    ):
+def comparison_destinations(path: Path, *, protected_paths: list[Path] | None = None
+                            ) -> tuple[Path, Path]:
+    """Validate both lexical report names before consuming an exposure journal."""
+    if path.suffix != ".json":
         raise ValueError("Use new JSON and Markdown report destinations")
+    try:
+        return report_destinations([path, path.with_suffix(".md")],
+                                   protected_paths=protected_paths or [])
+    except ValueError as exc:
+        raise ValueError(f"Use new JSON and Markdown report destinations: {exc}") from exc
+
+
+def write_comparison_report(report: dict, path: Path) -> tuple[Path, Path]:
+    path, markdown = comparison_destinations(path)
     write_new(path, report)
     write_new_text(markdown, comparison_markdown(report))
     return path, markdown

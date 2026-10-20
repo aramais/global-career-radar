@@ -192,6 +192,7 @@ padding:17px}.period-note{align-items:flex-start}.form-grid{gap:10px}.contact-se
         <option value="tier-asc">Категория: A → C</option><option value="tier-desc">Категория: C → A</option>
         <option value="score-desc">Баллы: больше сначала</option>
         <option value="score-asc">Баллы: меньше сначала</option>
+        <option value="relevance-desc">По релевантности labels-v3: 3 → 0</option>
         <option value="review-evidence">REVIEW: подтверждённость условий</option></select></label>
       <button id="resetJobFilters" type="button">Сбросить фильтры</button>
     </div>
@@ -264,6 +265,7 @@ let goldLoading = false;
 let goldEditor = null;
 let goldOpening = 0;
 let goldFilterTimer = null;
+let goldMessageSequence = 0;
 const $ = (id) => document.getElementById(id);
 const defaults = {
   stages: [{value:'saved',label:'Сохранено'},{value:'contacted',label:'Связался с контактом'},
@@ -594,6 +596,10 @@ function filterAndSortJobs(jobs, options = {}) {
       const scoreOrder = compareScores(assessmentScore(a.assessment),assessmentScore(b.assessment),
         sort === 'score-asc' ? 1 : -1);
       const tierOrder = compareTiers(a.assessment,b.assessment,sort === 'tier-desc' ? -1 : 1);
+      if (sort.startsWith('relevance-')) return compareScores(scoreNumber(a.job.labels_relevance),
+        scoreNumber(b.job.labels_relevance),sort === 'relevance-asc' ? 1 : -1)
+        || tierOrder || scoreOrder
+        || String(a.job.job_uid || '').localeCompare(String(b.job.job_uid || ''));
       return (sort.startsWith('score-') ? scoreOrder || tierOrder : tierOrder || scoreOrder)
         || String(a.job.job_uid || '').localeCompare(String(b.job.job_uid || ''));
     }).map(({job}) => job);
@@ -659,6 +665,7 @@ function renderJobFilters() {
     + ' '
     + ($('jobSort').value === 'review-evidence'
       ? 'Сначала REVIEW с подтверждёнными условиями, затем с неизвестными. Это приоритет проверки.'
+      : $('jobSort').value.startsWith('relevance-') ? 'Сначала релевантность по шкале 0–3, затем категория и баллы.'
       : $('jobSort').value.startsWith('tier-') ? 'Внутри категории — сначала больший балл.'
       : 'При равных баллах — категория A → C.') + ' Без оценки — в конце.';
   const min = scoreNumber($('scoreMinFilter').value), max = scoreNumber($('scoreMaxFilter').value);
@@ -814,6 +821,8 @@ function jobCard(job) {
   if (job.archived) tags.append(badge('В архиве · ' + dateText(job.archived_at),'amber'));
   const assessment = jobAssessment(job,$('profileFilter').value);
   tags.append(badge(job.role_name || profileName(job.role_label),'blue'));
+  if (Number.isInteger(job.labels_relevance)) tags.append(badge('Релевантность: '
+    + job.labels_relevance + '/3',job.labels_relevance >= 2 ? 'blue' : ''));
   if (assessment) tags.append(badge((assessment.tier || '—') + ' · '
     + (assessmentScore(assessment) === null ? 'Без оценки' : assessmentScore(assessment) + ' баллов')
     + (assessment.decision ? ' · ' + ({pass:'Подходит',review:'Проверить условия',reject:'Есть ограничение'}[assessment.decision]
@@ -1068,6 +1077,23 @@ function renderPrefilter(prefilter,unitAnchors,anchorPrefix,assessment) {
 }
 function renderJobAnnotation(job,assessment) {
   const body = el('div',null,'annotation-body'); const annotation = job.annotation || {};
+  const labels = job.labels_v3;
+  if (labels) {
+    body.append(el('h4','Разметка релевантности'),el('p','Релевантность: '
+      + (Number.isInteger(labels.relevance) ? labels.relevance + '/3' : 'не определена'),'small'));
+    const outcomes = {eligible:'найм подходит',ineligible:'есть ограничение найма',unknown:'условия найма не подтверждены'};
+    body.append(el('p',outcomes[labels.gate_outcome] || outcomes.unknown,'small'));
+    if (labels.escalated) body.append(badge('Дополнительно проверено моделью','blue'));
+    if (labels.gate_reasons?.length) body.append(el('p',labels.gate_reasons.map((reason) =>
+      GOLD_VALUE_LABELS[reason] || reason).join('; '),'small'));
+    Object.entries(labels.tags || {}).forEach(([name,tag]) => {
+      const values = name === 'preferred_focus' ? tag.values || []
+        : name === 'domain_fit' ? [tag.industry,tag.requirement,tag.required_domain,tag.domain].filter(Boolean)
+        : [tag.value,tag.office_location].filter(Boolean);
+      body.append(el('p',(GOLD_TAG_TITLES[name] || name) + ': '
+        + values.map((value) => GOLD_VALUE_LABELS[value] || value).join('; '),'small'));
+    });
+  }
   const prefilter = annotation.prefilter;
   const eligibility = assessment || job.eligibility;
   if (job.classification_reason) body.append(el('p',job.classification_reason,'small'));
@@ -1696,17 +1722,18 @@ function goldQuery(offset = goldOffset) {
 function goldMessage(message, kind = '') {
   $('goldMessage').textContent = message; $('goldMessage').hidden = !message;
   $('goldMessage').className = 'gold-message ' + kind;
+  return ++goldMessageSequence;
 }
 async function refreshGold(reset = true, navigation = null, offset = null) {
   if (navigation && !resumeGoldNavigation(navigation)) return false;
   if (reset && goldEditor && !closeModal()) return false;
-  if (reset) goldOffset = 0;
+  if (reset) offset = 0;
   navigation = navigation || goldNavigationContext(goldOpening);
   const request = ++goldSequence; goldLoading = true;
   navigation.sequence = request;
   const current = () => request === goldSequence && view === 'gold'
     && resumeGoldNavigation(navigation);
-  goldMessage('Загрузка выборки…'); renderGoldPagination();
+  const loadingMessage = goldMessage('Загрузка выборки…'); renderGoldPagination();
   try {
     const page = await api(goldQuery(offset ?? goldOffset));
     if (!current()) return false;
@@ -1719,7 +1746,10 @@ async function refreshGold(reset = true, navigation = null, offset = null) {
     return true;
   } catch (error) { if (current()) goldMessage(errorMessage(error),'error'); return false; }
   // A superseded owner still releases its own loading state, never a newer request's.
-  finally { if (request === goldSequence) { goldLoading = false; renderGoldPagination(); } }
+  finally {
+    if (goldMessageSequence === loadingMessage) goldMessage('');
+    if (request === goldSequence) { goldLoading = false; renderGoldPagination(); }
+  }
 }
 function renderGoldPagination() {
   $('previousGold').disabled = goldLoading || goldOffset === 0;
@@ -1793,7 +1823,7 @@ async function openGold(uid, navigation = null, page = null) {
     navigation = goldNavigationContext();
   }
   if (!resumeGoldNavigation(navigation)) return false;
-  goldMessage('Загрузка вакансии…');
+  const loadingMessage = goldMessage('Загрузка вакансии…');
   try {
     const detail = await api('/api/gold/' + encodeURIComponent(uid));
     if (!resumeGoldNavigation(navigation)) return false;
@@ -1803,6 +1833,7 @@ async function openGold(uid, navigation = null, page = null) {
     if (page) renderGoldList();
     return true;
   } catch (error) { if (resumeGoldNavigation(navigation)) goldMessage(errorMessage(error),'error'); return false; }
+  finally { if (goldMessageSequence === loadingMessage) goldMessage(''); }
 }
 function goldEditorMessage(message, kind = '') {
   if (!goldEditor?.message) return;
@@ -2059,8 +2090,8 @@ document.addEventListener('visibilitychange',() => tickGoldReview(false,false));
 $('goldFilters').addEventListener('submit',(event) => { event.preventDefault(); clearTimeout(goldFilterTimer); refreshGold(); });
 $('goldStatusFilter').addEventListener('change',() => { clearTimeout(goldFilterTimer); refreshGold(); });
 $('goldQuery').addEventListener('input',() => { clearTimeout(goldFilterTimer); goldFilterTimer = setTimeout(() => refreshGold(),250); });
-$('previousGold').addEventListener('click',() => { goldOffset = Math.max(0,goldOffset - 100); refreshGold(false); });
-$('nextGold').addEventListener('click',() => { goldOffset += 100; refreshGold(false); });
+$('previousGold').addEventListener('click',() => { refreshGold(false,null,Math.max(0,goldOffset - 100)); });
+$('nextGold').addEventListener('click',() => { refreshGold(false,null,goldOffset + 100); });
 window.addEventListener('beforeunload',(event) => {
   if (goldIsDirty()) { event.preventDefault(); event.returnValue = ''; }
 });

@@ -12,6 +12,7 @@ import pytest
 from typer.testing import CliRunner
 
 from job_intake import cli
+from job_intake.annotation import cohorts
 from job_intake.annotation import gold_workbook as gold
 from job_intake.annotation.gold import DEFAULT_PROFILE_IDS, _snapshot
 from job_intake.annotation.text import TEXT_VERSION, source_hash
@@ -362,9 +363,9 @@ def test_gold_sample_refuses_existing_gold_or_manifest_before_sampling(
 
 def test_atomic_create_refuses_existing_output_without_temp_files(tmp_path):
     path = tmp_path / "gold.jsonl"
-    gold.write_new_text("human labels", path)
+    gold.write_new_text(path, "human labels")
     with pytest.raises(ValueError, match="already exists"):
-        gold.write_new_text("replacement", path)
+        gold.write_new_text(path, "replacement")
     assert path.read_text() == "human labels"
     assert sorted(tmp_path.iterdir()) == [path]
 
@@ -376,9 +377,9 @@ def test_atomic_create_race_preserves_competing_output_and_cleans_temp_files(tmp
         destination.write_text("competing human labels")
         raise FileExistsError("Created after preflight")
 
-    monkeypatch.setattr(gold.os, "link", competing_writer)
+    monkeypatch.setattr(cohorts.os, "link", competing_writer)
     with pytest.raises(FileExistsError):
-        gold.write_new_text("new data", path)
+        gold.write_new_text(path, "new data")
     assert path.read_text() == "competing human labels"
     assert sorted(tmp_path.iterdir()) == [path]
 

@@ -133,6 +133,22 @@ def test_v3_options_human_fields_and_source_are_blind_without_mutation(labeling)
     assert (snapshot(path), snapshot(database)) == before
 
 
+def test_unknown_tag_names_cannot_leak_machine_text_through_blind_diagnostics(labeling):
+    config, path, database, cases, _ = labeling
+    cases[0]["tags"]["MACHINE_RELEVANCE_THREE_PRIVATE_MARKER"] = {
+        "value": "MACHINE_VALUE_PRIVATE_MARKER", "quote": "",
+    }
+    write_cases(path, cases)
+    before = snapshot(path), snapshot(database)
+    detail = GoldLabelStore(config, path).detail("uid-0")
+    serialized = json.dumps(detail)
+    assert not detail["can_save"] and detail["source_state"] == "invalid"
+    assert "MACHINE_RELEVANCE_THREE_PRIVATE_MARKER" not in serialized
+    assert "MACHINE_VALUE_PRIVATE_MARKER" not in serialized
+    assert any("Unknown v3 tag" in warning for warning in detail["warnings"])
+    assert (snapshot(path), snapshot(database)) == before
+
+
 def test_v3_six_tags_save_partial_provenance_and_quotes_without_changing_other_rows(labeling):
     config, path, database, _, records = labeling
     store = GoldLabelStore(config, path)

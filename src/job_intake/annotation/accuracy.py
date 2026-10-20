@@ -23,6 +23,7 @@ from job_intake.annotation.eval_runner import (
     evaluate_log,
     read_saved_records,
     report_destinations,
+    sqlite_input_paths,
     sqlite_path,
 )
 from job_intake.annotation.schema import _language_entities
@@ -1087,22 +1088,37 @@ def run_accuracy(
 ) -> dict:
     from job_intake.annotation.gold import validate_gold
 
+    if variant not in {"saved", "rules", "labels"}:
+        raise ValueError("variant must be saved (v2 gold), rules or labels (v3 gold); "
+                         "no AI calls are made")
+    if variant in {"rules", "labels"} and (prices is not None or log is not None):
+        raise ValueError("--prices and --log apply to the saved variant only")
+    protected = []
+    if output is not None:
+        # Public callers have the same read-only boundary as the CLI. Protect
+        # companion names even when absent, before reading gold or opening SQLite.
+        protected = [
+            *sqlite_input_paths(config.database_url), gold, config.rules_path,
+            config.search_profiles_path, config.company_watchlist_path,
+            prices or config.rules_path.parent / "eval_prices.yaml",
+            *(path for path in (log, cohort, predictions) if path is not None),
+        ]
+        accuracy_report_destinations(output, protected_paths=protected)
+        if cohort is not None:
+            from job_intake.annotation.cohorts import load_cohort
+
+            manifest = load_cohort(cohort)
+            if journal := manifest.get("exposure_log"):
+                protected.append(Path(journal))
+                accuracy_report_destinations(output, protected_paths=protected)
     if variant in {"rules", "labels"}:
-        if prices is not None or log is not None:
-            raise ValueError("--prices and --log apply to the saved variant only")
         report = run_relevance_accuracy(
             config, gold=gold, variant=variant, predictions=predictions, cohort=cohort,
             allow_source_snapshot=allow_source_snapshot,
         )
-        if output:
-            write_accuracy_report(report, output, protected_paths=[
-                Path(report["database"]), gold, config.rules_path, config.search_profiles_path,
-                *([predictions] if predictions else []),
-            ])
+        if output is not None:
+            write_accuracy_report(report, output, protected_paths=protected)
         return report
-    if variant != "saved":
-        raise ValueError("variant must be saved (v2 gold), rules or labels (v3 gold); "
-                         "no AI calls are made")
     if predictions is not None:
         raise ValueError("--predictions applies to the labels variant only")
     cases, cohort_manifest = _accuracy_cases(gold, cohort)
@@ -1234,19 +1250,8 @@ def run_accuracy(
         report["readiness"]["limitations"].append(
             "Changed source labels await human review; quote rebinding alone is insufficient."
         )
-    if output:
-        write_accuracy_report(
-            report,
-            output,
-            protected_paths=[
-                database,
-                gold,
-                price_path,
-                config.rules_path,
-                config.search_profiles_path,
-                *([log] if log else []),
-            ],
-        )
+    if output is not None:
+        write_accuracy_report(report, output, protected_paths=protected)
     return report
 
 
