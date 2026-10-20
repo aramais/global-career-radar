@@ -550,9 +550,11 @@ def gold_validate(
     ),
     output: Annotated[Path, typer.Option()] = Path("data/local/eval/gold-validation.json"),
 ) -> None:
-    """Validate vacancy labels and rebind their quotes to current source units."""
+    """Validate v2 or v3 vacancy labels (by their schema field) and rebind quotes."""
     from job_intake.annotation.benchmark import read_jsonl
     from job_intake.annotation.gold import validate_gold
+    from job_intake.labeling.gold_v3 import gold_file_schema, validate_gold_v3
+    from job_intake.labeling.schema import LABELS_SCHEMA
 
     try:
         settings = load_app_config(config)
@@ -561,13 +563,15 @@ def gold_validate(
         cases = read_jsonl(gold)
         if not cases or any(not isinstance(case.get("job_uid"), str) for case in cases):
             raise ValueError("Gold must contain vacancy rows with job_uid")
+        validator = validate_gold_v3 if gold_file_schema(cases) == LABELS_SCHEMA \
+            else validate_gold
         _, rows, problems = read_saved_records(
             settings.database_url, limit=None, job_uids=[case["job_uid"] for case in cases],
             include_archived=True,
         )
         streams = load_streams(load_yaml_mapping(settings.rules_path),
                                load_yaml_mapping(settings.search_profiles_path))
-        report = validate_gold(rows, cases, profile_ids=[stream.id for stream in streams])
+        report = validator(rows, cases, profile_ids=[stream.id for stream in streams])
         report["source_problems"] = problems
         if any(item["severity"] == "error" and item["code"] != "invalid_annotation_json"
                for items in problems.values() for item in items):
@@ -575,7 +579,8 @@ def gold_validate(
         write_report(report, output, protected_paths=protected)
     except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    typer.echo(f"Gold valid={report['valid']}; labeled={report['labeled_count']}; "
+    typer.echo(f"Gold {report['schema']} valid={report['valid']}; "
+               f"labeled={report['labeled_count']}; "
                f"relevant={report['relevant_count']}. API calls=0; database=read-only.")
     typer.echo(f"Report: {output.resolve()}")
     if not report["valid"]:
@@ -621,6 +626,36 @@ def gold_migrate(
     typer.echo("Migration provenance and blind reading: " + "; ".join(
         str(path.resolve()) for path in companions
     ))
+
+
+@gold_app.command("migrate-v3")
+def gold_migrate_v3(
+    source: Annotated[Path, typer.Option(help="vacancy-tags-v2 JSONL to preserve")],
+    out: Annotated[Path, typer.Option(help="New v3 JSONL; existing paths are refused")] = Path(
+        "data/local/gold/vacancy-labels-v3.jsonl"
+    ),
+    rubric: Annotated[Path, typer.Option(help="Labeling rubric YAML for rubric_version")] = Path(
+        "config/labeling_rubric.yaml"
+    ),
+    config: str = typer.Option("config/settings.yaml", help="App config YAML"),
+) -> None:
+    """Migrate human gold v2 to vacancy-labels-v3 with a SHA-256 manifest, file-only."""
+    from job_intake.labeling.gold_v3 import migrate_gold_v2
+    from job_intake.labeling.rubric import load_rubric
+
+    try:
+        settings = load_app_config(config)
+        manifest_path = out.with_suffix(".manifest.json")
+        _eval_destinations([out, manifest_path], _eval_inputs(settings, config, source, rubric))
+        manifest = migrate_gold_v2(source, out, rubric_version=load_rubric(rubric).version)
+    except (OSError, ValueError, TypeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    counts = manifest["counts"]
+    typer.echo(f"Migrated {counts['rows']} rows to vacancy-labels-v3: "
+               f"decision labels={counts['decision_labeled']}, relevant={counts['relevant']}, "
+               f"migrated tags={counts['migrated_tags']}, dropped tags={counts['dropped_tags']}. "
+               "Source preserved; API calls=0; database not opened.")
+    typer.echo(f"Gold v3: {out.resolve()}; manifest: {manifest_path.resolve()}")
 
 
 @gold_app.command("workbook-data")
@@ -703,8 +738,15 @@ def gold_import_xlsx(
 def eval_accuracy(
     gold: Annotated[Path, typer.Option(help="Human vacancy-level gold JSONL")],
     config: str = typer.Option("config/settings.yaml", help="App config YAML"),
-    variant: str = typer.Option("saved", help="Phase 0 supports saved annotations only"),
-    output: Annotated[Path, typer.Option()] = Path("data/local/eval/accuracy-saved.json"),
+    variant: str = typer.Option(
+        "saved", help="saved (v2 gold); rules: saved tier map, labels: predictions (v3 gold)",
+    ),
+    output: Annotated[
+        Path | None, typer.Option(help="JSON report; default data/local/eval/accuracy-VARIANT.json")
+    ] = None,
+    predictions: Annotated[
+        Path | None, typer.Option(help="v3 prediction JSONL for --variant labels")
+    ] = None,
     prices: Annotated[Path | None, typer.Option(help="Dated YAML token tariffs")] = None,
     log: Annotated[Path | None, typer.Option(help="Optional annotation run log")] = None,
     cohort: Annotated[Path | None, typer.Option(help="Dataset cohort manifest")] = None,
@@ -713,18 +755,20 @@ def eval_accuracy(
         Path | None, typer.Option(help="Append-only cohort analysis log")
     ] = None,
 ) -> None:
-    """Measure a saved baseline against human labels without API calls or DB writes."""
+    """Measure a baseline or v3 predictions against human labels without API calls or DB writes."""
     from job_intake.annotation.accuracy import run_accuracy, write_accuracy_report
 
+    output = output or Path(f"data/local/eval/accuracy-{variant}.json")
     try:
         settings = load_app_config(config)
         protected = _eval_inputs(
             settings, config, gold, prices or settings.rules_path.parent / "eval_prices.yaml",
-            log, cohort,
+            log, cohort, predictions,
         )
         _eval_destinations([output, output.with_suffix(".md")], protected)
         report = run_accuracy(settings, gold=gold, variant=variant, prices=prices, log=log,
-                              cohort=cohort, allow_source_snapshot=source_snapshot)
+                              cohort=cohort, allow_source_snapshot=source_snapshot,
+                              predictions=predictions)
         manifest = report["selection"].get("cohort")
         if manifest and manifest.get("dataset_role") == "holdout" and not (
             exposure_log or manifest.get("exposure_log")
@@ -745,6 +789,13 @@ def eval_accuracy(
             record_report_exposure(manifest, output=output, exposure_log=exposure_log)
     except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
         raise typer.BadParameter(str(exc)) from exc
+    if "relevance_scale" in report["evaluation"]:
+        scale = report["evaluation"]["relevance_scale"]
+        typer.echo(f"Relevance 0–3 ({variant}): N={scale['N']}, "
+                   f"coverage={scale['coverage']['value']}, QWK={scale['qwk']['value']}, "
+                   f"recall≥2={scale['relevant']['recall']['value']}, "
+                   f"precision≥2={scale['relevant']['precision']['value']}, "
+                   f"P@10={scale['precision_at']['10']['value']}.")
     typer.echo("Accuracy baseline calculated. API calls=0; database=read-only.")
     typer.echo(f"Reports: {paths}")
 

@@ -623,6 +623,31 @@ extraction сохраняют доказуемое происхождение, �
 извлечения и качество категорий A/B/C необходимо проверять отдельно. Live benchmark
 без ключей не запускался.
 
+### Единая шкала `vacancy-labels-v3` (фаза P0, без API)
+
+Реализована основа [design doc labels-v3](docs/vacancy-labeling-architecture.md):
+общая схема человека и машины, рубрика `config/labeling_rubric.yaml`, метрики шкалы 0–3
+и базовый уровень правил. Теггер, pipeline и UI разметки v3 ещё не подключены.
+
+```bash
+.venv/bin/job-intake gold migrate-v3 \
+  --source data/local/gold/vacancy-tags-v2-labeled.jsonl \
+  --out data/local/gold/vacancy-labels-v3.jsonl
+.venv/bin/job-intake gold validate --gold data/local/gold/vacancy-labels-v3.jsonl
+.venv/bin/job-intake eval accuracy --variant rules \
+  --gold data/local/gold/vacancy-labels-v3.jsonl
+```
+
+`gold migrate-v3` переносит решения, комментарии и снимки источника 1:1
+(`assisted` → `curated`), отказывается писать в занятый путь и сохраняет manifest
+с SHA-256 входа и выхода. `gold validate` определяет v2 или v3 по полю `schema`.
+`eval accuracy --variant rules` переводит сохранённый tier в relevance по явной
+таблице A→3, B→2, C→1, роль `other`→0; `--variant labels --predictions P.jsonl`
+оценивает готовые строки предсказаний v3. Отчёт `accuracy-<variant>.json/.md`
+содержит блок `relevance_scale`: покрытие, точное совпадение и ±1, MAE, QWK, Spearman,
+матрицу 4×4, recall и precision для relevance ≥2, P@5/10 и NDCG@5/10 рядом со
+случайным порядком. SQLite открывается только на чтение.
+
 ## CSV и HTML
 
 CSV по умолчанию включает A/B и низкие оценки C, исключая явные `REJECT`. По умолчанию

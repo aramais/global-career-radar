@@ -448,6 +448,9 @@ def validate_run(bundle: dict, run: dict) -> None:
     ):
         computed.pop("routing")
         computed["task_prediction_coverage"].pop("route")
+    # The additive relevance_scale block is equally recomputable; older runs lack it.
+    if isinstance(recorded, dict) and "relevance_scale" not in recorded:
+        computed.pop("relevance_scale", None)
     if recorded != computed:
         raise ValueError("Run metrics disagree with recorded outputs")
 
@@ -700,6 +703,11 @@ def compare_runs(
             "measurement": stability,
         }
     )
+    scales = {
+        name: _relevance_summary(run["evaluation"]["relevance_scale"])
+        for name, run in (("baseline", baseline), ("candidate", candidate))
+        if "relevance_scale" in run["evaluation"]
+    }
     statuses = {row["status"] for row in gates}
     status = (
         "fail"
@@ -708,7 +716,7 @@ def compare_runs(
         if "insufficient_evidence" in statuses or repeat is None
         else "pass"
     )
-    return {
+    result = {
         "schema": "frozen-quality-comparison-v1",
         "bundle_id": bundle["bundle_id"],
         "gate_policy": policy,
@@ -723,6 +731,23 @@ def compare_runs(
             "Unknown hiring eligibility is a separate stratum.",
             "Developer inspection consumes holdout independence for later releases.",
         ],
+    }
+    if scales:
+        # Descriptive only: the unified 0–3 scale is not yet a predeclared gate.
+        result["relevance_scale"] = scales
+    return result
+
+
+def _relevance_summary(block: dict) -> dict:
+    return {
+        "N": block["N"],
+        "coverage": block["coverage"]["value"],
+        "qwk": block["qwk"]["value"],
+        "exact": block["exact"]["value"],
+        "within_one": block["within_one"]["value"],
+        "relevant_recall": block["relevant"]["recall"]["value"],
+        "relevant_precision": block["relevant"]["precision"]["value"],
+        "precision_at_10": block["precision_at"]["10"]["value"],
     }
 
 
@@ -765,6 +790,17 @@ def comparison_markdown(report: dict) -> str:
                 f"| {safe_name} | {row['runs']} | {row['cost_usd']} | "
                 f"{cell(row.get('cost_per_confirmed_relevant'))} |"
             )
+    scales = comparison.get("relevance_scale") or {}
+    if scales:
+        lines += [
+            "",
+            "Relevance scale 0–3 (descriptive, not a gate): " + "; ".join(
+                f"{name} QWK {cell(row['qwk'])}, exact {cell(row['exact'])}, "
+                f"recall≥2 {cell(row['relevant_recall'])}, "
+                f"precision≥2 {cell(row['relevant_precision'])}"
+                for name, row in scales.items()
+            ) + ".",
+        ]
     lines += ["", "API calls by this report: 0. Missing evidence never passes a gate.", ""]
     return "\n".join(lines)
 

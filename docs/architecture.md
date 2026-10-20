@@ -519,6 +519,21 @@ Saved-eval читает архив через read-only SQLite, frozen bundles �
 метки и версии вариантов. Когорты/holdout, usage journals и gates описаны в
 [измерительном контракте](p1-evaluation.md); отсутствие покрытия не даёт pass.
 
+Единая шкала `vacancy-labels-v3` (фаза P0 [design doc](vacancy-labeling-architecture.md))
+живёт в `job_intake.labeling`. `schema` задаёт enum, JSON Schema gold и предсказаний
+(снимки — `docs/schemas/vacancy-labels-v3-*.schema.json`) и `validate_gold_row`.
+`rubric` читает `config/labeling_rubric.yaml`: раздел со `status: proposed` не
+применяется и не меняет хеши; `prompt_rubric_hash`, `aggregation_hash` и
+`rubric_version` независимы; `load_precedents` допускает только calibration/development
+когорты. `aggregate` содержит чистые `rules_relevance`, `normalize_company` и
+`p2_candidate`; `metrics.relevance_scale` считает метрики шкалы 0–3; `predictions`
+строит базовый вариант `rules:tier-map-v1`; `gold_v3` мигрирует gold v2 → v3 и
+проверяет файл. `accuracy.evaluate_vacancies` и `frozen_eval.task_metrics` добавляют
+`relevance_scale`, только когда хотя бы одно предсказание несёт целое `relevance`;
+прежние ключи не меняются, ранее записанные прогоны остаются валидными.
+`compare_runs` показывает шкалу описательно, без гейта. Теггер, pipeline, хранение
+и UI v3 относятся к фазам P1–P3.
+
 `reevaluate` выбирает одну роль и применяет её профиль к сохранённым данным без сбора,
 AI-вызовов и уведомлений. Сохраняются `posted_at`, `first_seen_at`, `last_seen_at`
 и `created_at`; изменяются оценки и `updated_at`. Неполные описания при этом

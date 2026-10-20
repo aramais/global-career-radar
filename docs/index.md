@@ -46,6 +46,8 @@ HR Automation собирает вакансии, сохраняет исходн
 | Поиск по хорошим примерам | [Positive example discovery](positive-example-discovery.md) — план, бюджетный запуск, очередь разметки, отчёт |
 | Perplexity | [Search API](perplexity-search-integration.md) — контракт интеграции и настройка ключа |
 | Человеческий эталон | [Gold разметка](vacancy-gold-labeling.md) — значения меток, протокол и примеры проверок |
+| Выбор метода разметки | [Оптимальная разметка](vacancy-labeling-optimization.md) — критичные теги, единые шкалы, обзор открытых решений и рейтинг вариантов |
+| Реализация разметки | [Design doc labels-v3](vacancy-labeling-architecture.md) — модули, схемы, промпт, конфиг, pipeline, CLI, тесты и фазы для исполнителя; фаза P0 реализована: `gold migrate-v3`, `gold validate` для v3, `eval accuracy --variant rules\|labels` |
 | Независимая оценка | [Evaluation](p1-evaluation.md) — когорты, holdout, фиксированные наборы, сравнение и стоимость |
 | Назначения и операции с данными | [Data operations](p1-data-operations.md) — P1/P2, prepare/apply/rollback, источники и перенос discovery |
 | Работа discovery между запусками | [Discovery P1](p1-discovery.md) — registry, происхождение примеров, расходы и цель поиска |

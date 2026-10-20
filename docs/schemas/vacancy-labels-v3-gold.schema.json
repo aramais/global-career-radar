@@ -1,0 +1,540 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vacancy-labels-v3 human gold",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "first_labeled_at",
+    "gate_outcome",
+    "gate_reasons",
+    "job_uid",
+    "labeled_at",
+    "labeler",
+    "method",
+    "notes",
+    "relevance",
+    "role_label",
+    "rubric_version",
+    "schema",
+    "source_hash",
+    "tags",
+    "text_version"
+  ],
+  "properties": {
+    "schema": {
+      "const": "vacancy-labels-v3"
+    },
+    "job_uid": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "text_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "company": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "original_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "apply_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_job_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "posted_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "location_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remote_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "employment_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "salary_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timezone_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description_raw": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description_clean": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "description_complete": {
+              "type": "boolean"
+            },
+            "applicant_location_requirements": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "working_language": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "labeler": {
+      "const": "human"
+    },
+    "method": {
+      "enum": [
+        "blind",
+        "curated",
+        "assisted_llm",
+        null
+      ]
+    },
+    "rubric_version": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "first_labeled_at": {
+      "anyOf": [
+        {
+          "type": "string",
+          "format": "date"
+        },
+        {
+          "type": "string",
+          "format": "date-time"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "labeled_at": {
+      "anyOf": [
+        {
+          "type": "string",
+          "format": "date"
+        },
+        {
+          "type": "string",
+          "format": "date-time"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "label_scope": {
+      "enum": [
+        "blind_decisions",
+        "full_tags",
+        "constraints"
+      ]
+    },
+    "role_label": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "description": "An enabled search_profiles stream ID or other; checked against the current role taxonomy by the validator."
+    },
+    "relevance": {
+      "enum": [
+        0,
+        1,
+        2,
+        3,
+        null
+      ]
+    },
+    "gate_outcome": {
+      "enum": [
+        "eligible",
+        "ineligible",
+        "unknown",
+        null
+      ]
+    },
+    "gate_reasons": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "hiring_region_restricted",
+          "work_authorization_required",
+          "office_outside_sp",
+          "other_language_required",
+          "vacancy_closed",
+          "personal_constraint"
+        ]
+      }
+    },
+    "tags": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hiring_eligibility": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "open_to_brazil",
+                "restricted_elsewhere",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            },
+            "basis": {
+              "enum": [
+                "explicit",
+                "implied"
+              ]
+            }
+          }
+        },
+        "work_mode": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "remote",
+                "office_sao_paulo",
+                "office_elsewhere",
+                "unspecified"
+              ]
+            },
+            "office_location": {
+              "type": "string",
+              "maxLength": 80
+            },
+            "quote": {
+              "type": "string"
+            },
+            "basis": {
+              "enum": [
+                "explicit",
+                "implied"
+              ]
+            }
+          }
+        },
+        "working_language": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "english",
+                "portuguese_with_english",
+                "portuguese_only",
+                "other_language_required",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            },
+            "basis": {
+              "enum": [
+                "explicit",
+                "implied"
+              ]
+            }
+          }
+        },
+        "function_core": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "quote"
+          ],
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "analytics_for_decisions",
+                "analytics_reporting",
+                "solo_analysis",
+                "product_without_analytics",
+                "non_analytics",
+                "unspecified"
+              ]
+            },
+            "quote": {
+              "type": "string"
+            },
+            "basis": {
+              "enum": [
+                "explicit",
+                "implied"
+              ]
+            }
+          }
+        },
+        "domain_fit": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "industry",
+            "requirement",
+            "quote"
+          ],
+          "properties": {
+            "industry": {
+              "type": "string",
+              "enum": [
+                "marketplace_classifieds",
+                "ecommerce_retail",
+                "mobility",
+                "fintech",
+                "saas_b2b",
+                "consumer_apps",
+                "gaming_betting",
+                "healthtech",
+                "pharma_biotech",
+                "cybersecurity",
+                "hardware_iot",
+                "consulting_outsourcing",
+                "public_sector_education",
+                "other"
+              ]
+            },
+            "requirement": {
+              "type": "string",
+              "enum": [
+                "none",
+                "preferred",
+                "required"
+              ]
+            },
+            "required_domain": {
+              "enum": [
+                "marketplace_classifieds",
+                "ecommerce_retail",
+                "mobility",
+                "fintech",
+                "saas_b2b",
+                "consumer_apps",
+                "gaming_betting",
+                "healthtech",
+                "pharma_biotech",
+                "cybersecurity",
+                "hardware_iot",
+                "consulting_outsourcing",
+                "public_sector_education",
+                "other",
+                null
+              ]
+            },
+            "domain": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 60
+            },
+            "quote": {
+              "type": "string"
+            },
+            "basis": {
+              "enum": [
+                "explicit",
+                "implied"
+              ]
+            }
+          },
+          "if": {
+            "required": [
+              "requirement"
+            ],
+            "properties": {
+              "requirement": {
+                "enum": [
+                  "preferred",
+                  "required"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "required_domain"
+            ],
+            "properties": {
+              "required_domain": {
+                "enum": [
+                  "marketplace_classifieds",
+                  "ecommerce_retail",
+                  "mobility",
+                  "fintech",
+                  "saas_b2b",
+                  "consumer_apps",
+                  "gaming_betting",
+                  "healthtech",
+                  "pharma_biotech",
+                  "cybersecurity",
+                  "hardware_iot",
+                  "consulting_outsourcing",
+                  "public_sector_education",
+                  "other"
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "required_domain": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        "preferred_focus": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "values",
+            "quote"
+          ],
+          "properties": {
+            "values": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "pricing_monetization",
+                  "experimentation_causal",
+                  "unit_economics_pnl_finance",
+                  "marketplace_economics"
+                ]
+              }
+            },
+            "quote": {
+              "type": "string"
+            },
+            "basis": {
+              "enum": [
+                "explicit",
+                "implied"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "string"
+    }
+  }
+}

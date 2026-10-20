@@ -1,0 +1,37 @@
+version: labels-rubric-2026-10-20
+status: confirmed           # решения пользователя 2026-10-20; менять только по новому решению
+source: career-orientation job-search-vector 2026-10-20; intake 2026-10-20_vacancy-labeling-criteria
+anchors:                    # в промпт, на английском, без личных данных
+  "3": "Target occupation whose core is analytics, data science or experimentation that informs business, product or economic decisions, AND at least one of: a preferred focus (pricing/monetization, experimentation/causal inference, unit economics/P&L/finance partnership, marketplace economics), a preferred industry, or a company from the approved strong-company list."
+  "2": "Target occupation with an analytics core that informs decisions, without a preferred focus, preferred industry or strong company."
+  "1": "Analytics dominated by reporting, BI or KPI maintenance; or a target role lowered by a disliked industry or by required experience in an unfamiliar domain; or an unclear function."
+  "0": "Not an analytics function, including product management or product ownership without an analytics core; prolonged individual analysis without stakeholders; an incompatible hard requirement."
+level_note: "Title level never lowers relevance: Head, Manager, Director, VP and Staff/Principal individual contributors qualify when the role leads projects with people and influences decisions."
+employer_note: "Consulting, outsourcing and agency employers are neutral; judge the content of the role."
+gate_note: "Hiring conditions never change relevance; report them only in gate fields."
+aggregation:                # S4 rules_relevance; бесплатно пересчитывается
+  status: confirmed
+  base_by_function_core:
+    analytics_for_decisions: 2
+    analytics_reporting: 1
+    solo_analysis: 0
+    product_without_analytics: 0
+    non_analytics: 0
+    unspecified: 1
+  other_role_max: 1
+  upgrade_to_3_if_any: [preferred_focus, liked_industry, strong_company]   # только при base == 2
+  disliked_industry_penalty: 1
+  unfamiliar_domain_penalty: {preferred: 1, required: 2}
+  min: 0
+  max: 3
+domain_preferences:
+  status: confirmed
+  liked_industries: [marketplace_classifieds, ecommerce_retail, healthtech, pharma_biotech]
+  disliked_industries: [gaming_betting, cybersecurity, hardware_iot]
+  own_domains: [marketplace_classifieds, ecommerce_retail, mobility, healthtech]
+strong_companies:
+  status: proposed          # черновик: career-orientation research/2026-10-20_strong-companies-draft.md
+  names: []                 # заполняется только после утверждения пользователем
+p2:
+  status: confirmed
+  rule: "function_core in {analytics_for_decisions, analytics_reporting} and (relevance == 1 or (relevance >= 2 and gate_outcome == ineligible))"

@@ -29,6 +29,7 @@ from job_intake.annotation.eval_runner import (
 from job_intake.annotation.schema import _language_entities
 from job_intake.annotation.text import TEXT_VERSION, source_hash
 from job_intake.config.settings import AppConfig, load_yaml_mapping
+from job_intake.labeling.metrics import has_relevance, relevance_scale
 from job_intake.models.job import JobRecord, JobStatus
 from job_intake.profiles import load_streams
 
@@ -610,7 +611,7 @@ def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
     route_coverage = proportion(len(route_present), len(labeled))
     route_status = "not_applicable" if not labeled else "unmeasured" if not route_present else \
         "measured" if len(route_present) == len(labeled) else "partial"
-    return {
+    result = {
         "counts": {
             "gold_rows": len(cases),
             "decision_labeled": len(labeled),
@@ -646,6 +647,10 @@ def evaluate_vacancies(cases: list[dict], predictions: dict[str, dict]) -> dict:
         },
         "ranking": [case["job_uid"] for case in ranked[:20]],
     }
+    # Additive unified 0–3 scale, only when some prediction carries a relevance.
+    if has_relevance(predictions):
+        result["relevance_scale"] = relevance_scale(cases, predictions)
+    return result
 
 
 def compare_stability(first: dict[str, dict], second: dict[str, dict]) -> dict:
@@ -1014,23 +1019,7 @@ def _parser_only_drift(case: dict, record: JobRecord) -> bool:
     )
 
 
-def run_accuracy(
-    config: AppConfig,
-    *,
-    gold: Path,
-    variant: str = "saved",
-    prices: Path | None = None,
-    log: Path | None = None,
-    output: Path | None = None,
-    cohort: Path | None = None,
-    allow_source_snapshot: bool = False,
-) -> dict:
-    from job_intake.annotation.gold import validate_gold
-
-    if variant != "saved":
-        raise ValueError(
-            "Only the saved accuracy variant is implemented in Phase 0; no AI calls are made"
-        )
+def _accuracy_cases(gold: Path, cohort: Path | None) -> tuple[list[dict], dict | None]:
     cases = read_jsonl(gold)
     cohort_manifest = None
     if cohort is not None:
@@ -1040,9 +1029,16 @@ def run_accuracy(
         cases = select_cases(cases, cohort_manifest)
     if any(not isinstance(case.get("job_uid"), str) for case in cases):
         raise ValueError("Vacancy gold rows require job_uid")
-    uids = [case["job_uid"] for case in cases]
-    if not uids:
+    if not cases:
         raise ValueError("Gold is empty")
+    return cases, cohort_manifest
+
+
+def _accuracy_sources(
+    config: AppConfig, cases: list[dict], *, allow_source_snapshot: bool,
+) -> tuple[Path, list[tuple[str, JobRecord]], list[tuple[str, JobRecord]], dict]:
+    """Read-only gold sources: (database, all rows, saved DB rows, source problems)."""
+    uids = [case["job_uid"] for case in cases]
     if allow_source_snapshot:
         from job_intake.annotation.frozen_eval import record_from_snapshot
 
@@ -1062,17 +1058,59 @@ def run_accuracy(
             config.database_url, limit=None, job_uids=uids, include_archived=True,
         )
         saved_rows = rows
-    versions = None
-    classifier_version = None
-    if config.rules_path.is_file() and config.search_profiles_path.is_file():
-        from job_intake.profiles import taxonomy_version, with_other_stream
+    return database, rows, saved_rows, problems
 
-        rules = load_yaml_mapping(config.rules_path)
-        streams = with_other_stream(
-            load_streams(rules, load_yaml_mapping(config.search_profiles_path)), rules,
+
+def _profile_versions(config: AppConfig) -> tuple[dict[str, str] | None, str | None]:
+    if not (config.rules_path.is_file() and config.search_profiles_path.is_file()):
+        return None, None
+    from job_intake.profiles import taxonomy_version, with_other_stream
+
+    rules = load_yaml_mapping(config.rules_path)
+    streams = with_other_stream(
+        load_streams(rules, load_yaml_mapping(config.search_profiles_path)), rules,
+    )
+    return {stream.id: stream.version for stream in streams}, taxonomy_version(streams)
+
+
+def run_accuracy(
+    config: AppConfig,
+    *,
+    gold: Path,
+    variant: str = "saved",
+    prices: Path | None = None,
+    log: Path | None = None,
+    output: Path | None = None,
+    cohort: Path | None = None,
+    allow_source_snapshot: bool = False,
+    predictions: Path | None = None,
+) -> dict:
+    from job_intake.annotation.gold import validate_gold
+
+    if variant in {"rules", "labels"}:
+        if prices is not None or log is not None:
+            raise ValueError("--prices and --log apply to the saved variant only")
+        report = run_relevance_accuracy(
+            config, gold=gold, variant=variant, predictions=predictions, cohort=cohort,
+            allow_source_snapshot=allow_source_snapshot,
         )
-        versions = {stream.id: stream.version for stream in streams}
-        classifier_version = taxonomy_version(streams)
+        if output:
+            write_accuracy_report(report, output, protected_paths=[
+                Path(report["database"]), gold, config.rules_path, config.search_profiles_path,
+                *([predictions] if predictions else []),
+            ])
+        return report
+    if variant != "saved":
+        raise ValueError("variant must be saved (v2 gold), rules or labels (v3 gold); "
+                         "no AI calls are made")
+    if predictions is not None:
+        raise ValueError("--predictions applies to the labels variant only")
+    cases, cohort_manifest = _accuracy_cases(gold, cohort)
+    uids = [case["job_uid"] for case in cases]
+    database, rows, saved_rows, problems = _accuracy_sources(
+        config, cases, allow_source_snapshot=allow_source_snapshot,
+    )
+    versions, classifier_version = _profile_versions(config)
     from job_intake.annotation.source_compat import read_source_history
 
     validated = validate_gold(
@@ -1212,6 +1250,163 @@ def run_accuracy(
     return report
 
 
+def run_relevance_accuracy(
+    config: AppConfig,
+    *,
+    gold: Path,
+    variant: str,
+    predictions: Path | None = None,
+    cohort: Path | None = None,
+    allow_source_snapshot: bool = False,
+) -> dict:
+    """v3 gold against the rules tier-map baseline or supplied v3 predictions, read-only."""
+    from job_intake.annotation.source_compat import read_source_history
+    from job_intake.labeling.gold_v3 import gold_file_schema, validate_gold_v3
+    from job_intake.labeling.predictions import (
+        BASELINE_LABELER,
+        OTHER_ROLE_RELEVANCE,
+        TIER_MAP_NOTE,
+        TIER_RELEVANCE,
+        baseline_predictions,
+        check_prediction_rows,
+    )
+    from job_intake.labeling.schema import LABELS_SCHEMA
+
+    if variant == "rules" and predictions is not None:
+        raise ValueError("The rules variant derives predictions from saved tiers; "
+                         "use --variant labels for a predictions file")
+    if variant == "labels" and predictions is None:
+        raise ValueError("--variant labels requires --predictions with v3 prediction rows")
+    cases, cohort_manifest = _accuracy_cases(gold, cohort)
+    if gold_file_schema(cases) != LABELS_SCHEMA:
+        raise ValueError(f"--variant {variant} needs {LABELS_SCHEMA} gold; "
+                         "create it with gold migrate-v3")
+    database, rows, saved_rows, problems = _accuracy_sources(
+        config, cases, allow_source_snapshot=allow_source_snapshot,
+    )
+    versions, classifier_version = _profile_versions(config)
+    validated = validate_gold_v3(
+        rows, cases, profile_ids=list(versions) if versions is not None else None,
+        source_history=read_source_history(config.database_url, cases),
+    )
+    if not validated["valid"]:
+        raise ValueError(
+            "Invalid vacancy gold: " + "; ".join(str(error) for error in validated["errors"])
+        )
+    records = dict(rows)
+    parser_only = {case["job_uid"] for case in validated["rows"]
+                   if _parser_only_drift(case, records[case["job_uid"]])}
+    drift_uids = {warning["job_uid"] for warning in validated["warnings"]
+                  if warning.get("code") == "source_hash_changed"} - parser_only
+    if variant == "rules":
+        saved = read_saved_predictions(
+            config.database_url, saved_rows, profile_versions=versions,
+            classification_version=classifier_version,
+        )
+        for uid, findings in problems.items():
+            if uid in saved and any(finding["severity"] == "error" for finding in findings):
+                saved[uid] = {"job_uid": uid, "evaluation_state": "invalid_saved_source"}
+        prediction_rows = baseline_predictions(rows, saved)
+    else:
+        from job_intake.annotation.text import source_hash
+
+        prediction_rows = read_jsonl(predictions)
+        supplied = check_prediction_rows(prediction_rows)
+        for uid, row in supplied.items():
+            if uid not in records or row["source_hash"] != source_hash(records[uid]):
+                raise ValueError("Predictions must bind uniquely to the gold sources: " + uid)
+    prediction_map = {row["job_uid"]: row for row in prediction_rows}
+    evaluation_cases = [
+        {**case, "role_label": None, "relevance": None, "gate_outcome": None, "tags": {}}
+        if case["job_uid"] in drift_uids else case
+        for case in validated["rows"]
+    ]
+    evaluation = evaluate_vacancies(
+        [{**case, "tags": {}} for case in evaluation_cases],
+        {uid: {**row, "tags": {}} for uid, row in prediction_map.items()},
+    )
+    # Legacy v2 tag blocks do not apply to v3 gold; the v3 tags live in relevance_scale.
+    evaluation.pop("tags")
+    evaluation.pop("negative_restrictions")
+    for name in [name for name in evaluation["task_prediction_coverage"]
+                 if name.startswith("tags.")]:
+        evaluation["task_prediction_coverage"].pop(name)
+    evaluation["relevance_scale"] = relevance_scale(evaluation_cases, prediction_map)
+    evaluation["counts"]["source_drift_withheld"] = len(drift_uids)
+    evaluation["counts"]["parser_only_rebound"] = len(parser_only)
+    report = {
+        "version": ACCURACY_VERSION,
+        "variant": variant,
+        "scope": "vacancy_level_labels_v3",
+        "generated_at": datetime.now(UTC).isoformat(),
+        "database": str(database),
+        "database_access": "read_only",
+        "api_calls": 0,
+        "gold": {"path": str(gold.resolve()), "schema": LABELS_SCHEMA, "validation": validated},
+        "selection": {"job_uids": [case["job_uid"] for case in cases], "include_archived": True,
+                      "cohort": cohort_manifest,
+                      "source_snapshot_fallback": allow_source_snapshot},
+        "prediction_source": {
+            "kind": "saved_tier_map" if variant == "rules" else "jsonl",
+            "path": str(predictions.resolve()) if predictions else None,
+            "labelers": dict(Counter(row.get("labeler") for row in prediction_rows)),
+        },
+        "evaluation": evaluation,
+        "predictions": prediction_rows,
+        "source_findings": problems,
+        "limitations": [
+            "Missing predictions count as errors in coverage, exact, ±1, recall and P@k; "
+            "MAE, QWK and Spearman use covered pairs only.",
+            "Tag metrics use only human-labeled v3 tags.",
+            "Conclusions require the holdout cohort; calibration results are not acceptance.",
+        ],
+    }
+    if variant == "rules":
+        report["baseline_tier_map"] = {
+            "labeler": BASELINE_LABELER, "tier_relevance": TIER_RELEVANCE,
+            "other_role_relevance": OTHER_ROLE_RELEVANCE, "note": TIER_MAP_NOTE,
+        }
+    if drift_uids:
+        report["limitations"].append(
+            "Changed source labels await human review and are withheld from metrics."
+        )
+    return report
+
+
+def relevance_accuracy_markdown(report: dict) -> str:
+    from job_intake.labeling.metrics import relevance_scale_markdown
+
+    evaluation = report["evaluation"]
+    block = evaluation["relevance_scale"]
+    lines = [
+        f"# Vacancy accuracy: {report['variant']} (vacancy-labels-v3)",
+        "",
+        f"API calls: {report['api_calls']}; database: read-only.",
+        "",
+        f"Human relevance labels: {block['N']}; decision labels: "
+        f"{evaluation['counts']['decision_labeled']}; relevant: "
+        f"{evaluation['counts']['relevant']}.",
+    ]
+    if "baseline_tier_map" in report:
+        lines += ["", "Baseline: " + report["baseline_tier_map"]["note"]]
+    lines += ["", "## Relevance scale 0–3", "", *relevance_scale_markdown(block), "",
+              "## Role classification", "",
+              f"Accuracy: {_formatted(evaluation['role_classification']['accuracy'])}; "
+              f"coverage: {_formatted(evaluation['role_classification']['prediction_coverage'])}.",
+              "", "## Eligibility", "",
+              f"Accuracy: {_formatted(evaluation['eligibility']['accuracy'])}; "
+              f"coverage: {_formatted(evaluation['eligibility']['prediction_coverage'])}.",
+              "", "## Tags", "", "| Tag | N | Accuracy | Coverage |", "| --- | --- | --- | --- |"]
+    lines.extend(
+        f"| {name} | {row['N']} | {_formatted(row['accuracy'])} | "
+        f"{_formatted(row['prediction_coverage'])} |"
+        for name, row in block["tags"].items()
+    )
+    lines += [""]
+    lines.extend("- " + limitation for limitation in report["limitations"])
+    return "\n".join(lines) + "\n"
+
+
 def _formatted(metric: dict) -> str:
     value = metric.get("value")
     if value is None:
@@ -1227,6 +1422,8 @@ def _formatted(metric: dict) -> str:
 
 
 def accuracy_markdown(report: dict) -> str:
+    if report.get("scope") == "vacancy_level_labels_v3":
+        return relevance_accuracy_markdown(report)
     evaluation, operational = report["evaluation"], report["operational"]
     lines = [
         "# Vacancy accuracy: saved baseline",
