@@ -22,6 +22,7 @@ from job_intake.annotation.eval_runner import read_saved_records
 from job_intake.annotation.gold import validate_gold
 from job_intake.annotation.text import source_hash
 from job_intake.config.settings import AppConfig
+from job_intake.labeling.metrics import has_relevance
 from job_intake.models.job import JobRecord, JobStatus
 
 BUNDLE_SCHEMA = "frozen-evaluation-v1"
@@ -675,10 +676,17 @@ def compare_runs(
         from job_intake.annotation.accuracy import compare_stability
 
         stability = compare_stability(candidate["predictions"], repeat["predictions"])
+        if has_relevance(candidate["predictions"]) or has_relevance(repeat["predictions"]):
+            from job_intake.labeling.metrics import compare_stability as labels_stability
+
+            stability["labels_v3"] = labels_stability(candidate["predictions"],
+                                                      repeat["predictions"])
         expected = {row["job_uid"] for row in bundle["rows"]}
         comparable = set(candidate["predictions"]) & set(repeat["predictions"])
         complete = comparable == expected and len(expected) >= policy["minimum_cases"]
-        fields = ("role_label", "gate_outcome", "decision", "tier", "fit_score", "tags", "route")
+        # Legacy predictions carry no relevance, so its comparison is None == None for them.
+        fields = ("role_label", "gate_outcome", "decision", "tier", "fit_score", "tags", "route",
+                  "relevance")
         unchanged = sum(
             all(
                 candidate["predictions"][uid].get(field) == repeat["predictions"][uid].get(field)

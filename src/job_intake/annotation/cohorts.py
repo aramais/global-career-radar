@@ -148,7 +148,13 @@ def select_cases(cases: list[dict], manifest: dict) -> list[dict]:
         if row.get("source_hash") != member["source_hash"]:
             raise ValueError("Cohort source hash does not match gold")
         for field, target in (("original_labeled_at", "labeled_at"), ("label_method", "method")):
-            if field in member and member[field] != row.get(target):
+            expected = member.get(field)
+            if field == "label_method" and row.get("schema") == "vacancy-labels-v3":
+                from job_intake.labeling.gold_v3 import METHOD_MAP
+
+                # gold migrate-v3 renames v2 "assisted" to "curated"; provenance is unchanged.
+                expected = METHOD_MAP.get(expected, expected)
+            if field in member and expected != row.get(target):
                 raise ValueError("Cohort label provenance changed; create a new cohort")
     return selected
 

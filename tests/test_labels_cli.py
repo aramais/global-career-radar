@@ -258,3 +258,33 @@ def test_baseline_predictions_are_accepted_by_frozen_create_run():
     other = baseline_predictions([("uid", record)], {"uid": {"role_label": "other"}})
     stale = baseline_predictions([("uid", record)], {})
     assert other[0]["relevance"] == 0 and stale[0]["relevance"] is None
+
+
+def test_labels_with_cohort_sets_aside_predictions_outside_the_selection(stored, tmp_path):
+    _, record, config, _ = stored
+    gold = write_jsonl(tmp_path / "v3.jsonl", [gold_row(record)])
+    cohort = tmp_path / "cohort.json"
+    cohort.write_text(json.dumps({
+        "schema": "evaluation-cohort-v1", "cohort_id": "calibration-test",
+        "dataset_role": "calibration", "rubric_version": "labels-rubric-2026-10-20",
+        "created_at": "2026-10-20T12:00:00+00:00",
+        "members": [{"job_uid": "uid", "source_hash": source_hash(record),
+                     "duplicate_group": "g", "label_method": "blind"}],
+    }))
+    row = {"schema": PREDICTION_SCHEMA, "job_uid": "uid", "source_hash": source_hash(record),
+           "labeler": "llm:gemini-3.5-flash-lite", "variant": "labels", "status": "labeled",
+           "role_label": "analytics-leadership", "relevance": 2, "gate_outcome": "unknown",
+           "gate_reasons": [], "tags": {}}
+    predictions = write_jsonl(tmp_path / "predictions.jsonl",
+                              [row, {**row, "job_uid": "elsewhere", "source_hash": "1" * 64}])
+    output = tmp_path / "labels.json"
+    result = invoke("eval", "accuracy", "--config", config, "--gold", gold, "--variant",
+                    "labels", "--predictions", predictions, "--cohort", cohort,
+                    "--output", output)
+    assert result.exit_code == 0, result.output
+    report = json.loads(output.read_text())
+    assert report["prediction_source"]["ignored_outside_selection"] == 1
+    assert [row["job_uid"] for row in report["predictions"]] == ["uid"]
+    result = invoke("eval", "accuracy", "--config", config, "--gold", gold, "--variant",
+                    "labels", "--predictions", predictions, "--output", tmp_path / "all.json")
+    assert result.exit_code == 2 and "bind" in text(result)

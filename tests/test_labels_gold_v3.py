@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from job_intake.annotation.cohorts import SCHEMA, select_cases
 from job_intake.annotation.gold import _snapshot, validate_gold
 from job_intake.annotation.text import TEXT_VERSION, source_hash
 from job_intake.labeling.gold_v3 import (
@@ -234,3 +235,20 @@ def test_gold_file_schema_detects_one_supported_schema():
         gold_file_schema([v2(), v3()])
     with pytest.raises(ValueError):
         gold_file_schema([{**v2(), "schema": "vacancy-tags-v1"}])
+
+
+def test_existing_v2_cohorts_select_migrated_curated_rows():
+    record = job()
+    member = {"job_uid": "uid", "source_hash": source_hash(record), "duplicate_group": "g",
+              "label_method": "assisted", "original_labeled_at": "2026-10-17"}
+    manifest = {"schema": SCHEMA, "cohort_id": "calibration", "dataset_role": "calibration",
+                "rubric_version": "vacancy-tags-v2", "created_at": "2026-10-19T12:00:00+00:00",
+                "members": [member]}
+    curated = v3(record=record, method="curated", labeled_at="2026-10-17")
+    assert select_cases([curated], manifest) == [curated]
+    with pytest.raises(ValueError, match="provenance changed"):
+        select_cases([{**curated, "method": "blind"}], manifest)
+    legacy = v2(record=record, method="assisted")
+    assert select_cases([legacy], manifest) == [legacy]
+    with pytest.raises(ValueError, match="provenance changed"):
+        select_cases([{**legacy, "method": "curated"}], manifest)

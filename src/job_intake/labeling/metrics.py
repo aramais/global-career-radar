@@ -280,6 +280,62 @@ def relevance_scale(cases: list[dict], predictions: dict[str, dict]) -> dict:
     }
 
 
+def _stability_value(row: dict, field: str) -> str | int | None:
+    if field == "relevance":
+        return _relevance(row)
+    tag, _, part = field.partition(".")
+    label = row.get("tags", {}).get(tag) if isinstance(row.get("tags"), dict) else None
+    if not isinstance(label, dict):
+        return None
+    if tag == "preferred_focus":
+        values = label.get("values")
+        return ",".join(sorted(map(str, values))) if isinstance(values, list) else None
+    value = label.get(part or "value")
+    return value if isinstance(value, str) else None
+
+
+def compare_stability(run_a: dict[str, dict], run_b: dict[str, dict]) -> dict:
+    """Cohen's kappa between two v3 prediction runs: relevance and each of the 6 tags.
+
+    ``domain_fit`` is compared by requirement and industry; ``preferred_focus`` by the
+    exact set. Only pairs present in both runs count; a single category has undefined
+    kappa. Callers establish that the runs are independent and source-matched.
+    """
+    from job_intake.annotation.accuracy import proportion
+
+    uids = sorted(set(run_a) | set(run_b))
+    fields = ["relevance", *TAG_VALUES, "domain_fit.requirement", "domain_fit.industry",
+              "preferred_focus"]
+    results = {}
+    for field in fields:
+        pairs = [(_stability_value(run_a.get(uid, {}), field),
+                  _stability_value(run_b.get(uid, {}), field)) for uid in uids]
+        paired = [(a, b) for a, b in pairs if a is not None and b is not None]
+        total = len(paired)
+        left = Counter(a for a, _ in paired)
+        right = Counter(b for _, b in paired)
+        expected = (sum(left[value] * right[value] for value in set(left) | set(right))
+                    / total**2 if total else None)
+        observed = sum(a == b for a, b in paired) / total if total else None
+        kappa = ((observed - expected) / (1 - expected)
+                 if expected is not None and expected < 1 else None)
+        results[field] = {
+            "kappa": round(kappa, 6) if kappa is not None else None,
+            "paired": total, "missing": len(uids) - total,
+            "agreement": proportion(sum(a == b for a, b in paired), total),
+            "sample_ready": total >= 30,
+        }
+    return {
+        "scope": "paired_v3_predictions", "version": METRICS_VERSION, "jobs": len(uids),
+        "fields": results, "independent_runs_confirmed": None,
+        "acceptance_status": "insufficient_evidence", "acceptance_passed": False,
+        "limitations": [
+            "At least 30 comparable vacancies and independent runs are required.",
+            "Kappa is undefined when both runs use a single category.",
+        ],
+    }
+
+
 def _formatted(metric: dict) -> str:
     value = metric.get("value")
     if value is None:

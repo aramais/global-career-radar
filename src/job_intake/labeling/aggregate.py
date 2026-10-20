@@ -13,7 +13,7 @@ from job_intake.labeling.rubric import Rubric
 
 AGGREGATION_VERSION = "labels-aggregation-v1"
 _LEGAL_FORM = re.compile(
-    r"(?:[\s,]+(?:inc|incorporated|llc|ltd|limited|ltda|gmbh|s\.?\s?a\.?)\.?)+\s*$"
+    r"(?:[\s,]+(?:inc|incorporated|llc|ltd|limited|ltda|gmbh|s\s?[./]?\s?a)\.?)+$"
 )
 _P2_FUNCTIONS = frozenset({"analytics_for_decisions", "analytics_reporting"})
 
@@ -24,7 +24,7 @@ def normalize_company(name: str | None) -> str:
         return ""
     text = unicodedata.normalize("NFKD", name)
     text = "".join(character for character in text if not unicodedata.combining(character))
-    text = " ".join(text.casefold().split())
+    text = " ".join(text.casefold().split()).rstrip(" ,.;:")
     text = _LEGAL_FORM.sub("", text)
     return " ".join(re.sub(r"[\W_]+", " ", text).split())
 

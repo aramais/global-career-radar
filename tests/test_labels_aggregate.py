@@ -137,7 +137,8 @@ def test_unconfirmed_aggregation_is_refused():
     ("Tiger Analytics Inc.", "tiger analytics"), ("Acme, Inc", "acme"), ("Nubank S.A.", "nubank"),
     ("Nubank SA", "nubank"), ("Raízen Ltda.", "raizen"), ("Zalando SE GmbH", "zalando se"),
     ("Mercado-Libre LLC", "mercado libre"), ("ARGENX", "argenx"), ("  Foo   Ltd  ", "foo"),
-    ("Mosa", "mosa"), (None, ""),
+    ("Mosa", "mosa"), (None, ""), ("Natura Cosméticos S/A", "natura cosmeticos"),
+    ("Acme, Inc.,", "acme"), ("Foo Ltd., Inc.", "foo"), ("Visa", "visa"),
 ])
 def test_normalize_company(name, expected):
     assert normalize_company(name) == expected

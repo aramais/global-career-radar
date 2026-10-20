@@ -531,8 +531,11 @@ Saved-eval читает архив через read-only SQLite, frozen bundles �
 проверяет файл. `accuracy.evaluate_vacancies` и `frozen_eval.task_metrics` добавляют
 `relevance_scale`, только когда хотя бы одно предсказание несёт целое `relevance`;
 прежние ключи не меняются, ранее записанные прогоны остаются валидными.
-`compare_runs` показывает шкалу описательно, без гейта. Теггер, pipeline, хранение
-и UI v3 относятся к фазам P1–P3.
+`compare_runs` показывает шкалу описательно, без гейта. При повторном прогоне
+`repeat_run_stability` сравнивает и `relevance`, а `measurement.labels_v3` содержит
+κ Коэна по relevance и 6 тегам (`metrics.compare_stability`). Когорты, созданные по
+gold v2, выбирают строки v3: `assisted` в когорте соответствует `curated` в v3.
+Теггер, pipeline, хранение и UI v3 относятся к фазам P1–P3.
 
 `reevaluate` выбирает одну роль и применяет её профиль к сохранённым данным без сбора,
 AI-вызовов и уведомлений. Сохраняются `posted_at`, `first_seen_at`, `last_seen_at`

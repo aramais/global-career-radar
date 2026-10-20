@@ -14,6 +14,7 @@ from job_intake.annotation.frozen_eval import (
     validate_run,
 )
 from job_intake.labeling.metrics import (
+    compare_stability,
     quadratic_weighted_kappa,
     queue_order,
     relevance_scale,
@@ -152,12 +153,12 @@ def test_evaluate_vacancies_adds_relevance_scale_only_with_int_relevance():
     assert "relevance_scale" not in task_metrics(cases, legacy)
 
 
-def frozen(n=4):
+def frozen(n=4, *, minimum=160):
     cases = [{**case(f"u{i}", i % 4, gate="eligible"), "schema": "vacancy-tags-v2",
               "method": "blind", "source_hash": f"{i:064x}"} for i in range(n)]
     result = {
         "versions": {"baseline": "v1", "candidate": "v2"}, "cohort": None,
-        "gate_policy": {"version": "audit-quality-gates-v2", "minimum_cases": 160,
+        "gate_policy": {"version": "audit-quality-gates-v2", "minimum_cases": minimum,
                         "minimum_relevant": 40, "minimum_full_tag_cases": 60,
                         "minimum_blind_cases": 30, "maximum_accuracy_regression": 0.0,
                         "maximum_false_block_increase": 0.0, "maximum_cost_ratio": 1.0,
@@ -210,3 +211,58 @@ def test_comparison_reports_relevance_scale_descriptively():
         version="v2", run_id="c2"))
     assert "relevance_scale" not in legacy
     assert "Relevance scale" not in comparison_markdown(legacy)
+
+
+def tagged(relevance, function_core, focus=()):
+    return {"relevance": relevance, "tags": {
+        "function_core": {"value": function_core, "evidence": []},
+        "domain_fit": {"industry": "fintech", "requirement": "none", "evidence": []},
+        "preferred_focus": {"values": list(focus), "evidence": []},
+    }}
+
+
+def test_v3_stability_kappa_covers_relevance_and_each_tag():
+    first = {"a": tagged(3, "analytics_for_decisions", ["pricing_monetization"]),
+             "b": tagged(1, "analytics_reporting"), "c": tagged(0, "non_analytics")}
+    same = compare_stability(first, first)
+    assert same["fields"]["relevance"]["kappa"] == 1
+    assert same["fields"]["function_core"]["kappa"] == 1
+    assert same["fields"]["domain_fit.industry"]["kappa"] is None
+    assert same["fields"]["work_mode"]["paired"] == 0
+    second = {"a": tagged(2, "analytics_for_decisions", ["experimentation_causal"]),
+              "b": tagged(1, "analytics_reporting")}
+    changed = compare_stability(first, second)
+    assert changed["fields"]["relevance"]["paired"] == 2
+    assert changed["fields"]["relevance"]["missing"] == 1
+    assert changed["fields"]["relevance"]["agreement"]["numerator"] == 1
+    assert changed["fields"]["preferred_focus"]["agreement"]["numerator"] == 1
+    assert changed["acceptance_passed"] is False
+
+
+def test_repeat_run_stability_includes_relevance_for_labels_runs():
+    bundle = frozen(minimum=4)
+    baseline = create_run(bundle, predictions=outputs(bundle, relevance=False),
+                          variant="baseline", version="v1", run_id="b")
+    candidate = create_run(bundle, predictions=outputs(bundle), variant="candidate",
+                           version="v2", run_id="c")
+    repeat = create_run(bundle, predictions=outputs(bundle), variant="candidate",
+                        version="v2", run_id="r")
+    gate = next(row for row in compare_runs(bundle, baseline, candidate, repeat=repeat)["gates"]
+                if row["name"] == "repeat_run_stability")
+    assert gate["status"] == "pass"
+    assert gate["measurement"]["labels_v3"]["fields"]["relevance"]["kappa"] == 1
+    drifted = outputs(bundle)
+    drifted[0]["relevance"] = (drifted[0]["relevance"] + 1) % 4
+    repeat = create_run(bundle, predictions=drifted, variant="candidate", version="v2",
+                        run_id="r2")
+    gate = next(row for row in compare_runs(bundle, baseline, candidate, repeat=repeat)["gates"]
+                if row["name"] == "repeat_run_stability")
+    assert gate["status"] == "fail"
+    legacy = create_run(bundle, predictions=outputs(bundle, relevance=False),
+                        variant="candidate", version="v2", run_id="c3")
+    legacy_repeat = create_run(bundle, predictions=outputs(bundle, relevance=False),
+                               variant="candidate", version="v2", run_id="r3")
+    gate = next(row for row in compare_runs(bundle, baseline, legacy,
+                                            repeat=legacy_repeat)["gates"]
+                if row["name"] == "repeat_run_stability")
+    assert gate["status"] == "pass" and "labels_v3" not in gate["measurement"]

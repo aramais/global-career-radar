@@ -1312,9 +1312,14 @@ def run_relevance_accuracy(
 
         prediction_rows = read_jsonl(predictions)
         supplied = check_prediction_rows(prediction_rows)
+        # A cohort evaluates a subset; predictions for the rest of the gold are set aside.
+        outside = sorted(uid for uid in supplied if uid not in records) if cohort else []
         for uid, row in supplied.items():
+            if uid in outside:
+                continue
             if uid not in records or row["source_hash"] != source_hash(records[uid]):
                 raise ValueError("Predictions must bind uniquely to the gold sources: " + uid)
+        prediction_rows = [row for row in prediction_rows if row["job_uid"] not in outside]
     prediction_map = {row["job_uid"]: row for row in prediction_rows}
     evaluation_cases = [
         {**case, "role_label": None, "relevance": None, "gate_outcome": None, "tags": {}}
@@ -1350,6 +1355,7 @@ def run_relevance_accuracy(
             "kind": "saved_tier_map" if variant == "rules" else "jsonl",
             "path": str(predictions.resolve()) if predictions else None,
             "labelers": dict(Counter(row.get("labeler") for row in prediction_rows)),
+            "ignored_outside_selection": len(outside) if variant == "labels" else 0,
         },
         "evaluation": evaluation,
         "predictions": prediction_rows,
