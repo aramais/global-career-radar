@@ -43,6 +43,7 @@ def _progress(event: dict) -> None:
         "label_complete",
         "label_error",
         "label_escalate",
+        "label_schema_retry",
     }:
         typer.echo(str(name))
 

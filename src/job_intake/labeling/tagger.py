@@ -40,6 +40,9 @@ from job_intake.labeling.validate import (
 from job_intake.profiles import role_taxonomy, taxonomy_version
 
 _ACTIVE = ContextVar("labeling_attempt", default=None)
+# A complete provider reply that breaks the closed schema is asked once more. Each
+# attempt is budgeted and ledgered separately; transport retries stay in the client.
+SCHEMA_RETRIES = 1
 
 
 class TaggerStageClients:
@@ -91,7 +94,8 @@ class VacancyTagger:
         self.ledger, self.budget = ledger, budget
         self.client = TaggerStageClients(config)
         self.stats = dict.fromkeys(
-            ("calls", "cache_hits", "facts_reuse", "escalations", "errors", "gated"), 0
+            ("calls", "cache_hits", "facts_reuse", "escalations", "errors", "gated",
+             "schema_retries"), 0
         )
         self._lock = threading.Lock()
         self._labels_observed = 0
@@ -273,6 +277,19 @@ class VacancyTagger:
             raise BudgetExceeded("budget_required")
         prompt, _schema = build_prompt(record, units, role_taxonomy(self.streams), rubric, examples)
         spec = self.config.resolved_stage(stage)
+        for attempt in range(SCHEMA_RETRIES + 1):
+            try:
+                return self._attempt(record, units, stage, examples, role_ids, prompt, spec,
+                                     facts, full, directory)
+            except LabelValidationError:
+                if attempt == SCHEMA_RETRIES:
+                    raise
+                self._inc("schema_retries")
+                emit_progress(self.progress, "label_schema_retry", stage=stage, model=spec.model)
+
+    def _attempt(self, record, units, stage, examples, role_ids, prompt, spec,
+                 facts, full, directory):
+        """One budgeted, ledgered request; only a schema-valid reply is cached."""
         reservation = self.budget.reserve(prompt, spec)
         active = {
             "reservation": reservation,

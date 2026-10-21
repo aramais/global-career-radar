@@ -132,6 +132,7 @@ class JobIntakePipeline:
             "labels_escalations": 0,
             "labels_errors": 0,
             "labels_gated": 0,
+            "labels_schema_retries": 0,
             "errors": [],
         }
 

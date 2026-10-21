@@ -7,7 +7,7 @@ export_dir: data
 
 # Opt-in labels-v3. Keep these rollout switches unchanged until evaluation gates pass.
 labeling:
-  enabled: false
+  enabled: true
   mode: shadow
   ai_enabled: false
   tier_source: score

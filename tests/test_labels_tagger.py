@@ -196,10 +196,11 @@ def test_refresh_stale_requests_a_new_model_answer(config, streams, record, tmp_
 
 
 def test_invalid_response_never_caches_or_leaks_provider_text(config, streams, record):
-    tagger = service(config, streams, [{"secret": "API-SECRET"}])
+    tagger = service(config, streams, [{"secret": "API-SECRET"}, {"secret": "API-SECRET"}])
     value = label(tagger, record, use_ai=True)
     assert value.status == "error" and value.relevance == 1
     assert value.errors[0]["code"] == "schema_violation"
+    assert tagger.client.calls == ["tag", "tag"]
     assert not list(Path(config.cache_dir).rglob("*.json"))
     assert "API-SECRET" not in str(value)
 
@@ -366,7 +367,8 @@ def test_escalation_share_warning_uses_shared_run_counts_without_changing_stats(
             "share": 0.5,
         }
     ]
-    expected = {"calls", "cache_hits", "facts_reuse", "escalations", "errors", "gated"}
+    expected = {"calls", "cache_hits", "facts_reuse", "escalations", "errors", "gated",
+                "schema_retries"}
     assert set(first.stats) == set(second.stats) == expected
     assert not any("provider private explanation" in str(event) for event in events)
 
